@@ -1,0 +1,510 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WebChat Gateway - Admin Panel</title>
+    <style>
+      :root {
+        --bg: #0f172a;
+        --fg: #e2e8f0;
+        --muted: #94a3b8;
+        --card: #1e293b;
+        --accent: #38bdf8;
+        --good: #22c55e;
+        --warn: #f59e0b;
+        --bad: #ef4444;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+        background: var(--bg);
+        color: var(--fg);
+      }
+      .wrap { max-width: 1100px; margin: 0 auto; padding: 16px; }
+      header h1 { margin: 0 0 12px; font-size: 18px; }
+      .conn {
+        display: grid;
+        grid-template-columns: 2fr 3fr auto;
+        gap: 8px;
+        align-items: end;
+        background: var(--card);
+        padding: 12px;
+        border-radius: 8px;
+        margin-bottom: 12px;
+      }
+      .conn label { font-size: 12px; color: var(--muted); display: flex; flex-direction: column; }
+      .conn input {
+        margin-top: 4px;
+        padding: 8px;
+        background: #0f172a;
+        color: var(--fg);
+        border: 1px solid #334155;
+        border-radius: 6px;
+      }
+      button {
+        background: var(--accent);
+        color: #0f172a;
+        border: none;
+        border-radius: 6px;
+        padding: 8px 14px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      button.ghost {
+        background: transparent;
+        color: var(--fg);
+        border: 1px solid #334155;
+      }
+      button.danger {
+        background: rgba(239, 68, 68, 0.2);
+        color: var(--bad);
+        border: 1px solid var(--bad);
+      }
+      button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+      .tabs { display: flex; gap: 4px; border-bottom: 1px solid #334155; margin-bottom: 12px; }
+      .tabs button {
+        background: transparent;
+        color: var(--muted);
+        padding: 8px 14px;
+        border-radius: 6px 6px 0 0;
+        font-weight: 500;
+      }
+      .tabs button.active {
+        background: var(--card);
+        color: var(--fg);
+        border-bottom: 2px solid var(--accent);
+      }
+
+      .panel { background: var(--card); padding: 16px; border-radius: 8px; }
+      .panel.hidden { display: none; }
+      h2 { margin: 0 0 12px; font-size: 14px; color: var(--muted); }
+
+      table { width: 100%; border-collapse: collapse; }
+      th, td { padding: 8px; text-align: left; border-bottom: 1px solid #334155; }
+      th { font-weight: 600; color: var(--muted); font-size: 12px; text-transform: uppercase; }
+      tr:hover { background: #0f172a; }
+
+      .form-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr 2fr;
+        gap: 8px;
+        align-items: end;
+      }
+      .form-grid label { display: flex; flex-direction: column; font-size: 12px; color: var(--muted); }
+      .form-grid input, .form-grid textarea {
+        margin-top: 4px;
+        padding: 8px;
+        background: #0f172a;
+        color: var(--fg);
+        border: 1px solid #334155;
+        border-radius: 6px;
+      }
+
+      .token-output {
+        margin-top: 12px;
+        padding: 12px;
+        background: #0f172a;
+        border: 1px solid var(--warn);
+        border-radius: 6px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        word-break: break-all;
+      }
+      .token-output strong { color: var(--warn); display: block; margin-bottom: 6px; }
+      .badge {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 999px;
+        font-size: 11px;
+      }
+      .badge.active { background: rgba(34, 197, 94, .2); color: var(--good); }
+      .badge.revoked { background: rgba(148, 163, 184, .2); color: var(--muted); }
+
+      .status-bar {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 8px;
+      }
+      .status { color: var(--muted); font-size: 13px; }
+      .status.error { color: var(--bad); }
+      .status.success { color: var(--good); }
+
+      canvas { background: #0f172a; border-radius: 4px; width: 100%; height: 220px; }
+
+      pre.detail {
+        white-space: pre-wrap;
+        word-break: break-all;
+        margin: 0;
+        font-size: 11px;
+        color: var(--muted);
+        max-width: 320px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <header><h1>WebChat Gateway - Admin Panel</h1></header>
+
+      <div class="conn">
+        <label>API Base
+          <input id="apiBase" placeholder="http://127.0.0.1:6186" />
+        </label>
+        <label>Master Admin Key
+          <input id="adminKey" type="password" placeholder="paste master_admin_key" />
+        </label>
+        <button id="reveal" class="ghost" type="button">显隐</button>
+      </div>
+
+      <div class="tabs">
+        <button data-tab="issue" class="active">签发</button>
+        <button data-tab="list">列表</button>
+        <button data-tab="stats">用量</button>
+        <button data-tab="audit">审计</button>
+      </div>
+
+      <!-- Issue -->
+      <section id="panel-issue" class="panel">
+        <h2>签发新 Token</h2>
+        <div class="form-grid">
+          <label>Name
+            <input id="iname" placeholder="alice" />
+          </label>
+          <label>每日配额
+            <input id="iquota" type="number" min="1" placeholder="默认值留空" />
+          </label>
+          <label>备注
+            <input id="inote" placeholder="alice@example.com (可选)" />
+          </label>
+        </div>
+        <div style="margin-top: 12px;">
+          <button id="issue">签发</button>
+          <span id="issueStatus" class="status"></span>
+        </div>
+        <div id="tokenOutput" class="token-output" style="display:none;"></div>
+      </section>
+
+      <!-- List -->
+      <section id="panel-list" class="panel hidden">
+        <div class="status-bar">
+          <h2>Token 列表</h2>
+          <div>
+            <label style="font-size: 12px; color: var(--muted);">
+              <input type="checkbox" id="includeRevoked" /> 含已撤销
+            </label>
+            <button id="refreshList" class="ghost">刷新</button>
+          </div>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th><th>状态</th><th>今日 / 配额</th>
+              <th>创建</th><th>备注</th><th></th>
+            </tr>
+          </thead>
+          <tbody id="listBody"></tbody>
+        </table>
+        <span id="listStatus" class="status"></span>
+      </section>
+
+      <!-- Stats -->
+      <section id="panel-stats" class="panel hidden">
+        <h2>用量统计</h2>
+        <div class="form-grid" style="grid-template-columns: 2fr 1fr 1fr;">
+          <label>Token Name
+            <input id="sname" placeholder="alice" list="nameList" />
+            <datalist id="nameList"></datalist>
+          </label>
+          <label>天数 (1-90)
+            <input id="sdays" type="number" min="1" max="90" value="7" />
+          </label>
+          <button id="loadStats">加载</button>
+        </div>
+        <div style="margin-top: 12px;">
+          <canvas id="statsChart" width="800" height="220"></canvas>
+        </div>
+        <table style="margin-top: 12px;">
+          <thead><tr><th>日期</th><th>用量</th></tr></thead>
+          <tbody id="statsBody"></tbody>
+        </table>
+        <span id="statsStatus" class="status"></span>
+      </section>
+
+      <!-- Audit -->
+      <section id="panel-audit" class="panel hidden">
+        <div class="status-bar">
+          <h2>审计日志</h2>
+          <div>
+            <label style="font-size: 12px; color: var(--muted);">
+              <input type="checkbox" id="autoRefresh" /> 自动刷新 (10s)
+            </label>
+            <button id="refreshAudit" class="ghost">刷新</button>
+          </div>
+        </div>
+        <table>
+          <thead>
+            <tr><th>时间</th><th>事件</th><th>Name</th><th>IP</th><th>详情</th></tr>
+          </thead>
+          <tbody id="auditBody"></tbody>
+        </table>
+        <span id="auditStatus" class="status"></span>
+      </section>
+    </div>
+
+    <script>
+      const LS = { apiBase: "wcs.adm.apiBase", key: "wcs.adm.key" };
+      const $ = (id) => document.getElementById(id);
+
+      const apiBase = $("apiBase");
+      const adminKey = $("adminKey");
+      apiBase.value = localStorage.getItem(LS.apiBase) || "http://127.0.0.1:6186";
+      adminKey.value = localStorage.getItem(LS.key) || "";
+      apiBase.addEventListener("change", () => localStorage.setItem(LS.apiBase, apiBase.value.trim()));
+      adminKey.addEventListener("change", () => localStorage.setItem(LS.key, adminKey.value.trim()));
+      $("reveal").onclick = () => {
+        adminKey.type = adminKey.type === "password" ? "text" : "password";
+      };
+
+      // tab switching
+      const tabs = document.querySelectorAll(".tabs button");
+      tabs.forEach((tab) => {
+        tab.onclick = () => {
+          tabs.forEach((t) => t.classList.toggle("active", t === tab));
+          ["issue", "list", "stats", "audit"].forEach((name) => {
+            $(`panel-${name}`).classList.toggle("hidden", name !== tab.dataset.tab);
+          });
+          if (tab.dataset.tab === "list") loadList();
+          if (tab.dataset.tab === "audit") loadAudit();
+          if (tab.dataset.tab === "stats") populateNames();
+        };
+      });
+
+      function fmt(ts) {
+        if (!ts) return "-";
+        return new Date(ts * 1000).toLocaleString();
+      }
+
+      async function api(path, opts = {}) {
+        const url = `${apiBase.value.trim()}${path}`;
+        const headers = Object.assign(
+          { Authorization: `Bearer ${adminKey.value.trim()}`, "Content-Type": "application/json" },
+          opts.headers || {}
+        );
+        const resp = await fetch(url, Object.assign({ headers }, opts));
+        let payload;
+        try { payload = await resp.json(); } catch { payload = {}; }
+        if (!resp.ok) {
+          const err = new Error(payload.error || `http_${resp.status}`);
+          err.payload = payload;
+          err.status = resp.status;
+          throw err;
+        }
+        return payload;
+      }
+
+      // ----- Issue -----
+      $("issue").onclick = async () => {
+        const status = $("issueStatus");
+        const out = $("tokenOutput");
+        status.textContent = "签发中...";
+        status.className = "status";
+        out.style.display = "none";
+        try {
+          const body = {
+            name: $("iname").value.trim(),
+            note: $("inote").value.trim(),
+          };
+          const q = $("iquota").value.trim();
+          if (q) body.daily_quota = Number(q);
+          const result = await api("/api/webchat/admin/tokens", {
+            method: "POST",
+            body: JSON.stringify(body),
+          });
+          status.textContent = `已签发 ${result.name},配额 ${result.daily_quota}`;
+          status.className = "status success";
+          out.style.display = "block";
+          out.innerHTML = `<strong>⚠ 此 Token 仅显示一次,请立即保存:</strong>${result.token}`;
+        } catch (e) {
+          status.textContent = `失败: ${e.message} ${e.payload && e.payload.detail || ""}`;
+          status.className = "status error";
+        }
+      };
+
+      // ----- List -----
+      let lastList = [];
+      async function loadList() {
+        const status = $("listStatus");
+        status.textContent = "加载中...";
+        status.className = "status";
+        try {
+          const q = $("includeRevoked").checked ? "?include_revoked=true" : "";
+          const data = await api(`/api/webchat/admin/tokens${q}`);
+          lastList = data.tokens;
+          renderList(data.tokens);
+          status.textContent = `${data.tokens.length} 个 token`;
+          status.className = "status success";
+        } catch (e) {
+          status.textContent = `失败: ${e.message}`;
+          status.className = "status error";
+        }
+      }
+      function renderList(rows) {
+        const body = $("listBody");
+        body.innerHTML = "";
+        for (const t of rows) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <td>${escape(t.name)}</td>
+            <td><span class="badge ${t.revoked_at ? "revoked" : "active"}">
+              ${t.revoked_at ? "REVOKED" : "active"}
+            </span></td>
+            <td>${t.today_usage} / ${t.daily_quota}</td>
+            <td>${fmt(t.created_at)}</td>
+            <td>${escape(t.note || "")}</td>
+            <td></td>
+          `;
+          if (!t.revoked_at) {
+            const btn = document.createElement("button");
+            btn.className = "danger";
+            btn.textContent = "撤销";
+            btn.onclick = () => revokeToken(t.name);
+            tr.lastElementChild.appendChild(btn);
+          }
+          body.appendChild(tr);
+        }
+      }
+      async function revokeToken(name) {
+        if (!confirm(`确定撤销 ${name}?`)) return;
+        try {
+          await api(`/api/webchat/admin/tokens/${encodeURIComponent(name)}`, {
+            method: "DELETE",
+          });
+          loadList();
+        } catch (e) {
+          alert(`撤销失败: ${e.message}`);
+        }
+      }
+      $("refreshList").onclick = loadList;
+      $("includeRevoked").onchange = loadList;
+
+      // ----- Stats -----
+      function populateNames() {
+        const dl = $("nameList");
+        dl.innerHTML = "";
+        for (const t of lastList) {
+          const opt = document.createElement("option");
+          opt.value = t.name;
+          dl.appendChild(opt);
+        }
+      }
+      $("loadStats").onclick = async () => {
+        const status = $("statsStatus");
+        status.textContent = "加载中...";
+        status.className = "status";
+        try {
+          const name = encodeURIComponent($("sname").value.trim());
+          const days = Number($("sdays").value) || 7;
+          const data = await api(`/api/webchat/admin/stats?name=${name}&days=${days}`);
+          renderStats(data);
+          status.textContent = `配额 ${data.daily_quota}${data.revoked ? " (已撤销)" : ""}`;
+          status.className = "status success";
+        } catch (e) {
+          status.textContent = `失败: ${e.message}`;
+          status.className = "status error";
+        }
+      };
+      function renderStats(data) {
+        const tbody = $("statsBody");
+        tbody.innerHTML = "";
+        for (const item of data.history) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `<td>${item.day}</td><td>${item.count}</td>`;
+          tbody.appendChild(tr);
+        }
+        drawChart(data.history, data.daily_quota);
+      }
+      function drawChart(history, quota) {
+        const canvas = $("statsChart");
+        const ctx = canvas.getContext("2d");
+        const W = canvas.width, H = canvas.height;
+        ctx.clearRect(0, 0, W, H);
+        if (history.length === 0) return;
+        const max = Math.max(quota, ...history.map((h) => h.count), 1);
+        const padL = 36, padB = 20, padT = 10;
+        const usable = H - padT - padB;
+        const barW = (W - padL) / history.length;
+        // grid + quota line
+        ctx.strokeStyle = "#334155";
+        ctx.fillStyle = "#94a3b8";
+        ctx.font = "11px sans-serif";
+        const yQuota = padT + usable - (quota / max) * usable;
+        ctx.beginPath();
+        ctx.moveTo(padL, yQuota);
+        ctx.lineTo(W, yQuota);
+        ctx.stroke();
+        ctx.fillText(`quota=${quota}`, 4, yQuota + 4);
+        // bars
+        history.forEach((item, i) => {
+          const h = (item.count / max) * usable;
+          const x = padL + i * barW + 2;
+          const y = padT + usable - h;
+          ctx.fillStyle = item.count >= quota ? "#ef4444" : "#38bdf8";
+          ctx.fillRect(x, y, barW - 4, h);
+          ctx.fillStyle = "#94a3b8";
+          if (i % Math.ceil(history.length / 7) === 0) {
+            ctx.fillText(item.day.slice(5), x, H - 6);
+          }
+        });
+      }
+
+      // ----- Audit -----
+      let auditTimer = null;
+      async function loadAudit() {
+        const status = $("auditStatus");
+        status.textContent = "加载中...";
+        status.className = "status";
+        try {
+          const data = await api("/api/webchat/admin/audit?limit=200");
+          renderAudit(data.events);
+          status.textContent = `${data.events.length} 条`;
+          status.className = "status success";
+        } catch (e) {
+          status.textContent = `失败: ${e.message}`;
+          status.className = "status error";
+        }
+      }
+      function renderAudit(events) {
+        const body = $("auditBody");
+        body.innerHTML = "";
+        for (const ev of events) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <td>${fmt(ev.ts)}</td>
+            <td>${escape(ev.event)}</td>
+            <td>${escape(ev.name || "-")}</td>
+            <td>${escape(ev.ip || "-")}</td>
+            <td><pre class="detail">${escape(ev.detail || "")}</pre></td>
+          `;
+          body.appendChild(tr);
+        }
+      }
+      $("refreshAudit").onclick = loadAudit;
+      $("autoRefresh").onchange = (e) => {
+        clearInterval(auditTimer);
+        if (e.target.checked) {
+          auditTimer = setInterval(loadAudit, 10000);
+        }
+      };
+
+      function escape(s) {
+        return String(s)
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;");
+      }
+    </script>
+  </body>
+</html>

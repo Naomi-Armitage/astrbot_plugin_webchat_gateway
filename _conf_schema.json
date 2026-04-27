@@ -1,0 +1,99 @@
+{
+  "host": {
+    "type": "string",
+    "description": "WebChat API 监听地址",
+    "hint": "用于绑定 WebChat API 服务的主机地址。",
+    "default": "0.0.0.0"
+  },
+  "port": {
+    "type": "int",
+    "description": "WebChat API 端口",
+    "hint": "WebChat API 服务监听端口（1-65535）。",
+    "default": 6186
+  },
+  "endpoint_prefix": {
+    "type": "string",
+    "description": "API 路径前缀",
+    "hint": "聊天位于 {prefix}/chat，管理位于 {prefix}/admin/...。",
+    "default": "/api/webchat"
+  },
+  "allowed_origins": {
+    "type": "string",
+    "description": "允许的网页来源（CORS Origin）",
+    "hint": "* 允许任意；或逗号分隔列表，如 http://localhost:1234,https://chat.example.com",
+    "default": "*"
+  },
+  "max_message_length": {
+    "type": "int",
+    "description": "单条消息最大字符数",
+    "hint": "超过此长度返回 400 message_too_long，防止 prompt 炸弹。",
+    "default": 4000
+  },
+  "history_turns": {
+    "type": "int",
+    "description": "上下文保留轮数",
+    "hint": "每次请求携带最近 N 轮历史，建议 4-12。",
+    "default": 8
+  },
+  "persona_id": {
+    "type": "string",
+    "description": "WebChat 使用的人格 ID",
+    "hint": "可直接从下拉框选择已在 AstrBot 中配置的人格。",
+    "default": "",
+    "_special": "select_persona"
+  },
+  "default_daily_quota": {
+    "type": "int",
+    "description": "签发新 Token 时默认每日配额",
+    "hint": "也可在签发时单独指定。",
+    "default": 200
+  },
+  "ip_brute_force_max_fails": {
+    "type": "int",
+    "description": "同 IP 鉴权失败多少次后封禁",
+    "hint": "防爆破阈值，0 表示禁用。",
+    "default": 10
+  },
+  "ip_brute_force_block_seconds": {
+    "type": "int",
+    "description": "封禁时长（秒）",
+    "default": 900
+  },
+  "trust_forwarded_for": {
+    "type": "bool",
+    "description": "信任 X-Forwarded-For 取首跳作为客户端 IP",
+    "hint": "仅当 AstrBot 部署在可信反向代理（Nginx/Caddy/Cloudflare）之后启用，否则攻击者可伪造 IP 绕过防爆破。",
+    "default": false
+  },
+  "master_admin_key": {
+    "type": "string",
+    "description": "管理 API 主密钥",
+    "hint": "为空则禁用 /admin/* 端点；建议使用 32+ 字符强随机字符串。",
+    "default": ""
+  },
+  "storage": {
+    "type": "object",
+    "description": "存储后端配置",
+    "hint": "tokens/用量/审计日志/IP 失败记录均存储在此后端。",
+    "items": {
+      "driver": {
+        "type": "string",
+        "description": "存储驱动",
+        "options": ["sqlite", "mysql"],
+        "default": "sqlite"
+      },
+      "sqlite_path": {
+        "type": "string",
+        "description": "SQLite 数据库文件路径",
+        "hint": "相对路径以 AstrBot 工作目录为基准；建议 data/webchat_gateway.db。",
+        "default": "data/webchat_gateway.db"
+      },
+      "mysql_dsn": {
+        "type": "string",
+        "description": "MySQL DSN",
+        "hint": "格式 mysql://user:pass@host:3306/dbname；driver=mysql 时必填。",
+        "default": ""
+      }
+    }
+  }
+}

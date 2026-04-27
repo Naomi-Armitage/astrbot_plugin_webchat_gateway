@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WebChat Gateway - Chat</title>
+    <style>
+      :root {
+        --bg: #0f172a;
+        --fg: #e2e8f0;
+        --muted: #94a3b8;
+        --card: #1e293b;
+        --accent: #38bdf8;
+        --good: #22c55e;
+        --warn: #f59e0b;
+        --bad: #ef4444;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+        background: var(--bg);
+        color: var(--fg);
+        min-height: 100vh;
+      }
+      .wrap {
+        max-width: 760px;
+        margin: 0 auto;
+        padding: 16px;
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding-bottom: 8px;
+        border-bottom: 1px solid #334155;
+      }
+      header h1 {
+        font-size: 16px;
+        margin: 0;
+        flex: 1;
+      }
+      .badge {
+        font-size: 12px;
+        padding: 4px 8px;
+        border-radius: 999px;
+        background: #334155;
+        color: var(--muted);
+      }
+      .badge.good { background: rgba(34, 197, 94, .2); color: var(--good); }
+      .badge.warn { background: rgba(245, 158, 11, .2); color: var(--warn); }
+      .badge.bad  { background: rgba(239, 68, 68, .2); color: var(--bad); }
+
+      .settings {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+        padding: 12px 0;
+        border-bottom: 1px solid #334155;
+      }
+      .settings label {
+        display: flex;
+        flex-direction: column;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .settings input {
+        margin-top: 4px;
+        padding: 8px;
+        background: var(--card);
+        color: var(--fg);
+        border: 1px solid #334155;
+        border-radius: 6px;
+      }
+
+      #messages {
+        flex: 1;
+        overflow-y: auto;
+        padding: 12px 0;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .msg {
+        max-width: 80%;
+        padding: 10px 12px;
+        border-radius: 10px;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .msg.user { align-self: flex-end; background: #1d4ed8; }
+      .msg.bot  { align-self: flex-start; background: var(--card); }
+      .msg.error { align-self: stretch; background: rgba(239,68,68,.12); border: 1px solid var(--bad); color: var(--fg); }
+      .msg.notice { align-self: stretch; background: rgba(245,158,11,.12); border: 1px solid var(--warn); color: var(--fg); }
+
+      footer {
+        display: flex;
+        gap: 8px;
+        padding-top: 8px;
+        border-top: 1px solid #334155;
+      }
+      footer textarea {
+        flex: 1;
+        min-height: 60px;
+        max-height: 200px;
+        padding: 8px;
+        background: var(--card);
+        color: var(--fg);
+        border: 1px solid #334155;
+        border-radius: 6px;
+        resize: vertical;
+        font-family: inherit;
+      }
+      footer button {
+        padding: 0 18px;
+        background: var(--accent);
+        color: #0f172a;
+        border: none;
+        border-radius: 6px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      footer button:disabled { opacity: .5; cursor: not-allowed; }
+
+      .actions { margin-left: auto; display: flex; gap: 8px; }
+      .actions button {
+        background: transparent;
+        border: 1px solid #334155;
+        color: var(--muted);
+        padding: 4px 10px;
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <header>
+        <h1>WebChat Gateway</h1>
+        <span id="quotaBadge" class="badge">--</span>
+        <div class="actions">
+          <button id="newSession">新会话</button>
+          <button id="clearHistory">清空</button>
+        </div>
+      </header>
+
+      <div class="settings">
+        <label>
+          API Base
+          <input id="apiBase" placeholder="http://127.0.0.1:6186" />
+        </label>
+        <label>
+          Endpoint Prefix
+          <input id="endpointPrefix" placeholder="/api/webchat" />
+        </label>
+        <label>
+          Token (一次性,务必保存)
+          <input id="token" type="password" placeholder="paste your token" />
+        </label>
+        <label>
+          Username
+          <input id="username" placeholder="昵称" />
+        </label>
+      </div>
+
+      <div id="messages"></div>
+
+      <footer>
+        <textarea id="input" placeholder="输入消息后按 Ctrl/Cmd+Enter 发送"></textarea>
+        <button id="send">发送</button>
+      </footer>
+    </div>
+
+    <script>
+      const LS = {
+        apiBase: "wcs.apiBase",
+        prefix: "wcs.prefix",
+        token: "wcs.token",
+        username: "wcs.username",
+        sessionId: "wcs.sessionId",
+      };
+      const SS = {
+        history: "wcs.history",
+      };
+
+      const $ = (id) => document.getElementById(id);
+      const apiBase = $("apiBase");
+      const prefix = $("endpointPrefix");
+      const token = $("token");
+      const usernameEl = $("username");
+      const inputEl = $("input");
+      const sendBtn = $("send");
+      const msgs = $("messages");
+      const badge = $("quotaBadge");
+
+      // hydrate from localStorage
+      apiBase.value = localStorage.getItem(LS.apiBase) || "http://127.0.0.1:6186";
+      prefix.value = localStorage.getItem(LS.prefix) || "/api/webchat";
+      token.value = localStorage.getItem(LS.token) || "";
+      usernameEl.value = localStorage.getItem(LS.username) || "Friend";
+      let sessionId = localStorage.getItem(LS.sessionId);
+      if (!sessionId) {
+        sessionId = (crypto.randomUUID && crypto.randomUUID()) || String(Date.now());
+        localStorage.setItem(LS.sessionId, sessionId);
+      }
+
+      const persistField = (el, key) => el.addEventListener("change", () => {
+        localStorage.setItem(key, el.value.trim());
+      });
+      persistField(apiBase, LS.apiBase);
+      persistField(prefix, LS.prefix);
+      persistField(token, LS.token);
+      persistField(usernameEl, LS.username);
+
+      // hydrate history
+      const history = JSON.parse(sessionStorage.getItem(SS.history) || "[]");
+      for (const item of history) {
+        addMessage(item.role, item.text, { skipPersist: true });
+      }
+      scrollToEnd();
+
+      function setBadge(remaining, quota) {
+        if (remaining == null || quota == null) {
+          badge.textContent = "--";
+          badge.className = "badge";
+          return;
+        }
+        badge.textContent = `今日剩余 ${remaining} / ${quota}`;
+        const ratio = remaining / Math.max(1, quota);
+        badge.className = "badge " + (ratio >= 0.3 ? "good" : ratio >= 0.1 ? "warn" : "bad");
+      }
+
+      function addMessage(role, text, opts = {}) {
+        const div = document.createElement("div");
+        div.className = "msg " + role;
+        div.textContent = text;
+        msgs.appendChild(div);
+        if (!opts.skipPersist && (role === "user" || role === "bot")) {
+          history.push({ role, text, ts: Date.now() });
+          sessionStorage.setItem(SS.history, JSON.stringify(history));
+        }
+        scrollToEnd();
+      }
+
+      function scrollToEnd() {
+        msgs.scrollTop = msgs.scrollHeight;
+      }
+
+      $("clearHistory").onclick = () => {
+        history.length = 0;
+        sessionStorage.removeItem(SS.history);
+        msgs.innerHTML = "";
+      };
+      $("newSession").onclick = () => {
+        sessionId = (crypto.randomUUID && crypto.randomUUID()) || String(Date.now());
+        localStorage.setItem(LS.sessionId, sessionId);
+        history.length = 0;
+        sessionStorage.removeItem(SS.history);
+        msgs.innerHTML = "";
+        addMessage("notice", `已开启新会话: ${sessionId}`);
+      };
+
+      inputEl.addEventListener("keydown", (e) => {
+        if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+          e.preventDefault();
+          send();
+        }
+      });
+      sendBtn.onclick = send;
+
+      async function send() {
+        const message = inputEl.value.trim();
+        if (!message) return;
+        if (!token.value.trim()) {
+          addMessage("error", "请先填写 Token");
+          return;
+        }
+        const url = `${apiBase.value.trim()}${prefix.value.trim() || "/api/webchat"}/chat`;
+        sendBtn.disabled = true;
+        addMessage("user", message);
+        inputEl.value = "";
+
+        try {
+          const resp = await fetch(url, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${token.value.trim()}`,
+            },
+            body: JSON.stringify({
+              session_id: sessionId,
+              username: usernameEl.value.trim() || "Friend",
+              message,
+            }),
+          });
+          let payload;
+          try { payload = await resp.json(); } catch { payload = {}; }
+
+          if (resp.ok) {
+            setBadge(payload.remaining, payload.daily_quota);
+            addMessage("bot", payload.reply || "(空回复)");
+            return;
+          }
+
+          const err = payload.error || `http_${resp.status}`;
+          if (resp.status === 401) {
+            addMessage("error", "Token 无效或已撤销,请联系管理员。");
+          } else if (resp.status === 429 && err === "quota_exceeded") {
+            setBadge(0, payload.daily_quota);
+            addMessage("notice", "今日额度已用完,明日 0 点重置。");
+          } else if (resp.status === 429 && err === "concurrent_request") {
+            addMessage("notice", "上一条还在处理中,稍候。");
+          } else if (resp.status === 429 && err === "ip_blocked") {
+            const retry = resp.headers.get("Retry-After") || payload.retry_after || "?";
+            addMessage("error", `请求过于频繁,已暂时封禁,${retry} 秒后重试。`);
+          } else if (resp.status === 400 && err === "message_too_long") {
+            addMessage("error", `消息过长 (上限 ${payload.max_length})。`);
+          } else if (resp.status === 403 && err === "forbidden_origin") {
+            addMessage("error", "页面来源未在 allowed_origins 中。");
+          } else {
+            addMessage("error", `请求失败: ${err} ${payload.detail || ""}`);
+          }
+        } catch (error) {
+          addMessage("error", `网络错误: ${String(error)}`);
+        } finally {
+          sendBtn.disabled = false;
+        }
+      }
+    </script>
+  </body>
+</html>
