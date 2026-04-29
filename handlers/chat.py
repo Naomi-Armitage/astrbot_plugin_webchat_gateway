@@ -1,4 +1,17 @@
-"""Chat HTTP handler — main 9-step defense pipeline."""
+"""Chat HTTP handler.
+
+Pipeline order (parse-before-lock, so a slow body cannot pin the per-token
+concurrency slot):
+    1. Origin allow-list
+    2. IP brute-force gate
+    3. Auth (token lookup + IP guard accounting)
+    4. Parse JSON body + length check
+    5. Per-token concurrency lock (single-flight)
+    6. Daily quota check (under the lock, paired with increment)
+    7. LLM call
+    8. Increment usage
+    9. Audit + respond
+"""
 
 from __future__ import annotations
 
@@ -37,6 +50,7 @@ class ChatDeps:
     allowed_origins: set[str]
     max_message_length: int
     trust_forwarded_for: bool
+    trust_referer_as_origin: bool = False
 
 
 @dataclass
@@ -68,7 +82,9 @@ def _parse_payload(payload: Any) -> _ParsedRequest | None:
 
 def make_chat_handler(deps: ChatDeps):
     async def handle(request: web.Request) -> web.Response:
-        origin = extract_origin(request)
+        origin = extract_origin(
+            request, trust_referer_as_origin=deps.trust_referer_as_origin
+        )
         allowed = deps.allowed_origins
 
         # 1. Origin allow-list
@@ -106,7 +122,12 @@ def make_chat_handler(deps: ChatDeps):
             )
         token = await deps.storage.get_token_by_hash(hash_token(presented))
         if token is None or token.revoked_at is not None:
-            await deps.ip_guard.record_failure(ip)
+            # Only blind probing (token not found) counts toward IP brute-force.
+            # A friend retrying a freshly revoked token is misconfiguration, not
+            # an attacker — penalising their IP would lock them out for
+            # ip_brute_force_block_seconds with no recourse.
+            if token is None:
+                await deps.ip_guard.record_failure(ip)
             await deps.audit.write(
                 "auth_fail",
                 ip=ip,
@@ -121,7 +142,52 @@ def make_chat_handler(deps: ChatDeps):
         # Valid auth — clear failures for this IP.
         await deps.ip_guard.reset(ip)
 
-        # 4. Concurrency lock
+        # 4. Parse + length check (before taking the per-token lock so a slow
+        # body cannot pin the slot).
+        try:
+            payload = await request.json()
+        except web.HTTPRequestEntityTooLarge:
+            return json_response(
+                {"error": "payload_too_large"},
+                status=413,
+                origin=origin,
+                allowed_origins=allowed,
+            )
+        except json.JSONDecodeError:
+            return json_response(
+                {"error": "invalid_json"},
+                status=400,
+                origin=origin,
+                allowed_origins=allowed,
+            )
+        except Exception:
+            logger.exception("[WebChatGateway] unexpected JSON parse error")
+            return json_response(
+                {"error": "invalid_json"},
+                status=400,
+                origin=origin,
+                allowed_origins=allowed,
+            )
+        data = _parse_payload(payload)
+        if data is None:
+            return json_response(
+                {"error": "invalid_payload"},
+                status=400,
+                origin=origin,
+                allowed_origins=allowed,
+            )
+        if len(data.message) > deps.max_message_length:
+            return json_response(
+                {
+                    "error": "message_too_long",
+                    "max_length": deps.max_message_length,
+                },
+                status=400,
+                origin=origin,
+                allowed_origins=allowed,
+            )
+
+        # 5. Concurrency lock
         async with deps.concurrency.acquire(token.name) as acquired:
             if not acquired:
                 await deps.audit.write(
@@ -134,7 +200,7 @@ def make_chat_handler(deps: ChatDeps):
                     allowed_origins=allowed,
                 )
 
-            # 5. Daily quota check (read-then-increment is racy across processes,
+            # 6. Daily quota check (read-then-increment is racy across processes,
             # but per-token concurrency=1 guarantees serial use of a single token).
             today = date.today()
             today_count = await deps.storage.get_today_usage(token.name, day=today)
@@ -156,49 +222,40 @@ def make_chat_handler(deps: ChatDeps):
                     allowed_origins=allowed,
                 )
 
-            # 6. Parse + length check
-            try:
-                payload = await request.json()
-            except json.JSONDecodeError:
-                return json_response(
-                    {"error": "invalid_json"},
-                    status=400,
-                    origin=origin,
-                    allowed_origins=allowed,
-                )
-            except Exception:
-                logger.exception("[WebChatGateway] unexpected JSON parse error")
-                return json_response(
-                    {"error": "invalid_json"},
-                    status=400,
-                    origin=origin,
-                    allowed_origins=allowed,
-                )
-            data = _parse_payload(payload)
-            if data is None:
-                return json_response(
-                    {"error": "invalid_payload"},
-                    status=400,
-                    origin=origin,
-                    allowed_origins=allowed,
-                )
-            if len(data.message) > deps.max_message_length:
-                return json_response(
-                    {
-                        "error": "message_too_long",
-                        "max_length": deps.max_message_length,
-                    },
-                    status=400,
-                    origin=origin,
-                    allowed_origins=allowed,
-                )
-
             # 7. LLM call
             try:
                 reply = await deps.llm_bridge.generate_reply(
+                    token_name=token.name,
                     session_id=data.session_id,
                     username=data.username,
                     message=data.message,
+                )
+            except RuntimeError as exc:
+                if str(exc) == "llm_timeout":
+                    await deps.audit.write(
+                        "llm_timeout",
+                        name=token.name,
+                        ip=ip,
+                        detail={"msg_len": len(data.message)},
+                    )
+                    return json_response(
+                        {"error": "llm_timeout"},
+                        status=504,
+                        origin=origin,
+                        allowed_origins=allowed,
+                    )
+                logger.exception("[WebChatGateway] LLM call failed")
+                await deps.audit.write(
+                    "chat_error",
+                    name=token.name,
+                    ip=ip,
+                    detail={"error": str(exc)[:200]},
+                )
+                return json_response(
+                    {"error": "llm_call_failed", "detail": str(exc)[:200]},
+                    status=500,
+                    origin=origin,
+                    allowed_origins=allowed,
                 )
             except Exception as exc:
                 logger.exception("[WebChatGateway] LLM call failed")
@@ -243,9 +300,18 @@ def make_chat_handler(deps: ChatDeps):
     return handle
 
 
-def make_preflight_handler(allowed: set[str]):
+def make_preflight_handler(
+    allowed: set[str],
+    *,
+    trust_referer_as_origin: bool = False,
+):
     async def handle(request: web.Request) -> web.Response:
-        return preflight_response(origin=extract_origin(request), allowed=allowed)
+        return preflight_response(
+            origin=extract_origin(
+                request, trust_referer_as_origin=trust_referer_as_origin
+            ),
+            allowed=allowed,
+        )
 
     return handle
 

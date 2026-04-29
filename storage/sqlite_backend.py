@@ -9,11 +9,20 @@ from datetime import date, timedelta
 import aiosqlite
 
 from .base import AbstractStorage, AuditRow, TokenRow, UsageRow
-from .ddl import SCHEMA_SQLITE
+from .ddl import CURRENT_SCHEMA_VERSION, SCHEMA_SQLITE
 
 
 class SqliteStorage(AbstractStorage):
-    """File-based SQLite storage with WAL mode."""
+    """File-based SQLite storage with WAL mode.
+
+    Concurrency invariant: this backend uses a single `aiosqlite.Connection`
+    plus an `asyncio.Lock` (`_write_lock`) that all mutating methods acquire.
+    Combined with AstrBot's "one process per plugin instance" model, this
+    serializes writes safely without needing transactional read-then-write
+    primitives. Adding a second connection or a worker pool would invalidate
+    several methods (`record_ip_failure` in particular relies on the lock to
+    bridge the SELECT/INSERT race).
+    """
 
     def __init__(self, db_path: str) -> None:
         self._db_path = db_path
@@ -31,6 +40,10 @@ class SqliteStorage(AbstractStorage):
         await self._conn.execute("PRAGMA foreign_keys=ON")
         for stmt in SCHEMA_SQLITE:
             await self._conn.execute(stmt)
+        await self._conn.execute(
+            "INSERT OR IGNORE INTO _schema_meta(key, value) VALUES('schema_version', ?)",
+            (CURRENT_SCHEMA_VERSION,),
+        )
         await self._conn.commit()
 
     async def close(self) -> None:
@@ -109,12 +122,18 @@ class SqliteStorage(AbstractStorage):
 
     # ----- daily usage -----
     async def increment_daily_usage(self, name: str, *, day: date) -> int:
+        # Two statements (UPSERT then SELECT) instead of `RETURNING`, so this
+        # works against SQLite < 3.35 (RETURNING was added 2021-03). Atomicity
+        # is preserved by `_write_lock` plus the surrounding single transaction.
         day_key = day.isoformat()
         async with self._write_lock:
-            async with self._db.execute(
+            await self._db.execute(
                 "INSERT INTO daily_usage(name, day, count) VALUES(?, ?, 1) "
-                "ON CONFLICT(name, day) DO UPDATE SET count = count + 1 "
-                "RETURNING count",
+                "ON CONFLICT(name, day) DO UPDATE SET count = count + 1",
+                (name, day_key),
+            )
+            async with self._db.execute(
+                "SELECT count FROM daily_usage WHERE name = ? AND day = ?",
                 (name, day_key),
             ) as cursor:
                 row = await cursor.fetchone()
@@ -128,6 +147,23 @@ class SqliteStorage(AbstractStorage):
         ) as cursor:
             row = await cursor.fetchone()
         return int(row["count"]) if row else 0
+
+    async def get_today_usage_bulk(
+        self, names: list[str], *, day: date
+    ) -> dict[str, int]:
+        if not names:
+            return {}
+        placeholders = ",".join("?" for _ in names)
+        sql = (
+            f"SELECT name, count FROM daily_usage "
+            f"WHERE day = ? AND name IN ({placeholders})"
+        )
+        async with self._db.execute(sql, (day.isoformat(), *names)) as cursor:
+            rows = await cursor.fetchall()
+        out = {n: 0 for n in names}
+        for row in rows:
+            out[row["name"]] = int(row["count"])
+        return out
 
     async def get_usage_stats(self, name: str, *, days: int) -> list[UsageRow]:
         days = max(1, min(days, 365))
@@ -168,11 +204,13 @@ class SqliteStorage(AbstractStorage):
                 new_count = 1
             else:
                 new_count = int(row["fail_count"]) + 1
-                blocked_until = now + block_seconds if new_count >= max_fails else 0
+                new_blocked_until = now + block_seconds if new_count >= max_fails else None
                 await self._db.execute(
-                    "UPDATE ip_failures SET fail_count = ?, last_fail_ts = ?, blocked_until = ? "
+                    "UPDATE ip_failures "
+                    "SET fail_count = ?, last_fail_ts = ?, "
+                    "    blocked_until = CASE WHEN ? >= ? THEN ? ELSE blocked_until END "
                     "WHERE ip = ?",
-                    (new_count, now, blocked_until, ip),
+                    (new_count, now, new_count, max_fails, new_blocked_until or 0, ip),
                 )
             await self._db.commit()
         return new_count
@@ -215,7 +253,7 @@ class SqliteStorage(AbstractStorage):
         limit = max(1, min(limit, 500))
         async with self._db.execute(
             "SELECT id, ts, name, ip, event, detail FROM audit_log "
-            "ORDER BY id DESC LIMIT ?",
+            "ORDER BY ts DESC, id DESC LIMIT ?",
             (limit,),
         ) as cursor:
             rows = await cursor.fetchall()

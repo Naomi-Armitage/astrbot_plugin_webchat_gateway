@@ -10,11 +10,13 @@ from aiohttp import web
 from astrbot.api import logger
 
 from ..core.audit import AuditLogger
+from ..core.ip_guard import IpGuard
 from ..storage.base import AbstractStorage
 from .admin_tokens import ServiceError, TokenService, gate_admin
 from .common import (
     client_ip,
     extract_origin,
+    is_origin_allowed,
     json_response,
     preflight_response,
 )
@@ -28,6 +30,7 @@ class AdminDeps:
     allowed_origins: set[str]
     master_admin_key: str
     trust_forwarded_for: bool
+    ip_guard: IpGuard
 
 
 def _parse_int(value, default: int, lo: int, hi: int) -> int:
@@ -41,6 +44,8 @@ def _parse_int(value, default: int, lo: int, hi: int) -> int:
 async def _read_json(request: web.Request) -> dict:
     try:
         body = await request.json()
+    except web.HTTPRequestEntityTooLarge:
+        raise ServiceError("payload_too_large", status=413) from None
     except (json.JSONDecodeError, ValueError):
         raise ServiceError("invalid_json", status=400) from None
     if not isinstance(body, dict):
@@ -52,18 +57,35 @@ def make_admin_handlers(deps: AdminDeps):
     allowed = deps.allowed_origins
 
     def _err(origin, exc: ServiceError) -> web.Response:
+        extra = None
+        if exc.code == "ip_blocked" and str(exc):
+            extra = {"Retry-After": str(exc)}
         return json_response(
             {"error": exc.code, "detail": str(exc) if str(exc) != exc.code else ""},
             status=exc.status,
             origin=origin,
             allowed_origins=allowed,
+            extra_headers=extra,
+        )
+
+    async def _gate(request: web.Request, ip: str, origin: str | None) -> None:
+        # Origin allow-list — match chat.py ordering: cheap filter before any
+        # IpGuard accounting or master-key probe.
+        if not is_origin_allowed(origin, allowed):
+            raise ServiceError("forbidden_origin", status=403)
+        await gate_admin(
+            request,
+            master_key=deps.master_admin_key,
+            ip=ip,
+            ip_guard=deps.ip_guard,
+            audit=deps.audit,
         )
 
     async def post_tokens(request: web.Request) -> web.Response:
         origin = extract_origin(request)
         ip = client_ip(request, trust_forwarded_for=deps.trust_forwarded_for)
         try:
-            gate_admin(request, deps.master_admin_key)
+            await _gate(request, ip, origin)
             body = await _read_json(request)
             result = await deps.token_service.issue(
                 name=str(body.get("name") or ""),
@@ -94,7 +116,7 @@ def make_admin_handlers(deps: AdminDeps):
         ip = client_ip(request, trust_forwarded_for=deps.trust_forwarded_for)
         name = request.match_info.get("name", "")
         try:
-            gate_admin(request, deps.master_admin_key)
+            await _gate(request, ip, origin)
             ok = await deps.token_service.revoke(name=name, ip=ip)
         except ServiceError as exc:
             return _err(origin, exc)
@@ -111,14 +133,17 @@ def make_admin_handlers(deps: AdminDeps):
 
     async def list_tokens(request: web.Request) -> web.Response:
         origin = extract_origin(request)
+        ip = client_ip(request, trust_forwarded_for=deps.trust_forwarded_for)
         try:
-            gate_admin(request, deps.master_admin_key)
+            await _gate(request, ip, origin)
             include = (request.query.get("include_revoked") or "").lower() in {
                 "1",
                 "true",
                 "yes",
             }
-            rows = await deps.token_service.list_with_today(include_revoked=include)
+            rows = await deps.token_service.list_with_today(
+                include_revoked=include, ip=ip
+            )
         except ServiceError as exc:
             return _err(origin, exc)
         except Exception:
@@ -144,11 +169,12 @@ def make_admin_handlers(deps: AdminDeps):
 
     async def get_stats(request: web.Request) -> web.Response:
         origin = extract_origin(request)
+        ip = client_ip(request, trust_forwarded_for=deps.trust_forwarded_for)
         try:
-            gate_admin(request, deps.master_admin_key)
+            await _gate(request, ip, origin)
             name = request.query.get("name") or ""
             days = _parse_int(request.query.get("days"), default=7, lo=1, hi=90)
-            data = await deps.token_service.stats(name=name, days=days)
+            data = await deps.token_service.stats(name=name, days=days, ip=ip)
         except ServiceError as exc:
             return _err(origin, exc)
         except Exception:
@@ -158,10 +184,14 @@ def make_admin_handlers(deps: AdminDeps):
 
     async def get_audit(request: web.Request) -> web.Response:
         origin = extract_origin(request)
+        ip = client_ip(request, trust_forwarded_for=deps.trust_forwarded_for)
         try:
-            gate_admin(request, deps.master_admin_key)
+            await _gate(request, ip, origin)
             limit = _parse_int(request.query.get("limit"), default=100, lo=1, hi=500)
             rows = await deps.storage.get_recent_audit(limit=limit)
+            await deps.audit.write(
+                "admin_audit", ip=ip, detail={"limit": limit, "count": len(rows)}
+            )
         except ServiceError as exc:
             return _err(origin, exc)
         except Exception:

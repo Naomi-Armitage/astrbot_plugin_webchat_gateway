@@ -79,7 +79,9 @@ class ConfigView:
     ip_brute_force_max_fails: int
     ip_brute_force_block_seconds: int
     trust_forwarded_for: bool
+    trust_referer_as_origin: bool
     master_admin_key: str
+    llm_timeout_seconds: int
     storage: StorageConfig
 
     @property
@@ -126,7 +128,11 @@ class ConfigView:
             hi=86_400 * 30,
         )
         trust_xff = _parse_bool(_get(cfg, "trust_forwarded_for"), default=False)
+        trust_ref = _parse_bool(_get(cfg, "trust_referer_as_origin"), default=False)
         admin_key = str(_get(cfg, "master_admin_key") or "").strip()
+        llm_timeout = _clamp_int(
+            _get(cfg, "llm_timeout_seconds"), default=60, lo=5, hi=600
+        )
 
         raw_storage = _get(cfg, "storage", {}) or {}
         driver = str(_get(raw_storage, "driver", "sqlite")).strip().lower() or "sqlite"
@@ -153,7 +159,9 @@ class ConfigView:
             ip_brute_force_max_fails=ip_max,
             ip_brute_force_block_seconds=ip_block,
             trust_forwarded_for=trust_xff,
+            trust_referer_as_origin=trust_ref,
             master_admin_key=admin_key,
+            llm_timeout_seconds=llm_timeout,
             storage=StorageConfig(
                 driver=driver,
                 sqlite_path=sqlite_path,
@@ -183,6 +191,10 @@ class ConfigView:
         if self.trust_forwarded_for:
             logger.warning(
                 "[WebChatGateway] trust_forwarded_for=true; ensure AstrBot is behind a trusted reverse proxy"
+            )
+        if self.trust_referer_as_origin:
+            logger.warning(
+                "[WebChatGateway] trust_referer_as_origin=true; weakens Origin allow-list as a CSRF mitigation"
             )
 
     def is_storage_ready(self) -> bool:

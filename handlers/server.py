@@ -22,11 +22,17 @@ class ServerDeps:
 
 
 def build_app(deps: ServerDeps) -> web.Application:
-    app = web.Application()
     cfg = deps.config
+    # Cap incoming body size: max_message_length is char count; multiply for
+    # JSON envelope + unicode escaping headroom, with a 64 KB floor.
+    body_cap = max(64 * 1024, cfg.max_message_length * 4)
+    app = web.Application(client_max_size=body_cap)
 
     chat_handler = make_chat_handler(deps.chat)
-    chat_preflight = make_preflight_handler(cfg.allowed_origins)
+    chat_preflight = make_preflight_handler(
+        cfg.allowed_origins,
+        trust_referer_as_origin=deps.chat.trust_referer_as_origin,
+    )
 
     app.router.add_post(cfg.chat_path, chat_handler)
     app.router.add_options(cfg.chat_path, chat_preflight)

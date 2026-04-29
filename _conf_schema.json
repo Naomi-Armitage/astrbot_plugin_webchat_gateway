@@ -35,6 +35,12 @@
     "hint": "每次请求携带最近 N 轮历史，建议 4-12。",
     "default": 8
   },
+  "llm_timeout_seconds": {
+    "type": "int",
+    "description": "LLM 调用超时时间（秒）",
+    "hint": "范围 5-600；超时返回错误并记录 audit 事件 llm_timeout。建议 30-120。",
+    "default": 60
+  },
   "persona_id": {
     "type": "string",
     "description": "WebChat 使用的人格 ID",
@@ -45,7 +51,7 @@
   "default_daily_quota": {
     "type": "int",
     "description": "签发新 Token 时默认每日配额",
-    "hint": "也可在签发时单独指定。",
+    "hint": "范围 1 - 1000000。也可在签发时单独指定，不指定则使用此默认值。",
     "default": 200
   },
   "ip_brute_force_max_fails": {
@@ -57,6 +63,7 @@
   "ip_brute_force_block_seconds": {
     "type": "int",
     "description": "封禁时长（秒）",
+    "hint": "触发封禁阈值后封禁该 IP 的持续时长，单位秒（默认 900 = 15 分钟）。",
     "default": 900
   },
   "trust_forwarded_for": {
@@ -65,10 +72,16 @@
     "hint": "仅当 AstrBot 部署在可信反向代理（Nginx/Caddy/Cloudflare）之后启用，否则攻击者可伪造 IP 绕过防爆破。",
     "default": false
   },
+  "trust_referer_as_origin": {
+    "type": "bool",
+    "description": "缺少 Origin 头时回退使用 Referer 推断来源",
+    "hint": "默认关闭。开启后会削弱 Origin 白名单作为 CSRF 防护的强度（隐私模式或 no-referrer 策略下可绕过），仅在你了解风险并需要兼容老式客户端时启用。",
+    "default": false
+  },
   "master_admin_key": {
     "type": "string",
     "description": "管理 API 主密钥",
-    "hint": "为空则禁用 /admin/* 端点；建议使用 32+ 字符强随机字符串。",
+    "hint": "为空则禁用 /admin/* HTTP 端点（机器人内 /webchat 命令仍可用）；建议使用 32+ 字符强随机字符串，可用 `python -c \"import secrets; print(secrets.token_urlsafe(32))\"` 生成。请勿提交到代码仓库。",
     "default": ""
   },
   "storage": {
@@ -79,6 +92,7 @@
       "driver": {
         "type": "string",
         "description": "存储驱动",
+        "hint": "sqlite 适合单机/朋友圈部署，零运维；mysql 适合多人共享部署，需要额外安装 aiomysql（pip install aiomysql）。",
         "options": ["sqlite", "mysql"],
         "default": "sqlite"
       },
@@ -91,7 +105,7 @@
       "mysql_dsn": {
         "type": "string",
         "description": "MySQL DSN",
-        "hint": "格式 mysql://user:pass@host:3306/dbname；driver=mysql 时必填。",
+        "hint": "格式 mysql://user:pass@host:3306/dbname（也支持 mariadb://）；driver=mysql 时必填。",
         "default": ""
       }
     }

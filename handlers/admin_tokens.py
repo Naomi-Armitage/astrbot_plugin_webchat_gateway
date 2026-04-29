@@ -14,7 +14,7 @@ from datetime import date
 from aiohttp import web
 
 from ..core.audit import AuditLogger
-from ..core.auth import generate_token, hash_token, is_master_admin
+from ..core.auth import extract_bearer, generate_token, hash_token, is_master_admin
 from ..storage.base import AbstractStorage
 
 
@@ -139,34 +139,61 @@ class TokenService:
         )
         return ok
 
-    async def list_with_today(self, *, include_revoked: bool = False) -> list[TokenSummary]:
+    async def list_with_today(
+        self,
+        *,
+        include_revoked: bool = False,
+        ip: str | None = None,
+    ) -> list[TokenSummary]:
         rows = await self._storage.list_tokens(include_revoked=include_revoked)
         today = date.today()
-        out: list[TokenSummary] = []
-        for row in rows:
-            usage = await self._storage.get_today_usage(row.name, day=today)
-            out.append(
-                TokenSummary(
-                    name=row.name,
-                    daily_quota=row.daily_quota,
-                    note=row.note,
-                    created_at=row.created_at,
-                    revoked_at=row.revoked_at,
-                    today_usage=usage,
-                )
+        if rows:
+            usage_map = await self._storage.get_today_usage_bulk(
+                [row.name for row in rows], day=today
             )
-        return out
+        else:
+            usage_map = {}
+        await self._audit.write(
+            "admin_list",
+            ip=ip,
+            detail={"include_revoked": include_revoked, "count": len(rows)},
+        )
+        return [
+            TokenSummary(
+                name=row.name,
+                daily_quota=row.daily_quota,
+                note=row.note,
+                created_at=row.created_at,
+                revoked_at=row.revoked_at,
+                today_usage=usage_map.get(row.name, 0),
+            )
+            for row in rows
+        ]
 
-    async def stats(self, *, name: str, days: int) -> dict:
+    async def stats(
+        self,
+        *,
+        name: str,
+        days: int,
+        ip: str | None = None,
+    ) -> dict:
         name = self._validate_name(name)
         days = max(1, min(days, 90))
         token = await self._storage.get_token_by_name(name)
         if not token:
             raise ServiceError("not_found", status=404)
         history = await self._storage.get_usage_stats(name, days=days)
+        await self._audit.write(
+            "admin_stats",
+            name=name,
+            ip=ip,
+            detail={"days": days},
+        )
         return {
             "name": name,
             "daily_quota": token.daily_quota,
+            "created_at": token.created_at,
+            "revoked_at": token.revoked_at,
             "revoked": token.revoked_at is not None,
             "history": [
                 {"day": row.day.isoformat(), "count": row.count} for row in history
@@ -177,9 +204,51 @@ class TokenService:
 # ----- HTTP wrappers -----
 
 
-def gate_admin(request: web.Request, master_key: str) -> None:
-    """Raise ServiceError if the request fails admin auth."""
+async def gate_admin(
+    request: web.Request,
+    *,
+    master_key: str,
+    ip: str,
+    ip_guard,
+    audit: AuditLogger,
+) -> None:
+    """Authenticate an admin request.
+
+    Pipeline (mirrors `chat.py` ordering, intentionally):
+        1. IpGuard.is_blocked → 429 ip_blocked, no master-key probe.
+        2. master_key empty → 403 admin_disabled (config issue, not attack;
+           do NOT count against ip_guard).
+        3. Bearer missing → record_failure + audit + 401.
+        4. Bearer mismatch → record_failure + audit + 401.
+        5. Success → ip_guard.reset, return.
+
+    `ip_guard` is typed loosely (no annotation) so this module need not
+    import IpGuard, avoiding a tighter coupling with the core package.
+    """
+    blocked, retry_after = await ip_guard.is_blocked(ip)
+    if blocked:
+        await audit.write(
+            "admin_auth_fail",
+            ip=ip,
+            detail={"reason": "ip_blocked", "retry_after": retry_after},
+        )
+        raise ServiceError("ip_blocked", status=429, message=str(retry_after))
     if not master_key:
+        await audit.write(
+            "admin_auth_fail", ip=ip, detail={"reason": "admin_disabled"}
+        )
         raise ServiceError("admin_disabled", status=403)
-    if not is_master_admin(request, master_key):
+    presented = extract_bearer(request)
+    if not presented:
+        await ip_guard.record_failure(ip)
+        await audit.write(
+            "admin_auth_fail", ip=ip, detail={"reason": "no_token"}
+        )
         raise ServiceError("unauthorized", status=401)
+    if not is_master_admin(request, master_key):
+        await ip_guard.record_failure(ip)
+        await audit.write(
+            "admin_auth_fail", ip=ip, detail={"reason": "invalid_key"}
+        )
+        raise ServiceError("unauthorized", status=401)
+    await ip_guard.reset(ip)

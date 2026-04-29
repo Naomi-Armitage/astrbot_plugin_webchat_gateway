@@ -8,10 +8,24 @@ from urllib.parse import urlparse
 from aiohttp import web
 
 
-def extract_origin(request: web.Request) -> str | None:
+def extract_origin(
+    request: web.Request,
+    *,
+    trust_referer_as_origin: bool = False,
+) -> str | None:
+    """Return the request Origin, optionally falling back to Referer.
+
+    The Referer fallback is unsafe by default: a browser that strips
+    Referer (privacy mode, no-referrer policy) and omits Origin would be
+    indistinguishable from a server-side curl call, weakening the Origin
+    allow-list as a CSRF mitigation. Only enable the fallback when the
+    deployment knowingly accepts that tradeoff.
+    """
     origin = (request.headers.get("Origin") or "").strip()
     if origin:
         return origin
+    if not trust_referer_as_origin:
+        return None
     referer = (request.headers.get("Referer") or "").strip()
     if not referer:
         return None
@@ -48,9 +62,15 @@ def build_cors_headers(origin: str | None, allowed: set[str]) -> dict[str, str]:
 def client_ip(request: web.Request, *, trust_forwarded_for: bool) -> str:
     if trust_forwarded_for:
         xff = request.headers.get("X-Forwarded-For", "")
-        first = xff.split(",")[0].strip()
-        if first:
-            return first
+        # Take the LAST entry: the trusted proxy appends the real client IP
+        # at the end of the list. The FIRST entry is whatever the client
+        # supplied in their request and is attacker-controlled — taking it
+        # would let any caller spoof their IP and bypass IP brute-force /
+        # poison the audit log. (This assumes a single-hop trusted proxy;
+        # multi-hop deployments must overwrite XFF at the edge instead.)
+        parts = [p.strip() for p in xff.split(",") if p.strip()]
+        if parts:
+            return parts[-1]
         real_ip = (request.headers.get("X-Real-IP") or "").strip()
         if real_ip:
             return real_ip

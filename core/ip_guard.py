@@ -6,6 +6,20 @@ import time
 
 from ..storage.base import AbstractStorage
 
+# Stable bucket for requests where the client IP could not be determined
+# (request.remote is None and trust_forwarded_for is off, or empty XFF).
+# Tracking under one key means a flood from such clients still trips the
+# brute-force guard instead of silently bypassing it.
+_UNKNOWN_IP_KEY = "__unknown__"
+
+
+def _normalize_ip(ip: str) -> str | None:
+    if not ip:
+        return None
+    if ip == "unknown":
+        return _UNKNOWN_IP_KEY
+    return ip
+
 
 class IpGuard:
     def __init__(
@@ -24,21 +38,28 @@ class IpGuard:
         return self._max_fails > 0
 
     async def is_blocked(self, ip: str) -> tuple[bool, int]:
-        if not self.enabled or not ip or ip == "unknown":
+        if not self.enabled:
             return False, 0
-        return await self._storage.is_ip_blocked(ip, now=int(time.time()))
+        key = _normalize_ip(ip)
+        if key is None:
+            return False, 0
+        return await self._storage.is_ip_blocked(key, now=int(time.time()))
 
     async def record_failure(self, ip: str) -> int:
-        if not self.enabled or not ip or ip == "unknown":
+        if not self.enabled:
+            return 0
+        key = _normalize_ip(ip)
+        if key is None:
             return 0
         return await self._storage.record_ip_failure(
-            ip,
+            key,
             now=int(time.time()),
             max_fails=self._max_fails,
             block_seconds=self._block_seconds,
         )
 
     async def reset(self, ip: str) -> None:
-        if not ip or ip == "unknown":
+        key = _normalize_ip(ip)
+        if key is None:
             return
-        await self._storage.reset_ip_failures(ip)
+        await self._storage.reset_ip_failures(key)

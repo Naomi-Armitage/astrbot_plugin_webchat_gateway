@@ -76,6 +76,12 @@ class AbstractStorage(ABC):
     async def get_today_usage(self, name: str, *, day: date) -> int: ...
 
     @abstractmethod
+    async def get_today_usage_bulk(
+        self, names: list[str], *, day: date
+    ) -> dict[str, int]:
+        """Fetch today's usage for many names in one query. Missing names map to 0."""
+
+    @abstractmethod
     async def get_usage_stats(self, name: str, *, days: int) -> list[UsageRow]: ...
 
     # ----- ip brute-force -----

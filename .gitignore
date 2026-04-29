@@ -1,0 +1,27 @@
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Local databases / runtime data
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Local secrets / config overrides
+.env
+.env.local
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
+
+# Team-collaboration scaffolding (kept locally, not for release)
+PLAN_*.md
+REVIEW_REPORT.md

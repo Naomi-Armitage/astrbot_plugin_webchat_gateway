@@ -6,12 +6,22 @@ the original plugin so behavior matches the simple version.
 
 from __future__ import annotations
 
+import asyncio
+
 from astrbot.api import logger
-from astrbot.core.agent.message import (
-    AssistantMessageSegment,
-    TextPart,
-    UserMessageSegment,
-)
+
+try:
+    from astrbot.core.agent.message import (
+        AssistantMessageSegment,
+        TextPart,
+        UserMessageSegment,
+    )
+except ImportError as _e:
+    raise ImportError(
+        "[WebChatGateway] Cannot import AssistantMessageSegment/TextPart/UserMessageSegment "
+        "from astrbot.core.agent.message. This plugin requires AstrBot >= 3.4. "
+        f"Original error: {_e}"
+    ) from _e
 
 
 class LlmBridge:
@@ -23,20 +33,27 @@ class LlmBridge:
         *,
         history_turns: int,
         persona_id: str,
+        timeout_seconds: float = 60.0,
     ) -> None:
         self._context = context
-        self._history_turns = max(0, min(history_turns, 50))
+        self._history_turns = max(0, history_turns)
         self._persona_id_cfg = (persona_id or "").strip()
+        self._timeout = float(timeout_seconds) if timeout_seconds else None
+        self._persona_cache: tuple[str | None, str | None] | None = None
 
     async def _resolve_persona(self) -> tuple[str | None, str | None]:
+        if self._persona_cache is not None:
+            return self._persona_cache
         if not self._persona_id_cfg:
-            return None, None
+            self._persona_cache = (None, None)
+            return self._persona_cache
         try:
             persona = await self._context.persona_manager.get_persona(
                 self._persona_id_cfg
             )
             system_prompt = (getattr(persona, "system_prompt", "") or "").strip()
-            return self._persona_id_cfg, system_prompt or None
+            self._persona_cache = (self._persona_id_cfg, system_prompt or None)
+            return self._persona_cache
         except Exception:
             logger.warning(
                 "[WebChatGateway] persona_id does not exist: %s",
@@ -76,11 +93,14 @@ class LlmBridge:
     async def generate_reply(
         self,
         *,
+        token_name: str,
         session_id: str,
         username: str,
         message: str,
     ) -> str:
-        unified_origin = f"webchat_gateway:private:{session_id}"
+        # Namespace by token so two callers passing the same sessionId never
+        # share conversation history across tokens.
+        unified_origin = f"webchat_gateway:{token_name}:{session_id}"
         provider_id = await self._context.get_current_chat_provider_id(
             umo=unified_origin
         )
@@ -104,12 +124,20 @@ class LlmBridge:
             message=message, system_prompt=system_prompt, history=history
         )
 
-        resp = await self._context.llm_generate(
-            chat_provider_id=provider_id,
-            prompt=prompt,
-            persona_id=persona_id,
-        )
+        try:
+            resp = await asyncio.wait_for(
+                self._context.llm_generate(
+                    chat_provider_id=provider_id,
+                    prompt=prompt,
+                    persona_id=persona_id,
+                ),
+                timeout=self._timeout,
+            )
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError("llm_timeout") from exc
         reply = (resp.completion_text or "").strip()
+        if not reply:
+            raise RuntimeError("empty_reply")
 
         try:
             await cm.add_message_pair(

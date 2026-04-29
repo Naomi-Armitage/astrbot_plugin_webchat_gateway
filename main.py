@@ -70,56 +70,68 @@ class WebChatGatewayPlugin(Star):
             return
         self._storage = storage
 
-        audit = AuditLogger(storage)
-        self._audit = audit
-        token_service = TokenService(
-            storage,
-            audit,
-            default_daily_quota=cfg.default_daily_quota,
-        )
-        self._token_service = token_service
+        try:
+            audit = AuditLogger(storage)
+            self._audit = audit
+            token_service = TokenService(
+                storage,
+                audit,
+                default_daily_quota=cfg.default_daily_quota,
+            )
+            self._token_service = token_service
 
-        ip_guard = IpGuard(
-            storage,
-            max_fails=cfg.ip_brute_force_max_fails,
-            block_seconds=cfg.ip_brute_force_block_seconds,
-        )
-        concurrency = PerTokenConcurrency()
-        llm_bridge = LlmBridge(
-            self.context,
-            history_turns=cfg.history_turns,
-            persona_id=cfg.persona_id,
-        )
+            ip_guard = IpGuard(
+                storage,
+                max_fails=cfg.ip_brute_force_max_fails,
+                block_seconds=cfg.ip_brute_force_block_seconds,
+            )
+            concurrency = PerTokenConcurrency()
+            llm_bridge = LlmBridge(
+                self.context,
+                history_turns=cfg.history_turns,
+                persona_id=cfg.persona_id,
+                timeout_seconds=cfg.llm_timeout_seconds,
+            )
 
-        chat_deps = ChatDeps(
-            storage=storage,
-            audit=audit,
-            ip_guard=ip_guard,
-            concurrency=concurrency,
-            llm_bridge=llm_bridge,
-            allowed_origins=cfg.allowed_origins,
-            max_message_length=cfg.max_message_length,
-            trust_forwarded_for=cfg.trust_forwarded_for,
-        )
-        admin_deps = AdminDeps(
-            storage=storage,
-            audit=audit,
-            token_service=token_service,
-            allowed_origins=cfg.allowed_origins,
-            master_admin_key=cfg.master_admin_key,
-            trust_forwarded_for=cfg.trust_forwarded_for,
-        )
-        server_deps = ServerDeps(config=cfg, chat=chat_deps, admin=admin_deps)
-        app = build_app(server_deps)
+            chat_deps = ChatDeps(
+                storage=storage,
+                audit=audit,
+                ip_guard=ip_guard,
+                concurrency=concurrency,
+                llm_bridge=llm_bridge,
+                allowed_origins=cfg.allowed_origins,
+                max_message_length=cfg.max_message_length,
+                trust_forwarded_for=cfg.trust_forwarded_for,
+                trust_referer_as_origin=cfg.trust_referer_as_origin,
+            )
+            admin_deps = AdminDeps(
+                storage=storage,
+                audit=audit,
+                token_service=token_service,
+                allowed_origins=cfg.allowed_origins,
+                master_admin_key=cfg.master_admin_key,
+                trust_forwarded_for=cfg.trust_forwarded_for,
+                ip_guard=ip_guard,
+            )
+            server_deps = ServerDeps(config=cfg, chat=chat_deps, admin=admin_deps)
+            app = build_app(server_deps)
 
-        await self._lifecycle.start(app, host=cfg.host, port=cfg.port)
+            await self._lifecycle.start(app, host=cfg.host, port=cfg.port)
+        except Exception:
+            logger.exception(
+                "[WebChatGateway] startup failed after storage init; tearing down"
+            )
+            await self._stop()
+            return
+
         logger.info(
-            "[WebChatGateway] chat=%s admin=%s storage=%s allowed_origins=%s admin_key=%s",
+            "[WebChatGateway] chat=%s admin=%s storage=%s allowed_origins=%s admin_key=%s llm_timeout=%ss",
             cfg.chat_path,
             cfg.admin_tokens_path,
             cfg.storage.driver,
             ", ".join(sorted(cfg.allowed_origins)),
             "enabled" if cfg.master_admin_key else "DISABLED",
+            cfg.llm_timeout_seconds,
         )
 
     async def _stop(self) -> None:
