@@ -307,6 +307,82 @@
         gap: 6px;
       }
 
+      .login-shell {
+        display: grid;
+        place-items: center;
+        min-height: 70vh;
+      }
+      .login-card {
+        width: min(420px, 100%);
+        background: var(--surface);
+        border: 1px solid var(--border-soft);
+        border-radius: 12px;
+        padding: 28px 26px;
+      }
+      .login-card h2 {
+        margin: 0 0 8px;
+        font-size: 18px;
+        text-transform: none;
+        letter-spacing: 0;
+        color: var(--text-strong);
+        font-weight: 650;
+      }
+      .login-card p.sub {
+        margin: 0 0 18px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .login-card label {
+        display: block;
+        font-size: 11px;
+        color: var(--muted);
+        margin-bottom: 10px;
+        font-weight: 500;
+      }
+      .login-card input {
+        width: 100%;
+        margin-top: 5px;
+        padding: 10px 11px;
+        background: var(--bg-elev);
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: 7px;
+        font: inherit;
+      }
+      .login-card input:focus {
+        outline: none;
+        border-color: var(--accent);
+        box-shadow: 0 0 0 3px var(--accent-soft);
+      }
+      .login-card .row {
+        display: flex;
+        gap: 10px;
+        margin-top: 12px;
+        align-items: center;
+      }
+      .login-card .row > button { flex: 0 0 auto; }
+      .login-card .row .grow { flex: 1; }
+      .api-base-row {
+        margin-top: 18px;
+        padding-top: 14px;
+        border-top: 1px dashed var(--border-soft);
+      }
+      .hidden { display: none !important; }
+
+      header .logout-btn {
+        font-size: 12px;
+        color: var(--muted);
+        padding: 5px 11px;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        background: transparent;
+        font-weight: 500;
+      }
+      header .logout-btn:hover {
+        color: var(--text-strong);
+        border-color: var(--accent);
+      }
+
       @media (max-width: 720px) {
         .conn { grid-template-columns: 1fr; }
         .form-grid { grid-template-columns: 1fr; }
@@ -314,9 +390,32 @@
     </style>
   </head>
   <body>
-    <div class="wrap">
+    <!-- ===== LOGIN VIEW ===== -->
+    <div id="loginView" class="wrap login-shell">
+      <div class="login-card">
+        <h2>WebChat Gateway · Admin</h2>
+        <p class="sub">输入 master_admin_key 登录。会话以 Cookie 形式签发，关闭浏览器后过期。</p>
+        <label>Master Admin Key
+          <input id="loginKey" type="password" placeholder="paste master_admin_key" autocomplete="off" />
+        </label>
+        <div class="row">
+          <button id="loginSubmit">登录</button>
+          <button id="loginReveal" class="ghost" type="button">显隐</button>
+          <span class="grow"></span>
+          <span id="loginStatus" class="status"></span>
+        </div>
+        <div class="api-base-row">
+          <label>API Base <span style="color:var(--muted); font-weight: 400; text-transform: none; letter-spacing: 0;">(留空表示和当前页面同源)</span>
+            <input id="apiBase" placeholder="" />
+          </label>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== APP VIEW (hidden until logged in) ===== -->
+    <div id="appView" class="wrap hidden">
       <header>
-        <a class="brand" href="../landing/index.html" aria-label="Back to landing">
+        <a class="brand" href="/" aria-label="Back to landing">
           <span class="brand-mark" aria-hidden="true">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
               stroke-linecap="round" stroke-linejoin="round">
@@ -325,19 +424,10 @@
           </span>
         </a>
         <h1>WebChat Gateway · Admin Panel</h1>
-        <span class="pill">master key</span>
-        <a class="back" href="../landing/index.html">← 首页</a>
+        <span class="pill" id="sessionPill">session</span>
+        <button id="logoutBtn" class="logout-btn" type="button">登出</button>
+        <a class="back" href="/">← 首页</a>
       </header>
-
-      <div class="conn">
-        <label>API Base
-          <input id="apiBase" placeholder="http://127.0.0.1:6186" />
-        </label>
-        <label>Master Admin Key
-          <input id="adminKey" type="password" placeholder="paste master_admin_key" />
-        </label>
-        <button id="reveal" class="ghost" type="button">显隐</button>
-      </div>
 
       <div class="tabs">
         <button data-tab="issue" class="active">签发</button>
@@ -435,17 +525,135 @@
     </div>
 
     <script>
-      const LS = { apiBase: "wcg.adm.apiBase", key: "wcg.adm.key" };
+      const LS_API_BASE = "wcg.adm.apiBase";
       const $ = (id) => document.getElementById(id);
 
       const apiBase = $("apiBase");
-      const adminKey = $("adminKey");
-      apiBase.value = localStorage.getItem(LS.apiBase) || "http://127.0.0.1:6186";
-      adminKey.value = localStorage.getItem(LS.key) || "";
-      apiBase.addEventListener("change", () => localStorage.setItem(LS.apiBase, apiBase.value.trim()));
-      adminKey.addEventListener("change", () => localStorage.setItem(LS.key, adminKey.value.trim()));
-      $("reveal").onclick = () => {
-        adminKey.type = adminKey.type === "password" ? "text" : "password";
+      const loginKey = $("loginKey");
+      const loginStatus = $("loginStatus");
+      const sessionPill = $("sessionPill");
+
+      // apiBase: empty default = same-origin (cookie auth works).
+      // Persist if the user explicitly fills it in for cross-origin admin
+      // panel hosting (in which case the gateway must allow that origin
+      // and the user falls back to bearer entry for every call).
+      apiBase.value = localStorage.getItem(LS_API_BASE) || "";
+      apiBase.addEventListener("change", () =>
+        localStorage.setItem(LS_API_BASE, apiBase.value.trim())
+      );
+
+      $("loginReveal").onclick = () => {
+        loginKey.type = loginKey.type === "password" ? "text" : "password";
+      };
+
+      function showLogin(message = "") {
+        $("loginView").classList.remove("hidden");
+        $("appView").classList.add("hidden");
+        loginStatus.textContent = message || "";
+        loginStatus.className = message ? "status error" : "status";
+        loginKey.focus();
+      }
+      function showApp(kind) {
+        $("loginView").classList.add("hidden");
+        $("appView").classList.remove("hidden");
+        sessionPill.textContent = kind === "bearer" ? "bearer" : "session";
+        loginKey.value = "";
+      }
+
+      function buildUrl(path) {
+        const base = apiBase.value.trim();
+        return `${base}${path}`;
+      }
+
+      async function api(path, opts = {}) {
+        const headers = Object.assign(
+          { "Content-Type": "application/json" },
+          opts.headers || {}
+        );
+        const resp = await fetch(
+          buildUrl(path),
+          Object.assign(
+            { credentials: "include", headers },
+            opts
+          )
+        );
+        let payload;
+        try { payload = await resp.json(); } catch { payload = {}; }
+        if (!resp.ok) {
+          const err = new Error(payload.error || `http_${resp.status}`);
+          err.payload = payload;
+          err.status = resp.status;
+          if (resp.status === 401) {
+            // Session expired or never present — bounce to login.
+            showLogin("会话已失效，请重新登录。");
+          }
+          throw err;
+        }
+        return payload;
+      }
+
+      // ----- session bootstrap -----
+      async function probeSession() {
+        try {
+          const me = await fetch(buildUrl("/api/webchat/admin/me"), {
+            credentials: "include",
+          });
+          if (me.ok) {
+            const data = await me.json().catch(() => ({}));
+            showApp(data.kind || "session");
+            return true;
+          }
+        } catch (e) {
+          // Network / CORS; fall through to login.
+        }
+        showLogin("");
+        return false;
+      }
+
+      async function doLogin() {
+        const key = loginKey.value.trim();
+        if (!key) {
+          loginStatus.textContent = "请输入 master_admin_key";
+          loginStatus.className = "status error";
+          return;
+        }
+        loginStatus.textContent = "登录中...";
+        loginStatus.className = "status";
+        try {
+          const resp = await fetch(buildUrl("/api/webchat/admin/login"), {
+            method: "POST",
+            credentials: "include",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ key }),
+          });
+          const data = await resp.json().catch(() => ({}));
+          if (!resp.ok) {
+            loginStatus.textContent = `登录失败: ${data.error || resp.status}`;
+            loginStatus.className = "status error";
+            return;
+          }
+          showApp("session");
+        } catch (e) {
+          loginStatus.textContent = `登录失败: ${e.message}`;
+          loginStatus.className = "status error";
+        }
+      }
+
+      $("loginSubmit").onclick = doLogin;
+      loginKey.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") doLogin();
+      });
+
+      $("logoutBtn").onclick = async () => {
+        try {
+          await fetch(buildUrl("/api/webchat/admin/logout"), {
+            method: "POST",
+            credentials: "include",
+          });
+        } catch (e) {
+          // Cookie clear-on-error is the server's job; we still show login.
+        }
+        showLogin("已登出。");
       };
 
       // tab switching
@@ -465,24 +673,6 @@
       function fmt(ts) {
         if (!ts) return "-";
         return new Date(ts * 1000).toLocaleString();
-      }
-
-      async function api(path, opts = {}) {
-        const url = `${apiBase.value.trim()}${path}`;
-        const headers = Object.assign(
-          { Authorization: `Bearer ${adminKey.value.trim()}`, "Content-Type": "application/json" },
-          opts.headers || {}
-        );
-        const resp = await fetch(url, Object.assign({ headers }, opts));
-        let payload;
-        try { payload = await resp.json(); } catch { payload = {}; }
-        if (!resp.ok) {
-          const err = new Error(payload.error || `http_${resp.status}`);
-          err.payload = payload;
-          err.status = resp.status;
-          throw err;
-        }
-        return payload;
       }
 
       // ----- Issue -----
@@ -694,6 +884,9 @@
           .replace(/>/g, "&gt;")
           .replace(/"/g, "&quot;");
       }
+
+      // Boot: see if a prior session is still good before showing login.
+      probeSession();
     </script>
   </body>
 </html>

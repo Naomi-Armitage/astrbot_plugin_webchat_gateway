@@ -1,15 +1,22 @@
-"""aiohttp server bootstrap: build routing table from deps."""
+"""aiohttp server bootstrap: build routing table from deps.
+
+Routes:
+- API:   /api/webchat/chat (configurable prefix), /api/webchat/admin/{tokens,stats,audit,login,logout,me}
+- UI:    / (landing), /admin (admin panel), /chat (chat client) — same-origin so the bundled HTML works without manual CORS entries
+"""
 
 from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from pathlib import Path
 
 from aiohttp import web
 
 from astrbot.api import logger
 
 from ..core.config import ConfigView
+from .admin_auth_routes import AuthRouteDeps, make_auth_handlers
 from .admin_stats import AdminDeps, make_admin_handlers
 from .chat import ChatDeps, make_chat_handler, make_preflight_handler
 
@@ -19,6 +26,45 @@ class ServerDeps:
     config: ConfigView
     chat: ChatDeps
     admin: AdminDeps
+
+
+_PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+_EXAMPLES_DIR = _PLUGIN_ROOT / "examples"
+
+
+def _file_handler(path: Path):
+    """Build a GET handler that serves a single static HTML file.
+
+    aiohttp's add_static is overkill for three fixed pages and complicates
+    the route table. Each page is self-contained (CSS + JS inlined), so a
+    plain FileResponse is enough.
+    """
+
+    async def handle(_: web.Request) -> web.StreamResponse:
+        if not path.is_file():
+            # Plugin shipped without examples/ — return 404 rather than
+            # raising so the API still works.
+            return web.Response(status=404, text="ui_not_installed")
+        return web.FileResponse(
+            path,
+            headers={
+                # Short cache so reloads pick up edits during development;
+                # production deployments behind a CDN should override.
+                "Cache-Control": "no-cache",
+            },
+        )
+
+    return handle
+
+
+async def _redirect_with_slash(request: web.Request) -> web.Response:
+    # /admin → /admin/  so relative links inside the page (../landing/...)
+    # resolve against the admin/ directory, not /. Cheap and avoids
+    # surprising 404s when someone hand-types the bare path.
+    target = request.path.rstrip("/") + "/"
+    if request.query_string:
+        target = f"{target}?{request.query_string}"
+    return web.Response(status=308, headers={"Location": target})
 
 
 def build_app(deps: ServerDeps) -> web.Application:
@@ -52,6 +98,42 @@ def build_app(deps: ServerDeps) -> web.Application:
 
     app.router.add_get(cfg.admin_audit_path, admin["get_audit"])
     app.router.add_options(cfg.admin_audit_path, admin["preflight"])
+
+    auth = make_auth_handlers(
+        AuthRouteDeps(
+            audit=deps.admin.audit,
+            ip_guard=deps.admin.ip_guard,
+            allowed_origins=cfg.allowed_origins,
+            master_admin_key=cfg.master_admin_key,
+            trust_forwarded_for=cfg.trust_forwarded_for,
+            trust_referer_as_origin=deps.admin.trust_referer_as_origin,
+            cookie_path=cfg.admin_cookie_path,
+        )
+    )
+    app.router.add_post(cfg.admin_login_path, auth["login"])
+    app.router.add_options(cfg.admin_login_path, auth["preflight"])
+    app.router.add_post(cfg.admin_logout_path, auth["logout"])
+    app.router.add_options(cfg.admin_logout_path, auth["preflight"])
+    app.router.add_get(cfg.admin_me_path, auth["me"])
+    app.router.add_options(cfg.admin_me_path, auth["preflight"])
+
+    # Bundled UI (same-origin so allowed_origins doesn't need an entry).
+    landing = _EXAMPLES_DIR / "landing" / "index.html"
+    admin_html = _EXAMPLES_DIR / "admin_panel" / "index.html"
+    chat_html = _EXAMPLES_DIR / "chat_client" / "index.html"
+    app.router.add_get("/", _file_handler(landing))
+    app.router.add_get("/admin", _redirect_with_slash)
+    app.router.add_get("/admin/", _file_handler(admin_html))
+    app.router.add_get("/chat", _redirect_with_slash)
+    app.router.add_get("/chat/", _file_handler(chat_html))
+    # Legacy paths (existing links inside the HTML pages reference
+    # `../admin_panel/index.html` and friends). Keep them working.
+    app.router.add_get("/landing/", _file_handler(landing))
+    app.router.add_get("/landing/index.html", _file_handler(landing))
+    app.router.add_get("/admin_panel/", _file_handler(admin_html))
+    app.router.add_get("/admin_panel/index.html", _file_handler(admin_html))
+    app.router.add_get("/chat_client/", _file_handler(chat_html))
+    app.router.add_get("/chat_client/index.html", _file_handler(chat_html))
 
     return app
 

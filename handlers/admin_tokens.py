@@ -14,7 +14,13 @@ from datetime import date
 from aiohttp import web
 
 from ..core.audit import AuditLogger
-from ..core.auth import extract_bearer, generate_token, hash_token, is_master_admin
+from ..core.auth import (
+    extract_bearer,
+    extract_session_cookie,
+    generate_token,
+    has_admin_credentials,
+    hash_token,
+)
 from ..storage.base import AbstractStorage
 
 
@@ -214,12 +220,16 @@ async def gate_admin(
 ) -> None:
     """Authenticate an admin request.
 
+    Accepts EITHER:
+      - `Authorization: Bearer <master_admin_key>` / `X-API-Key: <key>` (CLI/script callers)
+      - A valid `wcg_session` cookie (admin panel after login)
+
     Pipeline (mirrors `chat.py` ordering, intentionally):
-        1. IpGuard.is_blocked → 429 ip_blocked, no master-key probe.
+        1. IpGuard.is_blocked → 429 ip_blocked, no credential probe.
         2. master_key empty → 403 admin_disabled (config issue, not attack;
            do NOT count against ip_guard).
-        3. Bearer missing → record_failure + audit + 401.
-        4. Bearer mismatch → record_failure + audit + 401.
+        3. Neither bearer nor session cookie present → record_failure + audit + 401.
+        4. Both present but neither valid → record_failure + audit + 401.
         5. Success → ip_guard.reset, return.
 
     `ip_guard` is typed loosely (no annotation) so this module need not
@@ -238,17 +248,26 @@ async def gate_admin(
             "admin_auth_fail", ip=ip, detail={"reason": "admin_disabled"}
         )
         raise ServiceError("admin_disabled", status=403)
-    presented = extract_bearer(request)
-    if not presented:
+    bearer_present = bool(extract_bearer(request))
+    cookie_present = bool(extract_session_cookie(request))
+    if not bearer_present and not cookie_present:
         await ip_guard.record_failure(ip)
         await audit.write(
             "admin_auth_fail", ip=ip, detail={"reason": "no_token"}
         )
         raise ServiceError("unauthorized", status=401)
-    if not is_master_admin(request, master_key):
+    if not has_admin_credentials(request, master_key):
         await ip_guard.record_failure(ip)
-        await audit.write(
-            "admin_auth_fail", ip=ip, detail={"reason": "invalid_key"}
+        # Distinguish bearer-only mismatch from session-only mismatch so
+        # operators reading audit logs can tell whether someone is
+        # brute-forcing the master key vs. replaying a stolen cookie.
+        reason = (
+            "invalid_key"
+            if bearer_present and not cookie_present
+            else "invalid_session"
+            if cookie_present and not bearer_present
+            else "invalid_credentials"
         )
+        await audit.write("admin_auth_fail", ip=ip, detail={"reason": reason})
         raise ServiceError("unauthorized", status=401)
     await ip_guard.reset(ip)

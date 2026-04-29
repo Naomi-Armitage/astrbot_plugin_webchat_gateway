@@ -61,7 +61,7 @@ def make_admin_handlers(deps: AdminDeps):
     def _origin(request: web.Request) -> str | None:
         return extract_origin(request, trust_referer_as_origin=trust_referer)
 
-    def _err(origin, exc: ServiceError) -> web.Response:
+    def _err(request: web.Request, origin, exc: ServiceError) -> web.Response:
         extra = None
         if exc.code == "ip_blocked" and str(exc):
             extra = {"Retry-After": str(exc)}
@@ -71,12 +71,15 @@ def make_admin_handlers(deps: AdminDeps):
             origin=origin,
             allowed_origins=allowed,
             extra_headers=extra,
+            same_origin_host=request.host,
         )
 
     async def _gate(request: web.Request, ip: str, origin: str | None) -> None:
         # Origin allow-list — match chat.py ordering: cheap filter before any
         # IpGuard accounting or master-key probe.
-        if not is_origin_allowed(origin, allowed):
+        if not is_origin_allowed(
+            origin, allowed, same_origin_host=request.host
+        ):
             raise ServiceError("forbidden_origin", status=403)
         await gate_admin(
             request,
@@ -99,10 +102,10 @@ def make_admin_handlers(deps: AdminDeps):
                 ip=ip,
             )
         except ServiceError as exc:
-            return _err(origin, exc)
+            return _err(request, origin, exc)
         except Exception:
             logger.exception("[WebChatGateway] admin issue failed")
-            return _err(origin, ServiceError("internal_error", status=500))
+            return _err(request, origin, ServiceError("internal_error", status=500))
         return json_response(
             {
                 "name": result.name,
@@ -114,6 +117,7 @@ def make_admin_handlers(deps: AdminDeps):
             status=201,
             origin=origin,
             allowed_origins=allowed,
+            same_origin_host=request.host,
         )
 
     async def delete_token(request: web.Request) -> web.Response:
@@ -124,16 +128,17 @@ def make_admin_handlers(deps: AdminDeps):
             await _gate(request, ip, origin)
             ok = await deps.token_service.revoke(name=name, ip=ip)
         except ServiceError as exc:
-            return _err(origin, exc)
+            return _err(request, origin, exc)
         except Exception:
             logger.exception("[WebChatGateway] admin revoke failed")
-            return _err(origin, ServiceError("internal_error", status=500))
+            return _err(request, origin, ServiceError("internal_error", status=500))
         if not ok:
-            return _err(origin, ServiceError("not_found", status=404))
+            return _err(request, origin, ServiceError("not_found", status=404))
         return json_response(
             {"name": name, "revoked": True},
             origin=origin,
             allowed_origins=allowed,
+            same_origin_host=request.host,
         )
 
     async def list_tokens(request: web.Request) -> web.Response:
@@ -150,10 +155,10 @@ def make_admin_handlers(deps: AdminDeps):
                 include_revoked=include, ip=ip
             )
         except ServiceError as exc:
-            return _err(origin, exc)
+            return _err(request, origin, exc)
         except Exception:
             logger.exception("[WebChatGateway] admin list failed")
-            return _err(origin, ServiceError("internal_error", status=500))
+            return _err(request, origin, ServiceError("internal_error", status=500))
         return json_response(
             {
                 "tokens": [
@@ -170,6 +175,7 @@ def make_admin_handlers(deps: AdminDeps):
             },
             origin=origin,
             allowed_origins=allowed,
+            same_origin_host=request.host,
         )
 
     async def get_stats(request: web.Request) -> web.Response:
@@ -181,11 +187,16 @@ def make_admin_handlers(deps: AdminDeps):
             days = _parse_int(request.query.get("days"), default=7, lo=1, hi=90)
             data = await deps.token_service.stats(name=name, days=days, ip=ip)
         except ServiceError as exc:
-            return _err(origin, exc)
+            return _err(request, origin, exc)
         except Exception:
             logger.exception("[WebChatGateway] admin stats failed")
-            return _err(origin, ServiceError("internal_error", status=500))
-        return json_response(data, origin=origin, allowed_origins=allowed)
+            return _err(request, origin, ServiceError("internal_error", status=500))
+        return json_response(
+            data,
+            origin=origin,
+            allowed_origins=allowed,
+            same_origin_host=request.host,
+        )
 
     async def get_audit(request: web.Request) -> web.Response:
         origin = _origin(request)
@@ -198,10 +209,10 @@ def make_admin_handlers(deps: AdminDeps):
                 "admin_audit", ip=ip, detail={"limit": limit, "count": len(rows)}
             )
         except ServiceError as exc:
-            return _err(origin, exc)
+            return _err(request, origin, exc)
         except Exception:
             logger.exception("[WebChatGateway] admin audit failed")
-            return _err(origin, ServiceError("internal_error", status=500))
+            return _err(request, origin, ServiceError("internal_error", status=500))
         return json_response(
             {
                 "events": [
@@ -218,10 +229,15 @@ def make_admin_handlers(deps: AdminDeps):
             },
             origin=origin,
             allowed_origins=allowed,
+            same_origin_host=request.host,
         )
 
     async def preflight(request: web.Request) -> web.Response:
-        return preflight_response(origin=_origin(request), allowed=allowed)
+        return preflight_response(
+            origin=_origin(request),
+            allowed=allowed,
+            same_origin_host=request.host,
+        )
 
     return {
         "post_tokens": post_tokens,

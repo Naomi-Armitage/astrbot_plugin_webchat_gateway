@@ -35,25 +35,61 @@ def extract_origin(
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
-def is_origin_allowed(origin: str | None, allowed: set[str]) -> bool:
+def is_origin_allowed(
+    origin: str | None,
+    allowed: set[str],
+    *,
+    same_origin_host: str | None = None,
+) -> bool:
     if "*" in allowed:
         return True
     if origin is None:
         # Non-browser clients (curl, server-side) typically omit Origin.
         return True
-    return origin in allowed
+    if origin in allowed:
+        return True
+    if same_origin_host:
+        # Auto-allow same-origin requests so the bundled UI works without
+        # forcing operators to add the gateway's own URL to allowed_origins.
+        # request.host already includes :port, and a URL Origin's netloc
+        # includes :port too, so an exact equality check is correct.
+        parsed = urlparse(origin)
+        if parsed.netloc and parsed.netloc == same_origin_host:
+            return True
+    return False
 
 
-def build_cors_headers(origin: str | None, allowed: set[str]) -> dict[str, str]:
+def build_cors_headers(
+    origin: str | None,
+    allowed: set[str],
+    *,
+    same_origin_host: str | None = None,
+) -> dict[str, str]:
     headers = {
         "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
         "Access-Control-Allow-Headers": "Content-Type, Authorization, X-API-Key",
+        "Access-Control-Allow-Credentials": "true",
         "Access-Control-Max-Age": "600",
     }
     if "*" in allowed:
-        headers["Access-Control-Allow-Origin"] = "*"
+        # Wildcard + credentials is invalid per spec; if the operator
+        # opted into '*', echo the request's Origin so credentials still
+        # work for the bundled UI. Falling back to '*' keeps non-browser
+        # callers happy.
+        if origin:
+            headers["Access-Control-Allow-Origin"] = origin
+            headers["Vary"] = "Origin"
+        else:
+            headers["Access-Control-Allow-Origin"] = "*"
+            headers.pop("Access-Control-Allow-Credentials", None)
         return headers
-    if origin and origin in allowed:
+    if origin and (
+        origin in allowed
+        or (
+            same_origin_host
+            and urlparse(origin).netloc == same_origin_host
+        )
+    ):
         headers["Access-Control-Allow-Origin"] = origin
         headers["Vary"] = "Origin"
     return headers
@@ -84,21 +120,33 @@ def json_response(
     origin: str | None = None,
     allowed_origins: set[str] | None = None,
     extra_headers: dict[str, str] | None = None,
+    same_origin_host: str | None = None,
 ) -> web.Response:
-    headers = build_cors_headers(origin, allowed_origins or {"*"})
+    headers = build_cors_headers(
+        origin, allowed_origins or {"*"}, same_origin_host=same_origin_host
+    )
     if extra_headers:
         headers.update(extra_headers)
     return web.json_response(payload, status=status, headers=headers)
 
 
 def preflight_response(
-    *, origin: str | None, allowed: set[str]
+    *,
+    origin: str | None,
+    allowed: set[str],
+    same_origin_host: str | None = None,
 ) -> web.Response:
-    if not is_origin_allowed(origin, allowed):
+    if not is_origin_allowed(origin, allowed, same_origin_host=same_origin_host):
         return json_response(
             {"error": "forbidden_origin"},
             status=403,
             origin=origin,
             allowed_origins=allowed,
+            same_origin_host=same_origin_host,
         )
-    return web.Response(status=204, headers=build_cors_headers(origin, allowed))
+    return web.Response(
+        status=204,
+        headers=build_cors_headers(
+            origin, allowed, same_origin_host=same_origin_host
+        ),
+    )

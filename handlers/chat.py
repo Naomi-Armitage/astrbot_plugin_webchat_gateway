@@ -86,14 +86,16 @@ def make_chat_handler(deps: ChatDeps):
             request, trust_referer_as_origin=deps.trust_referer_as_origin
         )
         allowed = deps.allowed_origins
+        same_host = request.host
 
         # 1. Origin allow-list
-        if not is_origin_allowed(origin, allowed):
+        if not is_origin_allowed(origin, allowed, same_origin_host=same_host):
             return json_response(
                 {"error": "forbidden_origin"},
                 status=403,
                 origin=origin,
                 allowed_origins=allowed,
+                same_origin_host=same_host,
             )
 
         ip = client_ip(request, trust_forwarded_for=deps.trust_forwarded_for)
@@ -107,6 +109,7 @@ def make_chat_handler(deps: ChatDeps):
                 origin=origin,
                 allowed_origins=allowed,
                 extra_headers={"Retry-After": str(retry_after)},
+                same_origin_host=same_host,
             )
 
         # 3. Auth
@@ -119,6 +122,7 @@ def make_chat_handler(deps: ChatDeps):
                 status=401,
                 origin=origin,
                 allowed_origins=allowed,
+                same_origin_host=same_host,
             )
         token = await deps.storage.get_token_by_hash(hash_token(presented))
         if token is None or token.revoked_at is not None:
@@ -138,6 +142,7 @@ def make_chat_handler(deps: ChatDeps):
                 status=401,
                 origin=origin,
                 allowed_origins=allowed,
+                same_origin_host=same_host,
             )
         # Valid auth — clear failures for this IP.
         await deps.ip_guard.reset(ip)
@@ -152,6 +157,7 @@ def make_chat_handler(deps: ChatDeps):
                 status=413,
                 origin=origin,
                 allowed_origins=allowed,
+                same_origin_host=same_host,
             )
         except json.JSONDecodeError:
             return json_response(
@@ -159,6 +165,7 @@ def make_chat_handler(deps: ChatDeps):
                 status=400,
                 origin=origin,
                 allowed_origins=allowed,
+                same_origin_host=same_host,
             )
         except Exception:
             logger.exception("[WebChatGateway] unexpected JSON parse error")
@@ -167,6 +174,7 @@ def make_chat_handler(deps: ChatDeps):
                 status=400,
                 origin=origin,
                 allowed_origins=allowed,
+                same_origin_host=same_host,
             )
         data = _parse_payload(payload)
         if data is None:
@@ -175,6 +183,7 @@ def make_chat_handler(deps: ChatDeps):
                 status=400,
                 origin=origin,
                 allowed_origins=allowed,
+                same_origin_host=same_host,
             )
         if len(data.message) > deps.max_message_length:
             return json_response(
@@ -185,6 +194,7 @@ def make_chat_handler(deps: ChatDeps):
                 status=400,
                 origin=origin,
                 allowed_origins=allowed,
+                same_origin_host=same_host,
             )
 
         # 5. Concurrency lock
@@ -198,6 +208,7 @@ def make_chat_handler(deps: ChatDeps):
                     status=429,
                     origin=origin,
                     allowed_origins=allowed,
+                    same_origin_host=same_host,
                 )
 
             # 6. Daily quota check (read-then-increment is racy across processes,
@@ -220,6 +231,7 @@ def make_chat_handler(deps: ChatDeps):
                     status=429,
                     origin=origin,
                     allowed_origins=allowed,
+                    same_origin_host=same_host,
                 )
 
             # 7. LLM call
@@ -243,6 +255,7 @@ def make_chat_handler(deps: ChatDeps):
                         status=504,
                         origin=origin,
                         allowed_origins=allowed,
+                        same_origin_host=same_host,
                     )
                 # Internal exception text may leak provider names, paths, or
                 # context near credentials — keep it in audit/log only and
@@ -259,6 +272,7 @@ def make_chat_handler(deps: ChatDeps):
                     status=500,
                     origin=origin,
                     allowed_origins=allowed,
+                    same_origin_host=same_host,
                 )
             except Exception as exc:
                 logger.exception("[WebChatGateway] LLM call failed")
@@ -273,6 +287,7 @@ def make_chat_handler(deps: ChatDeps):
                     status=500,
                     origin=origin,
                     allowed_origins=allowed,
+                    same_origin_host=same_host,
                 )
 
             # 8. Increment usage (atomic)
@@ -298,6 +313,7 @@ def make_chat_handler(deps: ChatDeps):
                 },
                 origin=origin,
                 allowed_origins=allowed,
+                same_origin_host=same_host,
             )
 
     return handle
@@ -314,6 +330,7 @@ def make_preflight_handler(
                 request, trust_referer_as_origin=trust_referer_as_origin
             ),
             allowed=allowed,
+            same_origin_host=request.host,
         )
 
     return handle

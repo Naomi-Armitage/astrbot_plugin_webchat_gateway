@@ -8,6 +8,8 @@ import secrets
 
 from aiohttp import web
 
+from .session import COOKIE_NAME, verify_session
+
 
 def generate_token() -> str:
     """Return a 43-char URL-safe token (32 bytes of entropy)."""
@@ -40,3 +42,30 @@ def is_master_admin(request: web.Request, master_key: str) -> bool:
     if not presented:
         return False
     return constant_time_eq(presented, master_key)
+
+
+def extract_session_cookie(request: web.Request) -> str:
+    return (request.cookies.get(COOKIE_NAME) or "").strip()
+
+
+def has_admin_credentials(request: web.Request, master_key: str) -> bool:
+    """True if EITHER bearer matches master_key OR a valid session cookie is present."""
+    if not master_key:
+        return False
+    if is_master_admin(request, master_key):
+        return True
+    cookie = extract_session_cookie(request)
+    return bool(cookie) and verify_session(master_key, cookie)
+
+
+def admin_credential_kind(request: web.Request) -> str:
+    """Tag for audit logs: 'bearer', 'session', or 'none'.
+
+    Does NOT validate — purely for logging which channel the caller used,
+    so audit trails can distinguish UI sessions from script automation.
+    """
+    if extract_bearer(request):
+        return "bearer"
+    if extract_session_cookie(request):
+        return "session"
+    return "none"

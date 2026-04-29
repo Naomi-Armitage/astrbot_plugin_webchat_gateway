@@ -104,6 +104,22 @@ class ConfigView:
     def admin_audit_path(self) -> str:
         return f"{self.endpoint_prefix}/admin/audit"
 
+    @property
+    def admin_login_path(self) -> str:
+        return f"{self.endpoint_prefix}/admin/login"
+
+    @property
+    def admin_logout_path(self) -> str:
+        return f"{self.endpoint_prefix}/admin/logout"
+
+    @property
+    def admin_me_path(self) -> str:
+        return f"{self.endpoint_prefix}/admin/me"
+
+    @property
+    def admin_cookie_path(self) -> str:
+        return f"{self.endpoint_prefix}/admin"
+
     @classmethod
     def from_raw(cls, cfg: Any) -> "ConfigView":
         host = str(_get(cfg, "host", "0.0.0.0")).strip() or "0.0.0.0"
