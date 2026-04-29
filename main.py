@@ -112,6 +112,7 @@ class WebChatGatewayPlugin(Star):
                 master_admin_key=cfg.master_admin_key,
                 trust_forwarded_for=cfg.trust_forwarded_for,
                 ip_guard=ip_guard,
+                trust_referer_as_origin=cfg.trust_referer_as_origin,
             )
             server_deps = ServerDeps(config=cfg, chat=chat_deps, admin=admin_deps)
             app = build_app(server_deps)

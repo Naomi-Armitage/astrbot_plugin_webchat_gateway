@@ -98,6 +98,31 @@ class LlmBridge:
         username: str,
         message: str,
     ) -> str:
+        # Wrap the entire flow in a single timeout. Without this, slow
+        # provider lookup / persona resolution / conversation_manager calls
+        # could pin the per-token concurrency lock indefinitely while only
+        # the inner llm_generate had its own deadline.
+        try:
+            return await asyncio.wait_for(
+                self._generate_reply_inner(
+                    token_name=token_name,
+                    session_id=session_id,
+                    username=username,
+                    message=message,
+                ),
+                timeout=self._timeout,
+            )
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError("llm_timeout") from exc
+
+    async def _generate_reply_inner(
+        self,
+        *,
+        token_name: str,
+        session_id: str,
+        username: str,
+        message: str,
+    ) -> str:
         # Namespace by token so two callers passing the same sessionId never
         # share conversation history across tokens.
         unified_origin = f"webchat_gateway:{token_name}:{session_id}"
@@ -124,17 +149,11 @@ class LlmBridge:
             message=message, system_prompt=system_prompt, history=history
         )
 
-        try:
-            resp = await asyncio.wait_for(
-                self._context.llm_generate(
-                    chat_provider_id=provider_id,
-                    prompt=prompt,
-                    persona_id=persona_id,
-                ),
-                timeout=self._timeout,
-            )
-        except asyncio.TimeoutError as exc:
-            raise RuntimeError("llm_timeout") from exc
+        resp = await self._context.llm_generate(
+            chat_provider_id=provider_id,
+            prompt=prompt,
+            persona_id=persona_id,
+        )
         reply = (resp.completion_text or "").strip()
         if not reply:
             raise RuntimeError("empty_reply")

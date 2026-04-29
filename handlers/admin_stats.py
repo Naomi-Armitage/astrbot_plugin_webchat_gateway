@@ -31,6 +31,7 @@ class AdminDeps:
     master_admin_key: str
     trust_forwarded_for: bool
     ip_guard: IpGuard
+    trust_referer_as_origin: bool = False
 
 
 def _parse_int(value, default: int, lo: int, hi: int) -> int:
@@ -55,6 +56,10 @@ async def _read_json(request: web.Request) -> dict:
 
 def make_admin_handlers(deps: AdminDeps):
     allowed = deps.allowed_origins
+    trust_referer = deps.trust_referer_as_origin
+
+    def _origin(request: web.Request) -> str | None:
+        return extract_origin(request, trust_referer_as_origin=trust_referer)
 
     def _err(origin, exc: ServiceError) -> web.Response:
         extra = None
@@ -82,7 +87,7 @@ def make_admin_handlers(deps: AdminDeps):
         )
 
     async def post_tokens(request: web.Request) -> web.Response:
-        origin = extract_origin(request)
+        origin = _origin(request)
         ip = client_ip(request, trust_forwarded_for=deps.trust_forwarded_for)
         try:
             await _gate(request, ip, origin)
@@ -112,7 +117,7 @@ def make_admin_handlers(deps: AdminDeps):
         )
 
     async def delete_token(request: web.Request) -> web.Response:
-        origin = extract_origin(request)
+        origin = _origin(request)
         ip = client_ip(request, trust_forwarded_for=deps.trust_forwarded_for)
         name = request.match_info.get("name", "")
         try:
@@ -132,7 +137,7 @@ def make_admin_handlers(deps: AdminDeps):
         )
 
     async def list_tokens(request: web.Request) -> web.Response:
-        origin = extract_origin(request)
+        origin = _origin(request)
         ip = client_ip(request, trust_forwarded_for=deps.trust_forwarded_for)
         try:
             await _gate(request, ip, origin)
@@ -168,7 +173,7 @@ def make_admin_handlers(deps: AdminDeps):
         )
 
     async def get_stats(request: web.Request) -> web.Response:
-        origin = extract_origin(request)
+        origin = _origin(request)
         ip = client_ip(request, trust_forwarded_for=deps.trust_forwarded_for)
         try:
             await _gate(request, ip, origin)
@@ -183,7 +188,7 @@ def make_admin_handlers(deps: AdminDeps):
         return json_response(data, origin=origin, allowed_origins=allowed)
 
     async def get_audit(request: web.Request) -> web.Response:
-        origin = extract_origin(request)
+        origin = _origin(request)
         ip = client_ip(request, trust_forwarded_for=deps.trust_forwarded_for)
         try:
             await _gate(request, ip, origin)
@@ -216,7 +221,7 @@ def make_admin_handlers(deps: AdminDeps):
         )
 
     async def preflight(request: web.Request) -> web.Response:
-        return preflight_response(origin=extract_origin(request), allowed=allowed)
+        return preflight_response(origin=_origin(request), allowed=allowed)
 
     return {
         "post_tokens": post_tokens,

@@ -68,10 +68,27 @@ class ServerLifecycle:
         async with self._lock:
             if self._runner:
                 return
-            self._runner = web.AppRunner(app)
-            await self._runner.setup()
-            self._site = web.TCPSite(self._runner, host, port)
-            await self._site.start()
+            runner = web.AppRunner(app)
+            await runner.setup()
+            try:
+                site = web.TCPSite(runner, host, port)
+                await site.start()
+            except BaseException:
+                # AppRunner.setup() succeeded — if TCPSite construction or
+                # start fails (port in use, perms), the runner still owns
+                # an aiohttp server and signal handlers. Tearing it down
+                # here keeps the lifecycle re-entrant: the next `start`
+                # call would otherwise see `self._runner` is None but a
+                # stale runner would already be holding resources.
+                try:
+                    await runner.cleanup()
+                except Exception:
+                    logger.exception(
+                        "[WebChatGateway] runner cleanup after start failure failed"
+                    )
+                raise
+            self._runner = runner
+            self._site = site
             logger.info("[WebChatGateway] HTTP server started at http://%s:%s", host, port)
 
     async def stop(self) -> None:

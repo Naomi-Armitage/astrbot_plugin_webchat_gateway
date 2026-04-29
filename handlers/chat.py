@@ -244,6 +244,9 @@ def make_chat_handler(deps: ChatDeps):
                         origin=origin,
                         allowed_origins=allowed,
                     )
+                # Internal exception text may leak provider names, paths, or
+                # context near credentials — keep it in audit/log only and
+                # return a stable error code to the caller.
                 logger.exception("[WebChatGateway] LLM call failed")
                 await deps.audit.write(
                     "chat_error",
@@ -252,7 +255,7 @@ def make_chat_handler(deps: ChatDeps):
                     detail={"error": str(exc)[:200]},
                 )
                 return json_response(
-                    {"error": "llm_call_failed", "detail": str(exc)[:200]},
+                    {"error": "llm_call_failed"},
                     status=500,
                     origin=origin,
                     allowed_origins=allowed,
@@ -266,7 +269,7 @@ def make_chat_handler(deps: ChatDeps):
                     detail={"error": str(exc)[:200]},
                 )
                 return json_response(
-                    {"error": "llm_call_failed", "detail": str(exc)[:200]},
+                    {"error": "llm_call_failed"},
                     status=500,
                     origin=origin,
                     allowed_origins=allowed,

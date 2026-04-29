@@ -88,6 +88,23 @@ class MysqlStorage(AbstractStorage):
                     pass
                 raise
 
+    @asynccontextmanager
+    async def _read_tx(self) -> AsyncIterator[aiomysql.Connection]:
+        # autocommit=False starts an implicit transaction on the first SELECT
+        # under REPEATABLE READ. Without an explicit rollback, the pooled
+        # connection keeps that transaction (and its snapshot) open across
+        # checkout boundaries, so the next caller can read stale data and
+        # MVCC undo logs grow unboundedly. Always close the read transaction
+        # before returning the connection to the pool.
+        async with self._db.acquire() as conn:
+            try:
+                yield conn
+            finally:
+                try:
+                    await conn.rollback()
+                except Exception:
+                    pass
+
     @staticmethod
     def _row_to_token(row: dict) -> TokenRow:
         return TokenRow(
@@ -118,7 +135,7 @@ class MysqlStorage(AbstractStorage):
                 )
 
     async def get_token_by_hash(self, token_hash: str) -> TokenRow | None:
-        async with self._db.acquire() as conn:
+        async with self._read_tx() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
                     "SELECT * FROM tokens WHERE token_hash = %s", (token_hash,)
@@ -127,7 +144,7 @@ class MysqlStorage(AbstractStorage):
         return self._row_to_token(row) if row else None
 
     async def get_token_by_name(self, name: str) -> TokenRow | None:
-        async with self._db.acquire() as conn:
+        async with self._read_tx() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute("SELECT * FROM tokens WHERE name = %s", (name,))
                 row = await cur.fetchone()
@@ -149,7 +166,7 @@ class MysqlStorage(AbstractStorage):
         if not include_revoked:
             sql += " WHERE revoked_at IS NULL"
         sql += " ORDER BY created_at DESC"
-        async with self._db.acquire() as conn:
+        async with self._read_tx() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(sql)
                 rows = await cur.fetchall()
@@ -170,7 +187,7 @@ class MysqlStorage(AbstractStorage):
         return int(new_count or 1)
 
     async def get_today_usage(self, name: str, *, day: date) -> int:
-        async with self._db.acquire() as conn:
+        async with self._read_tx() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     "SELECT count FROM daily_usage WHERE name = %s AND day = %s",
@@ -189,7 +206,7 @@ class MysqlStorage(AbstractStorage):
             f"SELECT name, count FROM daily_usage "
             f"WHERE day = %s AND name IN ({placeholders})"
         )
-        async with self._db.acquire() as conn:
+        async with self._read_tx() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(sql, (day, *names))
                 rows = await cur.fetchall()
@@ -202,7 +219,7 @@ class MysqlStorage(AbstractStorage):
         days = max(1, min(days, 365))
         today = date.today()
         first = today - timedelta(days=days - 1)
-        async with self._db.acquire() as conn:
+        async with self._read_tx() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     "SELECT day, count FROM daily_usage "
@@ -276,7 +293,7 @@ class MysqlStorage(AbstractStorage):
         return new_count
 
     async def is_ip_blocked(self, ip: str, *, now: int) -> tuple[bool, int]:
-        async with self._db.acquire() as conn:
+        async with self._read_tx() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     "SELECT blocked_until FROM ip_failures WHERE ip = %s", (ip,)
@@ -314,7 +331,7 @@ class MysqlStorage(AbstractStorage):
 
     async def get_recent_audit(self, *, limit: int) -> list[AuditRow]:
         limit = max(1, min(limit, 500))
-        async with self._db.acquire() as conn:
+        async with self._read_tx() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
                     "SELECT id, ts, name, ip, event, detail FROM audit_log "
