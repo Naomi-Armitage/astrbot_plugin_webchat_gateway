@@ -41,8 +41,7 @@ class WebChatGatewayPlugin(Star):
         self._token_service: TokenService | None = None
         self._audit: AuditLogger | None = None
 
-    @filter.on_astrbot_loaded()
-    async def on_astrbot_loaded(self) -> None:
+    async def initialize(self) -> None:
         await self._start()
 
     async def terminate(self) -> None:
