@@ -232,6 +232,7 @@
       const API_BASE = "";
       const PREFIX = "/api/webchat";
       const CHAT_URL = `${API_BASE}${PREFIX}/chat`;
+      const ME_URL = `${API_BASE}${PREFIX}/me`;
       const SITE_URL = `${API_BASE}${PREFIX}/site`;
 
       const LS = {
@@ -286,6 +287,29 @@
           document.title = `${name} · Chat`;
           document.getElementById("brandName").textContent = name;
         } catch { /* keep defaults */ }
+      })();
+
+      // Quota probe: fires on every page load (including refresh) so the
+      // badge has a value before the first message round-trip. 401 means
+      // the saved token was revoked since last visit — treat the same as
+      // a logout and bounce back to /login.
+      (async () => {
+        try {
+          const resp = await fetch(ME_URL, {
+            headers: { Authorization: `Bearer ${savedToken}` },
+            credentials: "same-origin",
+          });
+          if (resp.status === 401) {
+            localStorage.removeItem(LS.token);
+            location.replace("/login");
+            return;
+          }
+          if (!resp.ok) return;
+          const data = await resp.json();
+          if (typeof data.remaining === "number" && typeof data.daily_quota === "number") {
+            setBadge(data.remaining, data.daily_quota);
+          }
+        } catch { /* leave badge as -- */ }
       })();
 
       function setBadge(remaining, quota) {

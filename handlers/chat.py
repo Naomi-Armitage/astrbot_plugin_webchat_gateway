@@ -336,9 +336,90 @@ def make_preflight_handler(
     return handle
 
 
+def make_me_handler(deps: ChatDeps):
+    """GET /me — token-authed quota probe.
+
+    Same Origin / IP-guard / bearer auth as the chat handler so an
+    attacker can't use it to enumerate tokens any more cheaply than
+    /chat itself. Skips the per-token concurrency lock and audit
+    logging because legitimate clients call this on every chat-page
+    load and refresh; auditing it would flood the table.
+    """
+
+    async def handle(request: web.Request) -> web.Response:
+        origin = extract_origin(
+            request, trust_referer_as_origin=deps.trust_referer_as_origin
+        )
+        allowed = deps.allowed_origins
+        same_host = request.host
+
+        if not is_origin_allowed(origin, allowed, same_origin_host=same_host):
+            return json_response(
+                {"error": "forbidden_origin"},
+                status=403,
+                origin=origin,
+                allowed_origins=allowed,
+                same_origin_host=same_host,
+            )
+
+        ip = client_ip(request, trust_forwarded_for=deps.trust_forwarded_for)
+
+        blocked, retry_after = await deps.ip_guard.is_blocked(ip)
+        if blocked:
+            return json_response(
+                {"error": "ip_blocked", "retry_after": retry_after},
+                status=429,
+                origin=origin,
+                allowed_origins=allowed,
+                extra_headers={"Retry-After": str(retry_after)},
+                same_origin_host=same_host,
+            )
+
+        presented = extract_bearer(request)
+        if not presented:
+            await deps.ip_guard.record_failure(ip)
+            return json_response(
+                {"error": "unauthorized"},
+                status=401,
+                origin=origin,
+                allowed_origins=allowed,
+                same_origin_host=same_host,
+            )
+        token = await deps.storage.get_token_by_hash(hash_token(presented))
+        if token is None or token.revoked_at is not None:
+            if token is None:
+                await deps.ip_guard.record_failure(ip)
+            return json_response(
+                {"error": "unauthorized"},
+                status=401,
+                origin=origin,
+                allowed_origins=allowed,
+                same_origin_host=same_host,
+            )
+        await deps.ip_guard.reset(ip)
+
+        today = date.today()
+        today_count = await deps.storage.get_today_usage(token.name, day=today)
+        remaining = max(0, token.daily_quota - today_count)
+        return json_response(
+            {
+                "name": token.name,
+                "remaining": remaining,
+                "daily_quota": token.daily_quota,
+            },
+            origin=origin,
+            allowed_origins=allowed,
+            same_origin_host=same_host,
+            extra_headers={"Cache-Control": "no-store"},
+        )
+
+    return handle
+
+
 __all__ = [
     "ChatDeps",
     "make_chat_handler",
+    "make_me_handler",
     "make_preflight_handler",
     "build_cors_headers",
 ]

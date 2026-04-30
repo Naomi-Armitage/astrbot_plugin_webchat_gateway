@@ -126,6 +126,10 @@ class ConfigView:
         return f"{self.endpoint_prefix}/chat"
 
     @property
+    def me_path(self) -> str:
+        return f"{self.endpoint_prefix}/me"
+
+    @property
     def site_info_path(self) -> str:
         return f"{self.endpoint_prefix}/site"
 

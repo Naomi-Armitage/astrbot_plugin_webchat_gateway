@@ -1,7 +1,7 @@
 """aiohttp server bootstrap: build routing table from deps.
 
 Routes:
-- API:   /api/webchat/chat (configurable prefix), /api/webchat/admin/{tokens,stats,audit,login,logout,me}, /api/webchat/site (public branding)
+- API:   /api/webchat/chat (configurable prefix), /api/webchat/me (token quota probe), /api/webchat/admin/{tokens,stats,audit,login,logout,me}, /api/webchat/site (public branding)
 - UI:    / (landing), /login (token entry), {admin_ui_path} (admin panel, default /admin), /chat (chat client) — same-origin so the bundled HTML works without manual CORS entries
 """
 
@@ -18,7 +18,7 @@ from astrbot.api import logger
 from ..core.config import ConfigView
 from .admin_auth_routes import AuthRouteDeps, make_auth_handlers
 from .admin_stats import AdminDeps, make_admin_handlers
-from .chat import ChatDeps, make_chat_handler, make_preflight_handler
+from .chat import ChatDeps, make_chat_handler, make_me_handler, make_preflight_handler
 from .site import SiteDeps, make_site_handlers
 
 
@@ -83,6 +83,10 @@ def build_app(deps: ServerDeps) -> web.Application:
 
     app.router.add_post(cfg.chat_path, chat_handler)
     app.router.add_options(cfg.chat_path, chat_preflight)
+
+    me_handler = make_me_handler(deps.chat)
+    app.router.add_get(cfg.me_path, me_handler)
+    app.router.add_options(cfg.me_path, chat_preflight)
 
     admin = make_admin_handlers(deps.admin)
 
