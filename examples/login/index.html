@@ -1,0 +1,455 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WebChat Gateway</title>
+    <meta name="description" content="WebChat Gateway 入口" />
+    <meta name="robots" content="noindex" />
+    <style>
+      :root[data-theme="dark"] {
+        --bg: #0d1117;
+        --bg-elev: #0b0f15;
+        --surface: #161b22;
+        --surface-2: #1c2330;
+        --border: #30363d;
+        --border-soft: #21262d;
+        --text: #e6edf3;
+        --text-strong: #f0f6fc;
+        --muted: #8b949e;
+        --accent: #a371f7;
+        --accent-strong: #b692ff;
+        --accent-soft: rgba(163, 113, 247, 0.14);
+        --good: #3fb950;
+        --bad: #f85149;
+        --grid: rgba(139, 148, 158, 0.08);
+      }
+      :root[data-theme="light"] {
+        --bg: #ffffff;
+        --bg-elev: #f6f8fa;
+        --surface: #ffffff;
+        --surface-2: #f6f8fa;
+        --border: #d0d7de;
+        --border-soft: #eaeef2;
+        --text: #1f2328;
+        --text-strong: #0a0c10;
+        --muted: #59636e;
+        --accent: #6639ba;
+        --accent-strong: #5226a3;
+        --accent-soft: rgba(102, 57, 186, 0.10);
+        --good: #1a7f37;
+        --bad: #cf222e;
+        --grid: rgba(31, 35, 40, 0.06);
+      }
+
+      *, *::before, *::after { box-sizing: border-box; }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font: 15px/1.55 "Comic Sans MS", "Comic Neue", "Chalkboard SE", system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+        -webkit-font-smoothing: antialiased;
+        text-rendering: optimizeLegibility;
+        min-height: 100vh;
+        display: flex;
+        flex-direction: column;
+      }
+      a { color: var(--accent-strong); text-decoration: none; }
+      a:hover { text-decoration: underline; }
+      h1, h2, h3 { color: var(--text-strong); margin: 0; letter-spacing: -0.01em; }
+
+      .container { max-width: 720px; margin: 0 auto; padding: 0 20px; width: 100%; }
+
+      /* ---------- nav ---------- */
+      .nav {
+        border-bottom: 1px solid var(--border-soft);
+        background: color-mix(in oklab, var(--bg) 80%, transparent);
+        backdrop-filter: saturate(140%) blur(10px);
+        -webkit-backdrop-filter: saturate(140%) blur(10px);
+      }
+      .nav-inner {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        height: 56px;
+      }
+      .brand {
+        display: flex; align-items: center; gap: 10px;
+        font-weight: 600; color: var(--text-strong);
+        text-decoration: none;
+      }
+      .brand:hover { text-decoration: none; }
+      .brand-mark {
+        width: 28px; height: 28px;
+        display: grid; place-items: center;
+        background: var(--accent-soft);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+      }
+      .brand-mark svg { width: 16px; height: 16px; color: var(--accent-strong); }
+      .nav-actions {
+        margin-left: auto;
+        display: flex; align-items: center; gap: 6px;
+      }
+      .icon-btn {
+        display: inline-grid; place-items: center;
+        width: 34px; height: 34px;
+        font: inherit;
+        color: var(--muted);
+        background: transparent;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        cursor: pointer;
+        text-decoration: none !important;
+      }
+      .icon-btn:hover { color: var(--text-strong); background: var(--surface); }
+      .icon-btn svg { width: 16px; height: 16px; }
+
+      /* ---------- main ---------- */
+      main {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+      }
+
+      /* ---------- hero ---------- */
+      .hero {
+        position: relative;
+        padding: 72px 0 24px;
+        overflow: hidden;
+      }
+      .hero-bg {
+        position: absolute; inset: 0;
+        pointer-events: none;
+        background:
+          radial-gradient(60% 60% at 50% 0%, var(--accent-soft) 0%, transparent 60%),
+          linear-gradient(var(--grid) 1px, transparent 1px) 0 0 / 40px 40px,
+          linear-gradient(90deg, var(--grid) 1px, transparent 1px) 0 0 / 40px 40px;
+        mask-image: radial-gradient(ellipse at 50% 30%, #000 30%, transparent 75%);
+        -webkit-mask-image: radial-gradient(ellipse at 50% 30%, #000 30%, transparent 75%);
+      }
+      .hero-inner {
+        position: relative;
+        text-align: center;
+        display: grid;
+        gap: 14px;
+      }
+      .hero h1 {
+        font-size: clamp(28px, 5vw, 40px);
+        line-height: 1.15;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+      }
+      .hero p.welcome {
+        color: var(--muted);
+        font-size: 16px;
+        max-width: 540px;
+        margin: 0 auto;
+      }
+      .hero p.welcome:empty { display: none; }
+
+      /* ---------- entry card ---------- */
+      .entry { padding: 24px 0 56px; }
+      .card {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 28px;
+        box-shadow: 0 12px 40px -24px rgba(0,0,0,.6);
+      }
+      .card h2 {
+        font-size: 18px;
+        font-weight: 650;
+        margin-bottom: 4px;
+      }
+      .card p.lede {
+        color: var(--muted);
+        font-size: 13px;
+        margin: 0 0 18px;
+      }
+      .field { display: grid; gap: 6px; margin-bottom: 14px; }
+      .field label {
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--muted);
+        letter-spacing: 0.02em;
+      }
+      .field input {
+        font: inherit;
+        padding: 11px 13px;
+        background: var(--bg-elev);
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        transition: border-color .12s ease, box-shadow .12s ease;
+      }
+      .field input:focus {
+        outline: none;
+        border-color: var(--accent);
+        box-shadow: 0 0 0 3px var(--accent-soft);
+      }
+      .field-row {
+        display: flex; align-items: center; gap: 6px;
+      }
+      .field-row input { flex: 1; }
+      .reveal-btn {
+        font: inherit; font-size: 12px;
+        padding: 0 12px;
+        height: 40px;
+        color: var(--muted);
+        background: var(--surface-2);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        cursor: pointer;
+      }
+      .reveal-btn:hover { color: var(--text-strong); }
+
+      .submit {
+        width: 100%;
+        font: inherit; font-weight: 600;
+        padding: 12px 18px;
+        margin-top: 6px;
+        background: var(--accent);
+        color: #fff;
+        border: 1px solid var(--accent);
+        border-radius: 9px;
+        cursor: pointer;
+        display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+        transition: background .12s ease, transform .1s ease;
+      }
+      .submit:hover { background: var(--accent-strong); }
+      .submit:active { transform: translateY(1px); }
+      .submit:disabled { opacity: .5; cursor: not-allowed; }
+      .submit svg { width: 14px; height: 14px; }
+
+      .err {
+        margin-top: 12px;
+        padding: 10px 12px;
+        font-size: 13px;
+        background: color-mix(in oklab, var(--bad) 15%, transparent);
+        border: 1px solid color-mix(in oklab, var(--bad) 40%, transparent);
+        color: var(--bad);
+        border-radius: 8px;
+      }
+      .err:empty { display: none; }
+
+      .hint {
+        margin-top: 16px;
+        font-size: 12.5px;
+        color: var(--muted);
+        text-align: center;
+      }
+
+      /* ---------- footer ---------- */
+      footer {
+        border-top: 1px solid var(--border-soft);
+        padding: 20px 0 28px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .foot-row {
+        display: flex; flex-wrap: wrap; gap: 14px;
+        align-items: center; justify-content: center;
+      }
+      .foot-row a { color: var(--muted); }
+      .foot-row a:hover { color: var(--text-strong); }
+      .foot-row .sep {
+        width: 3px; height: 3px; border-radius: 999px;
+        background: var(--border);
+      }
+
+      ::selection { background: color-mix(in oklab, var(--accent) 35%, transparent); }
+
+      @media (prefers-reduced-motion: reduce) {
+        *, *::before, *::after {
+          transition-duration: 0.001ms !important;
+          animation-duration: 0.001ms !important;
+        }
+        .submit:active { transform: none; }
+      }
+
+      @media (max-width: 520px) {
+        .hero { padding: 48px 0 16px; }
+        .card { padding: 22px; }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="nav">
+      <div class="container nav-inner">
+        <a class="brand" href="/" aria-label="返回首页">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+              stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>
+            </svg>
+          </span>
+          <span id="brandName">WebChat Gateway</span>
+        </a>
+        <div class="nav-actions">
+          <a id="githubLink" class="icon-btn" hidden
+             href="https://github.com/Naomi-Armitage/astrbot_plugin_webchat_gateway"
+             target="_blank" rel="noopener" aria-label="GitHub">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+              <path d="M12 .5C5.7.5.5 5.7.5 12c0 5.1 3.3 9.4 7.9 10.9.6.1.8-.3.8-.6v-2c-3.2.7-3.9-1.4-3.9-1.4-.5-1.3-1.3-1.7-1.3-1.7-1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.7 1.3 3.4 1 .1-.7.4-1.3.7-1.6-2.6-.3-5.4-1.3-5.4-5.9 0-1.3.5-2.4 1.2-3.2-.1-.3-.5-1.5.1-3.2 0 0 1-.3 3.3 1.2 1-.3 2-.4 3-.4s2 .1 3 .4c2.3-1.5 3.3-1.2 3.3-1.2.7 1.7.3 2.9.1 3.2.8.8 1.2 1.9 1.2 3.2 0 4.6-2.8 5.6-5.4 5.9.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6 4.6-1.5 7.9-5.8 7.9-10.9C23.5 5.7 18.3.5 12 .5z"/>
+            </svg>
+          </a>
+          <button id="themeToggle" class="icon-btn" type="button"
+            aria-label="切换主题" aria-pressed="true">
+            <svg id="themeIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+              stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div class="hero-bg" aria-hidden="true"></div>
+        <div class="container hero-inner">
+          <h1 id="heroTitle">WebChat Gateway</h1>
+          <p class="welcome" id="welcomeMessage"></p>
+        </div>
+      </section>
+
+      <section class="entry">
+        <div class="container">
+          <form class="card" id="entryForm" autocomplete="off" novalidate>
+            <h2>开始聊天</h2>
+            <p class="lede">输入你的访问 token 与昵称，进入聊天页面。</p>
+            <div class="field">
+              <label for="token">访问 Token</label>
+              <div class="field-row">
+                <input id="token" name="token" type="password" required
+                  placeholder="粘贴管理员发给你的 token"
+                  autocomplete="off" spellcheck="false" />
+                <button type="button" class="reveal-btn" id="revealBtn"
+                  aria-pressed="false">显示</button>
+              </div>
+            </div>
+            <div class="field">
+              <label for="username">昵称</label>
+              <input id="username" name="username" type="text"
+                placeholder="Friend" maxlength="32"
+                autocomplete="off" spellcheck="false" />
+            </div>
+            <button type="submit" class="submit" id="submitBtn">
+              开始聊天
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M5 12h14M13 5l7 7-7 7"/>
+              </svg>
+            </button>
+            <div class="err" id="err" role="alert"></div>
+            <p class="hint">没有 token？请联系把这个链接发给你的人。</p>
+          </form>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <div class="container foot-row">
+        <span id="footerName">WebChat Gateway</span>
+        <span class="sep" aria-hidden="true"></span>
+        <span>AGPLv3</span>
+        <a id="privacyLink" href="#" hidden>隐私声明</a>
+      </div>
+    </footer>
+
+    <script>
+      (() => {
+        const THEME_KEY = "wcg.landing.theme";
+        const LS_TOKEN = "wcg.token";
+        const LS_USERNAME = "wcg.username";
+
+        const root = document.documentElement;
+        const themeBtn = document.getElementById("themeToggle");
+        const themeIcon = document.getElementById("themeIcon");
+        const sunPath = '<path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/><circle cx="12" cy="12" r="4"/>';
+        const moonPath = '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>';
+
+        function applyTheme(t) {
+          root.setAttribute("data-theme", t);
+          themeIcon.innerHTML = t === "dark" ? moonPath : sunPath;
+          themeBtn.setAttribute("aria-pressed", String(t === "dark"));
+        }
+        applyTheme(localStorage.getItem(THEME_KEY) || "dark");
+        themeBtn.addEventListener("click", () => {
+          const next = root.getAttribute("data-theme") === "dark" ? "light" : "dark";
+          localStorage.setItem(THEME_KEY, next);
+          applyTheme(next);
+        });
+
+        // Hydrate token / username from any prior visit (returning user).
+        const tokenInput = document.getElementById("token");
+        const usernameInput = document.getElementById("username");
+        tokenInput.value = localStorage.getItem(LS_TOKEN) || "";
+        usernameInput.value = localStorage.getItem(LS_USERNAME) || "";
+
+        // Reveal/hide token.
+        const revealBtn = document.getElementById("revealBtn");
+        revealBtn.addEventListener("click", () => {
+          const showing = tokenInput.type === "text";
+          tokenInput.type = showing ? "password" : "text";
+          revealBtn.textContent = showing ? "显示" : "隐藏";
+          revealBtn.setAttribute("aria-pressed", String(!showing));
+        });
+
+        // Submit: persist + redirect to /chat.
+        const form = document.getElementById("entryForm");
+        const errEl = document.getElementById("err");
+        const submitBtn = document.getElementById("submitBtn");
+        form.addEventListener("submit", (e) => {
+          e.preventDefault();
+          errEl.textContent = "";
+          const token = tokenInput.value.trim();
+          const username = usernameInput.value.trim() || "Friend";
+          if (!token) {
+            errEl.textContent = "请先填写访问 token。";
+            tokenInput.focus();
+            return;
+          }
+          localStorage.setItem(LS_TOKEN, token);
+          localStorage.setItem(LS_USERNAME, username);
+          submitBtn.disabled = true;
+          location.href = "/chat";
+        });
+
+        // Pull operator-set branding. Failure is non-fatal: the static
+        // defaults already render a usable page.
+        async function loadSite() {
+          try {
+            const resp = await fetch("/api/webchat/site", { credentials: "same-origin" });
+            if (!resp.ok) return;
+            const data = await resp.json();
+            const name = (data.site_name || "").trim() || "WebChat Gateway";
+            document.title = name;
+            document.getElementById("brandName").textContent = name;
+            document.getElementById("heroTitle").textContent = name;
+            document.getElementById("footerName").textContent = name;
+            const welcome = (data.welcome_message || "").trim();
+            document.getElementById("welcomeMessage").textContent = welcome;
+            if (data.show_github_link) {
+              document.getElementById("githubLink").hidden = false;
+            }
+            const privacy = (data.privacy_url || "").trim();
+            if (privacy) {
+              const a = document.getElementById("privacyLink");
+              a.href = privacy;
+              a.hidden = false;
+              if (/^https?:\/\//i.test(privacy)) {
+                a.target = "_blank";
+                a.rel = "noopener";
+              }
+            }
+          } catch {
+            /* offline / network error — keep defaults */
+          }
+        }
+        loadSite();
+      })();
+    </script>
+  </body>
+</html>

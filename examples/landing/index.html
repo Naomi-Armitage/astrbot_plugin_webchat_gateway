@@ -1,11 +1,13 @@
 <!doctype html>
-<html lang="zh-CN" data-theme="dark">
+<html lang="en" data-theme="dark">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>WebChat Gateway</title>
-    <meta name="description" content="WebChat Gateway 入口" />
-    <meta name="robots" content="noindex" />
+    <title>WebChat Gateway · Controlled AstrBot LLM access</title>
+    <meta
+      name="description"
+      content="A controlled WebChat gateway for AstrBot. Per-friend tokens, daily quotas, single-flight concurrency, IP brute-force shield, audit log, SQLite or MySQL."
+    />
     <style>
       :root[data-theme="dark"] {
         --bg: #0d1117;
@@ -21,8 +23,18 @@
         --accent-strong: #b692ff;
         --accent-soft: rgba(163, 113, 247, 0.14);
         --good: #3fb950;
+        --warn: #d29922;
         --bad: #f85149;
         --grid: rgba(139, 148, 158, 0.08);
+
+        --tok-keyword: #ff7b72;
+        --tok-string: #a5d6ff;
+        --tok-number: #79c0ff;
+        --tok-comment: #8b949e;
+        --tok-function: #d2a8ff;
+        --tok-property: #79c0ff;
+        --tok-builtin: #ffa657;
+        --tok-plain: #e6edf3;
       }
       :root[data-theme="light"] {
         --bg: #ffffff;
@@ -38,40 +50,59 @@
         --accent-strong: #5226a3;
         --accent-soft: rgba(102, 57, 186, 0.10);
         --good: #1a7f37;
+        --warn: #9a6700;
         --bad: #cf222e;
         --grid: rgba(31, 35, 40, 0.06);
+
+        --tok-keyword: #cf222e;
+        --tok-string: #0a3069;
+        --tok-number: #0550ae;
+        --tok-comment: #59636e;
+        --tok-function: #8250df;
+        --tok-property: #0550ae;
+        --tok-builtin: #953800;
+        --tok-plain: #1f2328;
       }
 
       *, *::before, *::after { box-sizing: border-box; }
+      html { scroll-behavior: smooth; }
       body {
         margin: 0;
         background: var(--bg);
         color: var(--text);
-        font: 15px/1.55 "Comic Sans MS", "Comic Neue", "Chalkboard SE", system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+        font: 15px/1.6 "Comic Sans MS", "Comic Neue", "Chalkboard SE", system-ui, -apple-system, "Segoe UI", Roboto,
+          "Helvetica Neue", sans-serif;
         -webkit-font-smoothing: antialiased;
         text-rendering: optimizeLegibility;
-        min-height: 100vh;
-        display: flex;
-        flex-direction: column;
       }
       a { color: var(--accent-strong); text-decoration: none; }
       a:hover { text-decoration: underline; }
-      h1, h2, h3 { color: var(--text-strong); margin: 0; letter-spacing: -0.01em; }
+      h1, h2, h3, h4 { color: var(--text-strong); margin: 0; letter-spacing: -0.01em; }
+      h1 { font-size: clamp(36px, 5.4vw, 60px); line-height: 1.05; letter-spacing: -0.025em; font-weight: 700; }
+      h2 { font-size: clamp(24px, 3vw, 32px); font-weight: 650; letter-spacing: -0.015em; }
+      h3 { font-size: 17px; font-weight: 600; }
+      p  { margin: 0; color: var(--text); }
+      .muted { color: var(--muted); }
+      code, pre { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular,
+        "SF Mono", Menlo, Consolas, monospace; }
 
-      .container { max-width: 720px; margin: 0 auto; padding: 0 20px; width: 100%; }
+      .container { max-width: 1120px; margin: 0 auto; padding: 0 24px; }
 
       /* ---------- nav ---------- */
       .nav {
-        border-bottom: 1px solid var(--border-soft);
+        position: sticky;
+        top: 0;
+        z-index: 50;
         background: color-mix(in oklab, var(--bg) 80%, transparent);
         backdrop-filter: saturate(140%) blur(10px);
         -webkit-backdrop-filter: saturate(140%) blur(10px);
+        border-bottom: 1px solid var(--border-soft);
       }
       .nav-inner {
         display: flex;
         align-items: center;
-        gap: 12px;
-        height: 56px;
+        gap: 16px;
+        height: 60px;
       }
       .brand {
         display: flex; align-items: center; gap: 10px;
@@ -85,369 +116,845 @@
         border-radius: 8px;
       }
       .brand-mark svg { width: 16px; height: 16px; color: var(--accent-strong); }
-      .nav-actions {
+      .pill {
+        font-size: 11px;
+        padding: 3px 8px;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        color: var(--muted);
+        background: var(--surface);
+        font-weight: 500;
+      }
+      .nav-links {
         margin-left: auto;
-        display: flex; align-items: center; gap: 6px;
+        display: flex; align-items: center; gap: 4px;
+      }
+      .nav-links a, .nav-links button {
+        font: inherit;
+        color: var(--muted);
+        padding: 6px 12px;
+        border-radius: 6px;
+        background: transparent;
+        border: none;
+        cursor: pointer;
+      }
+      .nav-links a:hover, .nav-links button:hover {
+        color: var(--text-strong);
+        text-decoration: none;
+        background: var(--surface);
+      }
+      .nav-links a.nav-cta {
+        background: var(--accent);
+        color: #fff;
+        font-weight: 500;
+        padding: 6px 14px;
+      }
+      .nav-links a.nav-cta:hover {
+        background: var(--accent-strong);
+        color: #fff;
       }
       .icon-btn {
         display: inline-grid; place-items: center;
         width: 34px; height: 34px;
-        font: inherit;
-        color: var(--muted);
-        background: transparent;
-        border: 1px solid var(--border);
+        border: 1px solid var(--border) !important;
+        border-radius: 8px;
+      }
+      .icon-btn svg { width: 16px; height: 16px; }
+
+      /* ---------- buttons ---------- */
+      .btn {
+        display: inline-flex; align-items: center; gap: 8px;
+        padding: 10px 16px;
+        font: inherit; font-weight: 500;
         border-radius: 8px;
         cursor: pointer;
         text-decoration: none !important;
+        border: 1px solid transparent;
+        transition: transform .12s ease, background .15s ease, border-color .15s ease;
       }
-      .icon-btn:hover { color: var(--text-strong); background: var(--surface); }
-      .icon-btn svg { width: 16px; height: 16px; }
-
-      /* ---------- main ---------- */
-      main {
-        flex: 1;
-        display: flex;
-        flex-direction: column;
+      .btn:active { transform: translateY(1px); }
+      .btn-primary {
+        background: var(--accent);
+        color: #fff !important;
+        border-color: var(--accent);
       }
+      .btn-primary:hover { background: var(--accent-strong); border-color: var(--accent-strong); }
+      .btn-ghost {
+        background: var(--surface);
+        color: var(--text-strong) !important;
+        border-color: var(--border);
+      }
+      .btn-ghost:hover { background: var(--surface-2); }
 
       /* ---------- hero ---------- */
       .hero {
         position: relative;
-        padding: 72px 0 24px;
+        padding: 96px 0 80px;
         overflow: hidden;
       }
       .hero-bg {
         position: absolute; inset: 0;
         pointer-events: none;
         background:
-          radial-gradient(60% 60% at 50% 0%, var(--accent-soft) 0%, transparent 60%),
-          linear-gradient(var(--grid) 1px, transparent 1px) 0 0 / 40px 40px,
-          linear-gradient(90deg, var(--grid) 1px, transparent 1px) 0 0 / 40px 40px;
-        mask-image: radial-gradient(ellipse at 50% 30%, #000 30%, transparent 75%);
-        -webkit-mask-image: radial-gradient(ellipse at 50% 30%, #000 30%, transparent 75%);
+          radial-gradient(60% 50% at 50% 0%, var(--accent-soft) 0%, transparent 60%),
+          linear-gradient(var(--grid) 1px, transparent 1px) 0 0 / 48px 48px,
+          linear-gradient(90deg, var(--grid) 1px, transparent 1px) 0 0 / 48px 48px;
+        mask-image: radial-gradient(ellipse at 50% 30%, #000 40%, transparent 75%);
+        -webkit-mask-image: radial-gradient(ellipse at 50% 30%, #000 40%, transparent 75%);
       }
       .hero-inner {
         position: relative;
-        text-align: center;
         display: grid;
-        gap: 14px;
+        gap: 22px;
+        max-width: 760px;
       }
-      .hero h1 {
-        font-size: clamp(28px, 5vw, 40px);
-        line-height: 1.15;
-        font-weight: 700;
-        letter-spacing: -0.02em;
-      }
-      .hero p.welcome {
-        color: var(--muted);
-        font-size: 16px;
-        max-width: 540px;
-        margin: 0 auto;
-      }
-      .hero p.welcome:empty { display: none; }
-
-      /* ---------- entry card ---------- */
-      .entry { padding: 24px 0 56px; }
-      .card {
-        background: var(--surface);
+      .hero-pill {
+        display: inline-flex; align-items: center; gap: 8px;
+        padding: 5px 10px 5px 6px;
+        font-size: 12px;
         border: 1px solid var(--border);
-        border-radius: 14px;
-        padding: 28px;
-        box-shadow: 0 12px 40px -24px rgba(0,0,0,.6);
-      }
-      .card h2 {
-        font-size: 18px;
-        font-weight: 650;
-        margin-bottom: 4px;
-      }
-      .card p.lede {
+        background: var(--surface);
+        border-radius: 999px;
         color: var(--muted);
-        font-size: 13px;
-        margin: 0 0 18px;
+        width: fit-content;
       }
-      .field { display: grid; gap: 6px; margin-bottom: 14px; }
-      .field label {
+      .hero-pill .dot {
+        width: 6px; height: 6px; border-radius: 999px;
+        background: var(--good);
+        box-shadow: 0 0 0 3px color-mix(in oklab, var(--good) 25%, transparent);
+      }
+      .hero-pill .v {
+        background: var(--accent-soft);
+        color: var(--accent-strong);
+        font-weight: 600;
+        padding: 2px 8px;
+        border-radius: 999px;
+      }
+      .hero p.sub {
+        color: var(--muted);
+        font-size: 18px;
+        max-width: 620px;
+      }
+      .hero-cta { display: flex; gap: 10px; flex-wrap: wrap; }
+      .hero-stats {
+        margin-top: 12px;
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 12px;
+        max-width: 640px;
+      }
+      .hero-stat {
+        border: 1px solid var(--border-soft);
+        background: var(--surface);
+        padding: 14px;
+        border-radius: 10px;
+      }
+      .hero-stat strong { display: block; font-size: 18px; color: var(--text-strong); }
+      .hero-stat span { font-size: 12px; color: var(--muted); }
+
+      /* ---------- sections ---------- */
+      section { padding: 56px 0; }
+      .section-head {
+        max-width: 720px; margin-bottom: 28px;
+        display: grid; gap: 8px;
+      }
+      .eyebrow {
         font-size: 12px;
         font-weight: 600;
-        color: var(--muted);
-        letter-spacing: 0.02em;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--accent-strong);
       }
-      .field input {
-        font: inherit;
-        padding: 11px 13px;
-        background: var(--bg-elev);
-        color: var(--text);
+      .section-head p { color: var(--muted); }
+
+      /* ---------- code block ---------- */
+      .code-card {
+        background: var(--surface);
         border: 1px solid var(--border);
-        border-radius: 8px;
-        transition: border-color .12s ease, box-shadow .12s ease;
+        border-radius: 12px;
+        overflow: hidden;
+        box-shadow: 0 12px 40px -24px rgba(0,0,0,.6);
       }
-      .field input:focus {
-        outline: none;
-        border-color: var(--accent);
-        box-shadow: 0 0 0 3px var(--accent-soft);
-      }
-      .field-row {
-        display: flex; align-items: center; gap: 6px;
-      }
-      .field-row input { flex: 1; }
-      .reveal-btn {
-        font: inherit; font-size: 12px;
-        padding: 0 12px;
-        height: 40px;
-        color: var(--muted);
+      .code-tabs {
+        display: flex;
+        gap: 0;
+        border-bottom: 1px solid var(--border-soft);
+        padding: 0 8px;
         background: var(--surface-2);
-        border: 1px solid var(--border);
-        border-radius: 8px;
-        cursor: pointer;
       }
-      .reveal-btn:hover { color: var(--text-strong); }
-
-      .submit {
-        width: 100%;
-        font: inherit; font-weight: 600;
-        padding: 12px 18px;
-        margin-top: 6px;
-        background: var(--accent);
-        color: #fff;
-        border: 1px solid var(--accent);
-        border-radius: 9px;
+      .code-tab {
+        font: inherit;
+        padding: 12px 14px;
+        background: transparent;
+        border: none;
+        color: var(--muted);
         cursor: pointer;
-        display: inline-flex; align-items: center; justify-content: center; gap: 8px;
-        transition: background .12s ease, transform .1s ease;
-      }
-      .submit:hover { background: var(--accent-strong); }
-      .submit:active { transform: translateY(1px); }
-      .submit:disabled { opacity: .5; cursor: not-allowed; }
-      .submit svg { width: 14px; height: 14px; }
-
-      .err {
-        margin-top: 12px;
-        padding: 10px 12px;
         font-size: 13px;
-        background: color-mix(in oklab, var(--bad) 15%, transparent);
-        border: 1px solid color-mix(in oklab, var(--bad) 40%, transparent);
-        color: var(--bad);
-        border-radius: 8px;
+        border-bottom: 2px solid transparent;
+        margin-bottom: -1px;
       }
-      .err:empty { display: none; }
+      .code-tab[aria-selected="true"] {
+        color: var(--text-strong);
+        border-bottom-color: var(--accent);
+      }
+      .code-tab:hover { color: var(--text-strong); }
+      .code-body {
+        position: relative;
+        background: var(--bg-elev);
+      }
+      .code-body pre {
+        margin: 0;
+        padding: 18px 20px;
+        font-size: 13.5px;
+        line-height: 1.65;
+        overflow-x: auto;
+        color: var(--tok-plain);
+      }
+      .copy-btn {
+        position: absolute; top: 10px; right: 10px;
+        font: inherit; font-size: 12px;
+        padding: 5px 9px;
+        background: var(--surface);
+        color: var(--muted);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        cursor: pointer;
+        opacity: 0;
+        transition: opacity .15s ease;
+      }
+      .code-card:hover .copy-btn { opacity: 1; }
+      .copy-btn:hover { color: var(--text-strong); }
 
-      .hint {
-        margin-top: 16px;
-        font-size: 12.5px;
+      .tok-k { color: var(--tok-keyword); }
+      .tok-s { color: var(--tok-string); }
+      .tok-n { color: var(--tok-number); }
+      .tok-c { color: var(--tok-comment); font-style: italic; }
+      .tok-f { color: var(--tok-function); }
+      .tok-p { color: var(--tok-property); }
+      .tok-b { color: var(--tok-builtin); }
+
+      /* ---------- features ---------- */
+      .features {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 16px;
+      }
+      .feature {
+        background: var(--surface);
+        border: 1px solid var(--border-soft);
+        border-radius: 12px;
+        padding: 22px;
+        transition: border-color .15s ease, transform .15s ease;
+      }
+      .feature:hover { border-color: var(--border); transform: translateY(-2px); }
+      .feature-icon {
+        width: 36px; height: 36px;
+        display: grid; place-items: center;
+        background: var(--accent-soft);
+        color: var(--accent-strong);
+        border-radius: 9px;
+        margin-bottom: 14px;
+      }
+      .feature-icon svg { width: 18px; height: 18px; }
+      .feature h3 { margin-bottom: 6px; }
+      .feature p { color: var(--muted); font-size: 14px; }
+
+      /* ---------- comparison ---------- */
+      .compare-card {
+        border: 1px solid var(--border);
+        background: var(--surface);
+        border-radius: 12px;
+        overflow: hidden;
+      }
+      .compare-table { width: 100%; border-collapse: collapse; }
+      .compare-table th, .compare-table td {
+        padding: 14px 18px;
+        text-align: left;
+        border-bottom: 1px solid var(--border-soft);
+        font-size: 14px;
+      }
+      .compare-table thead th {
+        background: var(--surface-2);
+        color: var(--muted);
+        font-weight: 600;
+        font-size: 12px;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+      .compare-table tbody tr:last-child td { border-bottom: none; }
+      .compare-table .col-this {
+        background: color-mix(in oklab, var(--accent-soft) 60%, transparent);
+        color: var(--text-strong);
+        font-weight: 500;
+      }
+      .compare-table th.col-this { background: var(--accent-soft); color: var(--accent-strong); }
+      .check { color: var(--good); font-weight: 600; }
+      .dash  { color: var(--muted); }
+
+      /* ---------- integrations ---------- */
+      .integrations {
+        display: grid;
+        grid-template-columns: repeat(6, minmax(0, 1fr));
+        gap: 12px;
+      }
+      .logo-card {
+        display: grid;
+        place-items: center;
+        gap: 10px;
+        padding: 22px 10px;
+        background: var(--surface);
+        border: 1px solid var(--border-soft);
+        border-radius: 12px;
         color: var(--muted);
         text-align: center;
+      }
+      .logo-card svg { width: 30px; height: 30px; }
+      .logo-card span { font-size: 12px; font-weight: 500; }
+      .logo-card:hover { border-color: var(--border); color: var(--text-strong); }
+
+      /* ---------- demo cards ---------- */
+      .demos {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 16px;
+      }
+      .demo-card {
+        display: grid; gap: 14px;
+        background: var(--surface);
+        border: 1px solid var(--border-soft);
+        border-radius: 12px;
+        padding: 24px;
+        text-decoration: none !important;
+        color: inherit;
+        transition: border-color .15s ease, transform .15s ease;
+      }
+      .demo-card:hover { border-color: var(--accent); transform: translateY(-2px); }
+      .demo-tag {
+        display: inline-flex; align-items: center; gap: 6px;
+        font-size: 11px;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        font-weight: 600;
+      }
+      .demo-card h3 { font-size: 18px; }
+      .demo-card p { color: var(--muted); font-size: 14px; }
+      .demo-arrow {
+        margin-top: 4px;
+        color: var(--accent-strong);
+        font-size: 13px;
+        display: inline-flex; align-items: center; gap: 6px;
       }
 
       /* ---------- footer ---------- */
       footer {
+        margin-top: 24px;
         border-top: 1px solid var(--border-soft);
-        padding: 20px 0 28px;
+        padding: 28px 0 40px;
         color: var(--muted);
-        font-size: 12px;
+        font-size: 13px;
       }
       .foot-row {
-        display: flex; flex-wrap: wrap; gap: 14px;
-        align-items: center; justify-content: center;
+        display: flex; flex-wrap: wrap; gap: 16px;
+        align-items: center;
       }
+      .foot-row .spacer { flex: 1; }
       .foot-row a { color: var(--muted); }
       .foot-row a:hover { color: var(--text-strong); }
-      .foot-row .sep {
-        width: 3px; height: 3px; border-radius: 999px;
-        background: var(--border);
+
+      /* ---------- responsive ---------- */
+      @media (max-width: 920px) {
+        .features { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .integrations { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+        .demos { grid-template-columns: 1fr; }
+      }
+      @media (max-width: 620px) {
+        .hero { padding: 64px 0 56px; }
+        .features { grid-template-columns: 1fr; }
+        .integrations { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .hero-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .nav-links a:not(.icon-btn):not(.btn-primary) { display: none; }
       }
 
       ::selection { background: color-mix(in oklab, var(--accent) 35%, transparent); }
 
+      /* a11y: reduced-motion users get no transforms / no smooth scroll */
       @media (prefers-reduced-motion: reduce) {
+        html { scroll-behavior: auto; }
         *, *::before, *::after {
           transition-duration: 0.001ms !important;
           animation-duration: 0.001ms !important;
         }
-        .submit:active { transform: none; }
+        .feature:hover, .demo-card:hover { transform: none; }
+        .btn:active { transform: none; }
       }
 
-      @media (max-width: 520px) {
-        .hero { padding: 48px 0 16px; }
-        .card { padding: 22px; }
+      /* touch devices have no hover, so always show the copy button */
+      @media (hover: none) {
+        .copy-btn { opacity: 1; }
       }
+
+      /* code-tabs wrap on narrow widths */
+      .code-tabs { flex-wrap: wrap; }
+      .code-body pre { min-width: 0; }
     </style>
   </head>
   <body>
+    <!-- ====== nav ====== -->
     <header class="nav">
       <div class="container nav-inner">
-        <span class="brand" aria-label="WebChat Gateway">
+        <a href="#top" class="brand" aria-label="WebChat Gateway">
           <span class="brand-mark" aria-hidden="true">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
               stroke-linecap="round" stroke-linejoin="round">
               <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>
             </svg>
           </span>
-          <span id="brandName">WebChat Gateway</span>
-        </span>
-        <div class="nav-actions">
-          <a id="githubLink" class="icon-btn" hidden
-             href="https://github.com/Naomi-Armitage/astrbot_plugin_webchat_gateway"
-             target="_blank" rel="noopener" aria-label="GitHub">
+          <span>WebChat Gateway</span>
+          <span class="pill">v0.1.0</span>
+        </a>
+        <nav class="nav-links" aria-label="Primary">
+          <a href="#quickstart">Quickstart</a>
+          <a href="#features">Features</a>
+          <a href="#compare">Compare</a>
+          <a href="https://github.com/Naomi-Armitage/astrbot_plugin_webchat_gateway#astrbot_plugin_webchat_gateway"
+             target="_blank" rel="noopener">Docs</a>
+          <a href="/login" class="nav-cta">登录</a>
+          <a href="https://github.com/Naomi-Armitage/astrbot_plugin_webchat_gateway"
+             class="icon-btn" aria-label="GitHub repository" target="_blank" rel="noopener">
             <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
               <path d="M12 .5C5.7.5.5 5.7.5 12c0 5.1 3.3 9.4 7.9 10.9.6.1.8-.3.8-.6v-2c-3.2.7-3.9-1.4-3.9-1.4-.5-1.3-1.3-1.7-1.3-1.7-1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.7 1.3 3.4 1 .1-.7.4-1.3.7-1.6-2.6-.3-5.4-1.3-5.4-5.9 0-1.3.5-2.4 1.2-3.2-.1-.3-.5-1.5.1-3.2 0 0 1-.3 3.3 1.2 1-.3 2-.4 3-.4s2 .1 3 .4c2.3-1.5 3.3-1.2 3.3-1.2.7 1.7.3 2.9.1 3.2.8.8 1.2 1.9 1.2 3.2 0 4.6-2.8 5.6-5.4 5.9.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6 4.6-1.5 7.9-5.8 7.9-10.9C23.5 5.7 18.3.5 12 .5z"/>
             </svg>
           </a>
-          <button id="themeToggle" class="icon-btn" type="button"
-            aria-label="切换主题" aria-pressed="true">
+          <button id="themeToggle" class="icon-btn" aria-label="Toggle theme"
+            aria-pressed="true" type="button">
             <svg id="themeIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
               stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
             </svg>
           </button>
-        </div>
+        </nav>
       </div>
     </header>
 
-    <main>
+    <main id="top">
+      <!-- ====== hero ====== -->
       <section class="hero">
         <div class="hero-bg" aria-hidden="true"></div>
         <div class="container hero-inner">
-          <h1 id="heroTitle">WebChat Gateway</h1>
-          <p class="welcome" id="welcomeMessage"></p>
-        </div>
-      </section>
-
-      <section class="entry">
-        <div class="container">
-          <form class="card" id="entryForm" autocomplete="off" novalidate>
-            <h2>开始聊天</h2>
-            <p class="lede">输入你的访问 token 与昵称，进入聊天页面。</p>
-            <div class="field">
-              <label for="token">访问 Token</label>
-              <div class="field-row">
-                <input id="token" name="token" type="password" required
-                  placeholder="粘贴管理员发给你的 token"
-                  autocomplete="off" spellcheck="false" />
-                <button type="button" class="reveal-btn" id="revealBtn"
-                  aria-pressed="false">显示</button>
-              </div>
-            </div>
-            <div class="field">
-              <label for="username">昵称</label>
-              <input id="username" name="username" type="text"
-                placeholder="Friend" maxlength="32"
-                autocomplete="off" spellcheck="false" />
-            </div>
-            <button type="submit" class="submit" id="submitBtn">
-              开始聊天
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+          <span class="hero-pill">
+            <span class="dot" aria-hidden="true"></span>
+            <span>AstrBot plugin</span>
+            <span class="v">v0.1.0</span>
+          </span>
+          <h1>Controlled WebChat Gateway<br/>for AstrBot.</h1>
+          <p class="sub">
+            Hand a few friends an LLM endpoint without handing them the keys.
+            Per-token daily quotas, single-flight concurrency, IP brute-force
+            shield, and an audit trail &mdash; backed by SQLite or MySQL, in a
+            single AstrBot plugin.
+          </p>
+          <div class="hero-cta">
+            <a class="btn btn-primary" href="/login">
+              登录
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                 stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <path d="M5 12h14M13 5l7 7-7 7"/>
               </svg>
-            </button>
-            <div class="err" id="err" role="alert"></div>
-            <p class="hint">没有 token？请联系把这个链接发给你的人。</p>
-          </form>
+            </a>
+            <a class="btn btn-ghost" href="#quickstart">Quickstart</a>
+            <a class="btn btn-ghost"
+               href="https://github.com/Naomi-Armitage/astrbot_plugin_webchat_gateway"
+               target="_blank" rel="noopener">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                <path d="M12 .5C5.7.5.5 5.7.5 12c0 5.1 3.3 9.4 7.9 10.9.6.1.8-.3.8-.6v-2c-3.2.7-3.9-1.4-3.9-1.4-.5-1.3-1.3-1.7-1.3-1.7-1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.7 1.3 3.4 1 .1-.7.4-1.3.7-1.6-2.6-.3-5.4-1.3-5.4-5.9 0-1.3.5-2.4 1.2-3.2-.1-.3-.5-1.5.1-3.2 0 0 1-.3 3.3 1.2 1-.3 2-.4 3-.4s2 .1 3 .4c2.3-1.5 3.3-1.2 3.3-1.2.7 1.7.3 2.9.1 3.2.8.8 1.2 1.9 1.2 3.2 0 4.6-2.8 5.6-5.4 5.9.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6 4.6-1.5 7.9-5.8 7.9-10.9C23.5 5.7 18.3.5 12 .5z"/>
+              </svg>
+              View on GitHub
+            </a>
+          </div>
+          <div class="hero-stats" role="list">
+            <div class="hero-stat" role="listitem">
+              <strong>Per-friend</strong>
+              <span>Independent tokens</span>
+            </div>
+            <div class="hero-stat" role="listitem">
+              <strong>Daily quota</strong>
+              <span>Per-token limits</span>
+            </div>
+            <div class="hero-stat" role="listitem">
+              <strong>Single-flight</strong>
+              <span>One in-flight call</span>
+            </div>
+            <div class="hero-stat" role="listitem">
+              <strong>SQLite&nbsp;/&nbsp;MySQL</strong>
+              <span>Pick your backend</span>
+            </div>
+          </div>
         </div>
       </section>
+
+      <!-- ====== quickstart ====== -->
+      <section id="quickstart">
+        <div class="container">
+          <div class="section-head">
+            <span class="eyebrow">Quickstart</span>
+            <h2>Up and running in four steps.</h2>
+            <p>No build pipeline. Drop the plugin into AstrBot, fill in a master
+              admin key, and issue tokens to your friends.</p>
+          </div>
+          <div class="code-card" id="quickstartCard">
+            <div class="code-tabs" role="tablist" aria-label="Quickstart steps">
+              <button class="code-tab" role="tab" aria-selected="true" data-tab="install">Install</button>
+              <button class="code-tab" role="tab" aria-selected="false" data-tab="config">Configure</button>
+              <button class="code-tab" role="tab" aria-selected="false" data-tab="issue">Issue token</button>
+              <button class="code-tab" role="tab" aria-selected="false" data-tab="curl">Call it</button>
+            </div>
+            <noscript>
+              <p style="padding: 12px 18px; margin: 0; font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--border-soft);">
+                Tabs need JavaScript. Showing the <strong>Install</strong> step; full guide on
+                <a href="https://github.com/Naomi-Armitage/astrbot_plugin_webchat_gateway#%E5%BF%AB%E9%80%9F%E5%BC%80%E5%A7%8B"
+                   target="_blank" rel="noopener">GitHub</a>.
+              </p>
+            </noscript>
+            <div class="code-body">
+              <button class="copy-btn" type="button" data-copy>Copy</button>
+              <pre id="codePane" data-tab="install"><span class="tok-c"># 1. drop the plugin into AstrBot's plugin directory</span>
+<span class="tok-f">git</span> clone https://github.com/Naomi-Armitage/astrbot_plugin_webchat_gateway.git \
+  data/plugins/astrbot_plugin_webchat_gateway
+
+<span class="tok-c"># 2. install the SQLite driver (default backend)</span>
+<span class="tok-f">pip</span> install aiosqlite
+
+<span class="tok-c"># optional &mdash; if you'd rather use MySQL in production</span>
+<span class="tok-f">pip</span> install aiomysql</pre>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ====== features ====== -->
+      <section id="features">
+        <div class="container">
+          <div class="section-head">
+            <span class="eyebrow">Features</span>
+            <h2>Built for sharing an LLM, not exposing it.</h2>
+            <p>Every primitive you'd otherwise have to bolt on yourself, already
+              there and audited.</p>
+          </div>
+          <div class="features">
+            <article class="feature">
+              <div class="feature-icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                  stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <rect x="3" y="11" width="18" height="11" rx="2"/>
+                  <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+                </svg>
+              </div>
+              <h3>Per-friend tokens</h3>
+              <p>Independent SHA-256 hashed tokens, shown exactly once at issue
+                time. Revoke a single friend without touching anyone else.</p>
+            </article>
+            <article class="feature">
+              <div class="feature-icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                  stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <circle cx="12" cy="12" r="9"/>
+                  <path d="M12 7v5l3 2"/>
+                </svg>
+              </div>
+              <h3>Daily quotas</h3>
+              <p>Each token has its own daily request budget that resets at
+                midnight, with live remaining-count headers for clients to show.</p>
+            </article>
+            <article class="feature">
+              <div class="feature-icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                  stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>
+                </svg>
+              </div>
+              <h3>Single-flight</h3>
+              <p>The same token may have only one in-flight LLM call at a time,
+                so a runaway script can't fan out and drain your quota.</p>
+            </article>
+            <article class="feature">
+              <div class="feature-icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                  stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+                </svg>
+              </div>
+              <h3>IP brute-force shield</h3>
+              <p>Repeated auth failures from a single IP earn an automatic
+                temporary block, with a <code>Retry-After</code> hint to clients.</p>
+            </article>
+            <article class="feature">
+              <div class="feature-icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                  stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                  <path d="M14 2v6h6"/>
+                  <path d="M9 13h6M9 17h6M9 9h2"/>
+                </svg>
+              </div>
+              <h3>Audit log</h3>
+              <p>Issue, revoke, chat, quota-exhaustion and IP-block events all
+                land in a queryable <code>audit_log</code> table.</p>
+            </article>
+            <article class="feature">
+              <div class="feature-icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                  stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <ellipse cx="12" cy="5" rx="9" ry="3"/>
+                  <path d="M3 5v6c0 1.7 4 3 9 3s9-1.3 9-3V5"/>
+                  <path d="M3 11v6c0 1.7 4 3 9 3s9-1.3 9-3v-6"/>
+                </svg>
+              </div>
+              <h3>SQLite or MySQL</h3>
+              <p>Zero-config SQLite for solo hosting, or swap in MySQL for
+                production via a single DSN string &mdash; same schema, same code.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <!-- ====== comparison ====== -->
+      <section id="compare">
+        <div class="container">
+          <div class="section-head">
+            <span class="eyebrow">Comparison</span>
+            <h2>Versus a raw AstrBot HTTP endpoint.</h2>
+            <p>What you get out of the box, instead of writing it yourself.</p>
+          </div>
+          <div class="compare-card">
+            <table class="compare-table">
+              <thead>
+                <tr>
+                  <th scope="col">Capability</th>
+                  <th scope="col" class="col-this">WebChat Gateway</th>
+                  <th scope="col">Raw AstrBot HTTP</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>Per-friend independent tokens</td>
+                  <td class="col-this"><span class="check">&#10003;</span> Issue / revoke per name</td>
+                  <td><span class="dash">&mdash;</span> Single shared key</td>
+                </tr>
+                <tr>
+                  <td>Per-token daily quota</td>
+                  <td class="col-this"><span class="check">&#10003;</span> Per-name daily limit</td>
+                  <td><span class="dash">&mdash;</span> No throttling</td>
+                </tr>
+                <tr>
+                  <td>Single-flight concurrency</td>
+                  <td class="col-this"><span class="check">&#10003;</span> One call per token</td>
+                  <td><span class="dash">&mdash;</span> Unbounded</td>
+                </tr>
+                <tr>
+                  <td>IP brute-force shield</td>
+                  <td class="col-this"><span class="check">&#10003;</span> Auto IP block + Retry-After</td>
+                  <td><span class="dash">&mdash;</span> None</td>
+                </tr>
+                <tr>
+                  <td>Audit trail</td>
+                  <td class="col-this"><span class="check">&#10003;</span> Issue / revoke / chat / quota / block</td>
+                  <td><span class="dash">&mdash;</span> Server logs only</td>
+                </tr>
+                <tr>
+                  <td>Origin allow-list (CORS)</td>
+                  <td class="col-this"><span class="check">&#10003;</span> Built-in allow-list</td>
+                  <td><span class="dash">&mdash;</span> Manual</td>
+                </tr>
+                <tr>
+                  <td>Admin panel + chat demo</td>
+                  <td class="col-this"><span class="check">&#10003;</span> Bundled, single-file HTML</td>
+                  <td><span class="dash">&mdash;</span> Build your own</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ====== integrations ====== -->
+      <section id="integrations">
+        <div class="container">
+          <div class="section-head">
+            <span class="eyebrow">Integrations</span>
+            <h2>Reuses AstrBot's LLM layer.</h2>
+            <p>Whatever provider AstrBot is configured to talk to, this gateway
+              quietly inherits.</p>
+          </div>
+          <div class="integrations" role="list">
+            <div class="logo-card" role="listitem">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
+                stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>
+                <circle cx="9" cy="12" r="0.7" fill="currentColor"/>
+                <circle cx="13" cy="12" r="0.7" fill="currentColor"/>
+                <circle cx="17" cy="12" r="0.7" fill="currentColor"/>
+              </svg>
+              <span>AstrBot</span>
+            </div>
+            <div class="logo-card" role="listitem">
+              <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                <path d="M22.28 9.82a5.95 5.95 0 0 0-.51-4.91 6.04 6.04 0 0 0-6.5-2.9 6 6 0 0 0-10.2 2.16 5.97 5.97 0 0 0-3.99 2.9 6.04 6.04 0 0 0 .74 7.08 5.96 5.96 0 0 0 .51 4.91 6.05 6.05 0 0 0 6.5 2.9 5.97 5.97 0 0 0 4.5 2.04 6.05 6.05 0 0 0 5.77-4.21 5.97 5.97 0 0 0 3.99-2.9 6.04 6.04 0 0 0-.74-7.08zM13.27 21.4a4.48 4.48 0 0 1-2.88-1.04l.14-.08 4.78-2.76a.78.78 0 0 0 .39-.68v-6.74l2.02 1.17a.07.07 0 0 1 .04.05v5.58a4.5 4.5 0 0 1-4.49 4.5zM3.6 17.27a4.48 4.48 0 0 1-.53-3.02l.14.08 4.78 2.76a.78.78 0 0 0 .78 0l5.83-3.37v2.33a.08.08 0 0 1-.03.06l-4.83 2.79a4.5 4.5 0 0 1-6.14-1.63zM2.34 9.62a4.49 4.49 0 0 1 2.34-1.97v5.68c-.01.27.13.53.39.67l5.8 3.34-2.02 1.17a.07.07 0 0 1-.07 0L3.95 15.7a4.5 4.5 0 0 1-1.61-6.08zm16.6 3.86-5.83-3.37 2.02-1.17a.07.07 0 0 1 .07 0l4.83 2.8a4.5 4.5 0 0 1-.68 8.1v-5.68a.79.79 0 0 0-.4-.68zm2.01-3.02-.14-.09-4.78-2.76a.78.78 0 0 0-.78 0L9.42 11v-2.33a.07.07 0 0 1 .03-.06l4.83-2.79a4.5 4.5 0 0 1 6.68 4.66zM8.32 14.59 6.3 13.42a.08.08 0 0 1-.04-.06V7.78a4.5 4.5 0 0 1 7.38-3.46l-.14.08L8.71 7.16a.78.78 0 0 0-.39.68zm1.1-2.36 2.6-1.5 2.6 1.5v3l-2.6 1.5-2.6-1.5z"/>
+              </svg>
+              <span>OpenAI</span>
+            </div>
+            <div class="logo-card" role="listitem">
+              <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                <path d="M12 2 2 21h4.4l1.7-3.4h7.8L17.6 21H22zm-2.6 12 2.6-5.6 2.6 5.6z"/>
+              </svg>
+              <span>Anthropic</span>
+            </div>
+            <div class="logo-card" role="listitem">
+              <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                <path d="M12 2 5 6v12l7 4 7-4V6zm0 2.3 4.7 2.7L12 9.6 7.3 7zM6.5 8.4l4.7 2.7v5.4L6.5 13.8zm6.7 8.1v-5.4l4.8-2.7v5.4z"/>
+              </svg>
+              <span>Gemini</span>
+            </div>
+            <div class="logo-card" role="listitem">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
+                stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M3 12c4-6 14-6 18 0-4 6-14 6-18 0z"/>
+                <path d="M8 14c2-3 6-3 8 0M8 10c2 3 6 3 8 0"/>
+              </svg>
+              <span>DeepSeek</span>
+            </div>
+            <div class="logo-card" role="listitem">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
+                stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <ellipse cx="12" cy="9" rx="7" ry="6"/>
+                <path d="M7 13c-1.5 2-2 5-1 7M17 13c1.5 2 2 5 1 7"/>
+                <circle cx="9.5" cy="9" r="1" fill="currentColor"/>
+                <circle cx="14.5" cy="9" r="1" fill="currentColor"/>
+              </svg>
+              <span>Ollama</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <footer>
+        <div class="container foot-row">
+          <span>WebChat Gateway &middot; AstrBot plugin &middot; GNU AGPLv3</span>
+          <span class="spacer"></span>
+          <a href="https://github.com/Naomi-Armitage/astrbot_plugin_webchat_gateway#astrbot_plugin_webchat_gateway"
+             target="_blank" rel="noopener">README</a>
+          <a href="https://github.com/Naomi-Armitage/astrbot_plugin_webchat_gateway"
+             target="_blank" rel="noopener">GitHub</a>
+          <a href="https://github.com/Naomi-Armitage/astrbot_plugin_webchat_gateway/blob/main/LICENSE"
+             target="_blank" rel="noopener">License</a>
+        </div>
+      </footer>
     </main>
 
-    <footer>
-      <div class="container foot-row">
-        <span id="footerName">WebChat Gateway</span>
-        <span class="sep" aria-hidden="true"></span>
-        <span>AGPLv3</span>
-        <a id="privacyLink" href="#" hidden>隐私声明</a>
-      </div>
-    </footer>
+    <!-- ====== code snippets ====== -->
+    <template id="snip-install"><span class="tok-c"># 1. drop the plugin into AstrBot's plugin directory</span>
+<span class="tok-f">git</span> clone https://github.com/Naomi-Armitage/astrbot_plugin_webchat_gateway.git \
+  data/plugins/astrbot_plugin_webchat_gateway
+
+<span class="tok-c"># 2. install the SQLite driver (default backend)</span>
+<span class="tok-f">pip</span> install aiosqlite
+
+<span class="tok-c"># optional &mdash; if you'd rather use MySQL in production</span>
+<span class="tok-f">pip</span> install aiomysql</template>
+
+    <template id="snip-config"><span class="tok-c"># AstrBot Dashboard &rarr; Plugins &rarr; WebChat Gateway</span>
+<span class="tok-p">host</span>:                 <span class="tok-s">"0.0.0.0"</span>
+<span class="tok-p">port</span>:                 <span class="tok-n">6186</span>
+<span class="tok-p">endpoint_prefix</span>:      <span class="tok-s">"/api/webchat"</span>
+<span class="tok-p">allowed_origins</span>:
+  - <span class="tok-s">"https://chat.example.com"</span>
+
+<span class="tok-p">master_admin_key</span>:     <span class="tok-s">"REPLACE_WITH_32_CHAR_RANDOM_STRING"</span>
+<span class="tok-p">default_daily_quota</span>:  <span class="tok-n">200</span>
+
+<span class="tok-p">storage</span>:
+  <span class="tok-p">driver</span>:             <span class="tok-s">"sqlite"</span>     <span class="tok-c"># or "mysql"</span>
+  <span class="tok-c"># mysql_dsn:        "mysql://user:pass@host:3306/dbname"</span></template>
+
+    <template id="snip-issue"><span class="tok-c"># Option A &mdash; private message to your bot</span>
+/webchat issue alice <span class="tok-n">200</span>
+
+<span class="tok-c"># Option B &mdash; HTTP admin API (master key)</span>
+<span class="tok-f">curl</span> -X POST http://127.0.0.1:6186/api/webchat/admin/tokens \
+  -H <span class="tok-s">"Authorization: Bearer $MASTER_ADMIN_KEY"</span> \
+  -H <span class="tok-s">"Content-Type: application/json"</span> \
+  -d <span class="tok-s">'{"name":"alice","daily_quota":200,"note":"alice@example.com"}'</span>
+
+<span class="tok-c"># &rarr; { "name": "alice", "token": "&lt;shown once, save it&gt;", "daily_quota": 200 }</span></template>
+
+    <template id="snip-curl"><span class="tok-f">curl</span> -X POST http://127.0.0.1:6186/api/webchat/chat \
+  -H <span class="tok-s">"Authorization: Bearer $ALICE_TOKEN"</span> \
+  -H <span class="tok-s">"Content-Type: application/json"</span> \
+  -d <span class="tok-s">'{
+        "session_id": "8f3e-…",
+        "username":   "alice",
+        "message":    "hello, who are you?"
+      }'</span>
+
+<span class="tok-c"># 200 OK</span>
+<span class="tok-p">{</span>
+  <span class="tok-s">"reply"</span>:        <span class="tok-s">"Hi alice! I'm running on AstrBot…"</span>,
+  <span class="tok-s">"remaining"</span>:    <span class="tok-n">199</span>,
+  <span class="tok-s">"daily_quota"</span>:  <span class="tok-n">200</span>
+<span class="tok-p">}</span></template>
 
     <script>
-      (() => {
-        const THEME_KEY = "wcg.landing.theme";
-        const LS_TOKEN = "wcg.token";
-        const LS_USERNAME = "wcg.username";
+      // ----- theme toggle -----
+      const KEY = "wcg.landing.theme";
+      const root = document.documentElement;
+      const themeBtn = document.getElementById("themeToggle");
+      const themeIcon = document.getElementById("themeIcon");
+      const sunPath = '<path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/><circle cx="12" cy="12" r="4"/>';
+      const moonPath = '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>';
 
-        const root = document.documentElement;
-        const themeBtn = document.getElementById("themeToggle");
-        const themeIcon = document.getElementById("themeIcon");
-        const sunPath = '<path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/><circle cx="12" cy="12" r="4"/>';
-        const moonPath = '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>';
+      function applyTheme(t) {
+        root.setAttribute("data-theme", t);
+        themeIcon.innerHTML = t === "dark" ? moonPath : sunPath;
+        themeBtn.setAttribute("aria-pressed", String(t === "dark"));
+      }
+      const saved = localStorage.getItem(KEY) || "dark";
+      applyTheme(saved);
+      themeBtn.addEventListener("click", () => {
+        const next = root.getAttribute("data-theme") === "dark" ? "light" : "dark";
+        localStorage.setItem(KEY, next);
+        applyTheme(next);
+      });
 
-        function applyTheme(t) {
-          root.setAttribute("data-theme", t);
-          themeIcon.innerHTML = t === "dark" ? moonPath : sunPath;
-          themeBtn.setAttribute("aria-pressed", String(t === "dark"));
+      // ----- code tabs -----
+      const tabs = document.querySelectorAll(".code-tab");
+      const pane = document.getElementById("codePane");
+      const snippets = {
+        install: document.getElementById("snip-install").innerHTML,
+        config:  document.getElementById("snip-config").innerHTML,
+        issue:   document.getElementById("snip-issue").innerHTML,
+        curl:    document.getElementById("snip-curl").innerHTML,
+      };
+      tabs.forEach((tab) => {
+        tab.addEventListener("click", () => {
+          tabs.forEach((t) => t.setAttribute("aria-selected", String(t === tab)));
+          const which = tab.dataset.tab;
+          pane.dataset.tab = which;
+          pane.innerHTML = snippets[which];
+        });
+      });
+
+      // ----- copy button -----
+      const copyBtn = document.querySelector("[data-copy]");
+      copyBtn.addEventListener("click", async () => {
+        const text = pane.innerText;
+        try {
+          await navigator.clipboard.writeText(text);
+          copyBtn.textContent = "Copied";
+          setTimeout(() => (copyBtn.textContent = "Copy"), 1400);
+        } catch {
+          copyBtn.textContent = "Press Ctrl+C";
         }
-        applyTheme(localStorage.getItem(THEME_KEY) || "dark");
-        themeBtn.addEventListener("click", () => {
-          const next = root.getAttribute("data-theme") === "dark" ? "light" : "dark";
-          localStorage.setItem(THEME_KEY, next);
-          applyTheme(next);
-        });
-
-        // Hydrate token / username from any prior visit (returning user).
-        const tokenInput = document.getElementById("token");
-        const usernameInput = document.getElementById("username");
-        tokenInput.value = localStorage.getItem(LS_TOKEN) || "";
-        usernameInput.value = localStorage.getItem(LS_USERNAME) || "";
-
-        // Reveal/hide token.
-        const revealBtn = document.getElementById("revealBtn");
-        revealBtn.addEventListener("click", () => {
-          const showing = tokenInput.type === "text";
-          tokenInput.type = showing ? "password" : "text";
-          revealBtn.textContent = showing ? "显示" : "隐藏";
-          revealBtn.setAttribute("aria-pressed", String(!showing));
-        });
-
-        // Submit: persist + redirect to /chat.
-        const form = document.getElementById("entryForm");
-        const errEl = document.getElementById("err");
-        const submitBtn = document.getElementById("submitBtn");
-        form.addEventListener("submit", (e) => {
-          e.preventDefault();
-          errEl.textContent = "";
-          const token = tokenInput.value.trim();
-          const username = usernameInput.value.trim() || "Friend";
-          if (!token) {
-            errEl.textContent = "请先填写访问 token。";
-            tokenInput.focus();
-            return;
-          }
-          localStorage.setItem(LS_TOKEN, token);
-          localStorage.setItem(LS_USERNAME, username);
-          submitBtn.disabled = true;
-          location.href = "/chat";
-        });
-
-        // Pull operator-set branding. Failure is non-fatal: the static
-        // defaults already render a usable page.
-        async function loadSite() {
-          try {
-            const resp = await fetch("/api/webchat/site", { credentials: "same-origin" });
-            if (!resp.ok) return;
-            const data = await resp.json();
-            const name = (data.site_name || "").trim() || "WebChat Gateway";
-            document.title = name;
-            document.getElementById("brandName").textContent = name;
-            document.getElementById("heroTitle").textContent = name;
-            document.getElementById("footerName").textContent = name;
-            const welcome = (data.welcome_message || "").trim();
-            document.getElementById("welcomeMessage").textContent = welcome;
-            if (data.show_github_link) {
-              document.getElementById("githubLink").hidden = false;
-            }
-            const privacy = (data.privacy_url || "").trim();
-            if (privacy) {
-              const a = document.getElementById("privacyLink");
-              a.href = privacy;
-              a.hidden = false;
-              if (/^https?:\/\//i.test(privacy)) {
-                a.target = "_blank";
-                a.rel = "noopener";
-              }
-            }
-          } catch {
-            /* offline / network error — keep defaults */
-          }
-        }
-        loadSite();
-      })();
+      });
     </script>
   </body>
 </html>

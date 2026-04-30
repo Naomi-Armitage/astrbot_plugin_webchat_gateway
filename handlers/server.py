@@ -2,7 +2,7 @@
 
 Routes:
 - API:   /api/webchat/chat (configurable prefix), /api/webchat/admin/{tokens,stats,audit,login,logout,me}, /api/webchat/site (public branding)
-- UI:    / (landing), {admin_ui_path} (admin panel, default /admin), /chat (chat client) — same-origin so the bundled HTML works without manual CORS entries
+- UI:    / (landing), /login (token entry), {admin_ui_path} (admin panel, default /admin), /chat (chat client) — same-origin so the bundled HTML works without manual CORS entries
 """
 
 from __future__ import annotations
@@ -133,9 +133,12 @@ def build_app(deps: ServerDeps) -> web.Application:
 
     # Bundled UI (same-origin so allowed_origins doesn't need an entry).
     landing = _EXAMPLES_DIR / "landing" / "index.html"
+    login_html = _EXAMPLES_DIR / "login" / "index.html"
     admin_html = _EXAMPLES_DIR / "admin_panel" / "index.html"
     chat_html = _EXAMPLES_DIR / "chat_client" / "index.html"
     app.router.add_get("/", _file_handler(landing))
+    app.router.add_get("/login", _redirect_with_slash)
+    app.router.add_get("/login/", _file_handler(login_html))
     # admin UI lives at the operator-chosen path. Only the trailing-slash
     # variant serves the page; the bare path 308s to it so relative links
     # inside the page resolve. We deliberately do NOT register
