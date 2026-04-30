@@ -125,9 +125,10 @@ class WebChatGatewayPlugin(Star):
             return
 
         logger.info(
-            "[WebChatGateway] chat=%s admin=%s storage=%s allowed_origins=%s admin_key=%s llm_timeout=%ss",
+            "[WebChatGateway] chat=%s admin_api=%s admin_ui=%s storage=%s allowed_origins=%s admin_key=%s llm_timeout=%ss",
             cfg.chat_path,
             cfg.admin_tokens_path,
+            cfg.admin_ui_path,
             cfg.storage.driver,
             ", ".join(sorted(cfg.allowed_origins)),
             "enabled" if cfg.master_admin_key else "DISABLED",

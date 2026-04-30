@@ -17,6 +17,36 @@
     "hint": "聊天位于 {prefix}/chat，管理位于 {prefix}/admin/...。",
     "default": "/api/webchat"
   },
+  "admin_ui_path": {
+    "type": "string",
+    "description": "管理后台页面路径",
+    "hint": "默认 /admin。建议改成不易猜测的字符串（如 /mgmt-7f3a2b）以减少入口曝光，落地页不会显示该路径。仅影响 HTML 入口；管理 API 仍在 endpoint_prefix/admin/* 下。",
+    "default": "/admin"
+  },
+  "site_name": {
+    "type": "string",
+    "description": "落地页显示的站点名称",
+    "hint": "留空则使用默认 WebChat Gateway。",
+    "default": ""
+  },
+  "welcome_message": {
+    "type": "string",
+    "description": "落地页欢迎语",
+    "hint": "可选；空则隐藏。建议 1-2 行简短文本，会显示在首页 hero 区。",
+    "default": ""
+  },
+  "show_github_link": {
+    "type": "bool",
+    "description": "落地页是否显示 GitHub 仓库链接",
+    "hint": "私密部署可关闭，避免暴露项目来源。",
+    "default": true
+  },
+  "privacy_url": {
+    "type": "string",
+    "description": "隐私声明 / 使用条款链接",
+    "hint": "落地页页脚显示；空则隐藏。",
+    "default": ""
+  },
   "allowed_origins": {
     "type": "string",
     "description": "允许的网页来源（CORS Origin）",

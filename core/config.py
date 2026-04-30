@@ -59,6 +59,38 @@ def _normalize_prefix(raw: Any) -> str:
     return path.rstrip("/") or "/api/webchat"
 
 
+_ADMIN_UI_PATH_ALLOWED = set(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_/"
+)
+
+
+def _normalize_admin_ui_path(raw: Any) -> str:
+    path = str(raw or "").strip()
+    if not path:
+        return "/admin"
+    if not path.startswith("/"):
+        path = "/" + path
+    path = path.rstrip("/") or "/admin"
+    if "//" in path or any(ch not in _ADMIN_UI_PATH_ALLOWED for ch in path):
+        logger.warning(
+            "[WebChatGateway] admin_ui_path=%r contains unsupported characters; fallback to /admin",
+            path,
+        )
+        return "/admin"
+    if len(path) > 128:
+        logger.warning(
+            "[WebChatGateway] admin_ui_path is longer than 128 chars; fallback to /admin"
+        )
+        return "/admin"
+    if path in {"/", "/chat", "/api"} or path.startswith("/api/"):
+        logger.warning(
+            "[WebChatGateway] admin_ui_path=%r collides with reserved route; fallback to /admin",
+            path,
+        )
+        return "/admin"
+    return path
+
+
 @dataclass(frozen=True)
 class StorageConfig:
     driver: str
@@ -71,6 +103,7 @@ class ConfigView:
     host: str
     port: int
     endpoint_prefix: str
+    admin_ui_path: str
     allowed_origins: set[str]
     max_message_length: int
     history_turns: int
@@ -82,11 +115,19 @@ class ConfigView:
     trust_referer_as_origin: bool
     master_admin_key: str
     llm_timeout_seconds: int
+    site_name: str
+    welcome_message: str
+    show_github_link: bool
+    privacy_url: str
     storage: StorageConfig
 
     @property
     def chat_path(self) -> str:
         return f"{self.endpoint_prefix}/chat"
+
+    @property
+    def site_info_path(self) -> str:
+        return f"{self.endpoint_prefix}/site"
 
     @property
     def admin_tokens_path(self) -> str:
@@ -125,6 +166,7 @@ class ConfigView:
         host = str(_get(cfg, "host", "0.0.0.0")).strip() or "0.0.0.0"
         port = _clamp_int(_get(cfg, "port"), default=6186, lo=1, hi=65535)
         prefix = _normalize_prefix(_get(cfg, "endpoint_prefix", "/api/webchat"))
+        admin_ui_path = _normalize_admin_ui_path(_get(cfg, "admin_ui_path", "/admin"))
         origins = _parse_origins(_get(cfg, "allowed_origins"))
         max_msg = _clamp_int(
             _get(cfg, "max_message_length"), default=4000, lo=16, hi=200_000
@@ -149,6 +191,10 @@ class ConfigView:
         llm_timeout = _clamp_int(
             _get(cfg, "llm_timeout_seconds"), default=60, lo=5, hi=600
         )
+        site_name = str(_get(cfg, "site_name") or "").strip()
+        welcome_message = str(_get(cfg, "welcome_message") or "").strip()
+        show_github_link = _parse_bool(_get(cfg, "show_github_link"), default=True)
+        privacy_url = str(_get(cfg, "privacy_url") or "").strip()
 
         raw_storage = _get(cfg, "storage", {}) or {}
         driver = str(_get(raw_storage, "driver", "sqlite")).strip().lower() or "sqlite"
@@ -167,6 +213,7 @@ class ConfigView:
             host=host,
             port=port,
             endpoint_prefix=prefix,
+            admin_ui_path=admin_ui_path,
             allowed_origins=origins,
             max_message_length=max_msg,
             history_turns=history,
@@ -178,6 +225,10 @@ class ConfigView:
             trust_referer_as_origin=trust_ref,
             master_admin_key=admin_key,
             llm_timeout_seconds=llm_timeout,
+            site_name=site_name,
+            welcome_message=welcome_message,
+            show_github_link=show_github_link,
+            privacy_url=privacy_url,
             storage=StorageConfig(
                 driver=driver,
                 sqlite_path=sqlite_path,

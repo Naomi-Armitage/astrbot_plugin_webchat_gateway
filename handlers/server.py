@@ -1,8 +1,8 @@
 """aiohttp server bootstrap: build routing table from deps.
 
 Routes:
-- API:   /api/webchat/chat (configurable prefix), /api/webchat/admin/{tokens,stats,audit,login,logout,me}
-- UI:    / (landing), /admin (admin panel), /chat (chat client) — same-origin so the bundled HTML works without manual CORS entries
+- API:   /api/webchat/chat (configurable prefix), /api/webchat/admin/{tokens,stats,audit,login,logout,me}, /api/webchat/site (public branding)
+- UI:    / (landing), {admin_ui_path} (admin panel, default /admin), /chat (chat client) — same-origin so the bundled HTML works without manual CORS entries
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from ..core.config import ConfigView
 from .admin_auth_routes import AuthRouteDeps, make_auth_handlers
 from .admin_stats import AdminDeps, make_admin_handlers
 from .chat import ChatDeps, make_chat_handler, make_preflight_handler
+from .site import SiteDeps, make_site_handlers
 
 
 @dataclass
@@ -117,23 +118,34 @@ def build_app(deps: ServerDeps) -> web.Application:
     app.router.add_get(cfg.admin_me_path, auth["me"])
     app.router.add_options(cfg.admin_me_path, auth["preflight"])
 
+    site = make_site_handlers(
+        SiteDeps(
+            site_name=cfg.site_name,
+            welcome_message=cfg.welcome_message,
+            show_github_link=cfg.show_github_link,
+            privacy_url=cfg.privacy_url,
+            allowed_origins=cfg.allowed_origins,
+            trust_referer_as_origin=deps.chat.trust_referer_as_origin,
+        )
+    )
+    app.router.add_get(cfg.site_info_path, site["get_site"])
+    app.router.add_options(cfg.site_info_path, site["preflight"])
+
     # Bundled UI (same-origin so allowed_origins doesn't need an entry).
     landing = _EXAMPLES_DIR / "landing" / "index.html"
     admin_html = _EXAMPLES_DIR / "admin_panel" / "index.html"
     chat_html = _EXAMPLES_DIR / "chat_client" / "index.html"
     app.router.add_get("/", _file_handler(landing))
-    app.router.add_get("/admin", _redirect_with_slash)
-    app.router.add_get("/admin/", _file_handler(admin_html))
+    # admin UI lives at the operator-chosen path. Only the trailing-slash
+    # variant serves the page; the bare path 308s to it so relative links
+    # inside the page resolve. We deliberately do NOT register
+    # /admin_panel/* fallbacks: those would leak the entry regardless of
+    # how obscure admin_ui_path is.
+    admin_ui_path = cfg.admin_ui_path
+    app.router.add_get(admin_ui_path, _redirect_with_slash)
+    app.router.add_get(admin_ui_path + "/", _file_handler(admin_html))
     app.router.add_get("/chat", _redirect_with_slash)
     app.router.add_get("/chat/", _file_handler(chat_html))
-    # Legacy paths (existing links inside the HTML pages reference
-    # `../admin_panel/index.html` and friends). Keep them working.
-    app.router.add_get("/landing/", _file_handler(landing))
-    app.router.add_get("/landing/index.html", _file_handler(landing))
-    app.router.add_get("/admin_panel/", _file_handler(admin_html))
-    app.router.add_get("/admin_panel/index.html", _file_handler(admin_html))
-    app.router.add_get("/chat_client/", _file_handler(chat_html))
-    app.router.add_get("/chat_client/index.html", _file_handler(chat_html))
 
     return app
 
