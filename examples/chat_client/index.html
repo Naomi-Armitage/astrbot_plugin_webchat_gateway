@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>WebChat Gateway · Chat Demo</title>
+    <title>WebChat Gateway · Chat</title>
     <style>
       :root {
         --bg: #0d1117;
@@ -99,37 +99,20 @@
         color: var(--text-strong);
         border-color: var(--accent);
       }
+      .actions .danger:hover {
+        color: var(--bad);
+        border-color: var(--bad);
+      }
 
-      .settings {
-        display: grid;
-        grid-template-columns: 1fr 1fr;
-        gap: 10px;
-        padding: 14px 0;
-        border-bottom: 1px solid var(--border-soft);
-      }
-      .settings label {
-        display: flex;
-        flex-direction: column;
-        font-size: 11px;
+      .who {
+        font-size: 12px;
         color: var(--muted);
-        font-weight: 500;
-        letter-spacing: 0.02em;
-      }
-      .settings input {
-        margin-top: 5px;
-        padding: 9px 11px;
+        padding: 4px 10px;
+        border: 1px solid var(--border-soft);
+        border-radius: 999px;
         background: var(--surface);
-        color: var(--text);
-        border: 1px solid var(--border);
-        border-radius: 7px;
-        font: inherit;
-        transition: border-color .12s ease, box-shadow .12s ease;
       }
-      .settings input:focus {
-        outline: none;
-        border-color: var(--accent);
-        box-shadow: 0 0 0 3px var(--accent-soft);
-      }
+      .who strong { color: var(--text-strong); font-weight: 600; }
 
       #messages {
         flex: 1;
@@ -218,7 +201,7 @@
   <body>
     <div class="wrap">
       <header>
-        <a class="brand" href="/" aria-label="Back to landing">
+        <a class="brand" href="/" aria-label="返回首页">
           <span class="brand-mark" aria-hidden="true">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
               stroke-linecap="round" stroke-linejoin="round">
@@ -226,33 +209,15 @@
             </svg>
           </span>
         </a>
-        <h1>WebChat Gateway · Chat</h1>
+        <h1 id="brandName">WebChat Gateway</h1>
+        <span id="who" class="who" hidden></span>
         <span id="quotaBadge" class="badge">--</span>
         <div class="actions">
-          <a href="/" title="返回首页">← 首页</a>
           <button id="newSession" type="button">新会话</button>
           <button id="clearHistory" type="button">清空</button>
+          <button id="logout" type="button" class="danger" title="退出并清除本机保存的 token">登出</button>
         </div>
       </header>
-
-      <div class="settings">
-        <label>
-          API Base
-          <input id="apiBase" placeholder="留空即同源" />
-        </label>
-        <label>
-          Endpoint Prefix
-          <input id="endpointPrefix" placeholder="/api/webchat" />
-        </label>
-        <label>
-          Token (一次性，务必保存)
-          <input id="token" type="password" placeholder="paste your token" />
-        </label>
-        <label>
-          Username
-          <input id="username" placeholder="昵称" />
-        </label>
-      </div>
 
       <div id="messages"></div>
 
@@ -263,9 +228,13 @@
     </div>
 
     <script>
+      (() => {
+      const API_BASE = "";
+      const PREFIX = "/api/webchat";
+      const CHAT_URL = `${API_BASE}${PREFIX}/chat`;
+      const SITE_URL = `${API_BASE}${PREFIX}/site`;
+
       const LS = {
-        apiBase: "wcg.apiBase",
-        prefix: "wcg.prefix",
         token: "wcg.token",
         username: "wcg.username",
         sessionId: "wcg.sessionId",
@@ -274,41 +243,50 @@
         history: "wcg.history",
       };
 
+      // No token in localStorage → user hasn't logged in. Bounce to /login
+      // before rendering anything else; replace() avoids stacking history.
+      const savedToken = (localStorage.getItem(LS.token) || "").trim();
+      if (!savedToken) {
+        location.replace("/login");
+        return;
+      }
+
       const $ = (id) => document.getElementById(id);
-      const apiBase = $("apiBase");
-      const prefix = $("endpointPrefix");
-      const token = $("token");
-      const usernameEl = $("username");
       const inputEl = $("input");
       const sendBtn = $("send");
       const msgs = $("messages");
       const badge = $("quotaBadge");
+      const whoEl = $("who");
 
-      // hydrate from localStorage
-      apiBase.value = localStorage.getItem(LS.apiBase) || "";
-      prefix.value = localStorage.getItem(LS.prefix) || "/api/webchat";
-      token.value = localStorage.getItem(LS.token) || "";
-      usernameEl.value = localStorage.getItem(LS.username) || "Friend";
+      const username = (localStorage.getItem(LS.username) || "Friend").trim() || "Friend";
+      whoEl.innerHTML = `你好，<strong></strong>`;
+      whoEl.querySelector("strong").textContent = username;
+      whoEl.hidden = false;
+
       let sessionId = localStorage.getItem(LS.sessionId);
       if (!sessionId) {
         sessionId = (crypto.randomUUID && crypto.randomUUID()) || String(Date.now());
         localStorage.setItem(LS.sessionId, sessionId);
       }
 
-      const persistField = (el, key) => el.addEventListener("change", () => {
-        localStorage.setItem(key, el.value.trim());
-      });
-      persistField(apiBase, LS.apiBase);
-      persistField(prefix, LS.prefix);
-      persistField(token, LS.token);
-      persistField(usernameEl, LS.username);
-
-      // hydrate history
+      // hydrate history (per-tab)
       const history = JSON.parse(sessionStorage.getItem(SS.history) || "[]");
       for (const item of history) {
         addMessage(item.role, item.text, { skipPersist: true });
       }
       scrollToEnd();
+
+      // Operator branding (best-effort).
+      (async () => {
+        try {
+          const resp = await fetch(SITE_URL, { credentials: "same-origin" });
+          if (!resp.ok) return;
+          const data = await resp.json();
+          const name = (data.site_name || "").trim() || "WebChat Gateway";
+          document.title = `${name} · Chat`;
+          document.getElementById("brandName").textContent = name;
+        } catch { /* keep defaults */ }
+      })();
 
       function setBadge(remaining, quota) {
         if (remaining == null || quota == null) {
@@ -350,6 +328,14 @@
         msgs.innerHTML = "";
         addMessage("notice", `已开启新会话: ${sessionId}`);
       };
+      $("logout").onclick = () => {
+        if (!confirm("登出会清除本机保存的 token 与对话历史。继续？")) return;
+        localStorage.removeItem(LS.token);
+        localStorage.removeItem(LS.username);
+        localStorage.removeItem(LS.sessionId);
+        sessionStorage.removeItem(SS.history);
+        location.replace("/");
+      };
 
       inputEl.addEventListener("keydown", (e) => {
         if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
@@ -362,25 +348,20 @@
       async function send() {
         const message = inputEl.value.trim();
         if (!message) return;
-        if (!token.value.trim()) {
-          addMessage("error", "请先填写 Token");
-          return;
-        }
-        const url = `${apiBase.value.trim()}${prefix.value.trim() || "/api/webchat"}/chat`;
         sendBtn.disabled = true;
         addMessage("user", message);
         inputEl.value = "";
 
         try {
-          const resp = await fetch(url, {
+          const resp = await fetch(CHAT_URL, {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
-              Authorization: `Bearer ${token.value.trim()}`,
+              Authorization: `Bearer ${savedToken}`,
             },
             body: JSON.stringify({
               session_id: sessionId,
-              username: usernameEl.value.trim() || "Friend",
+              username,
               message,
             }),
           });
@@ -395,7 +376,11 @@
 
           const err = payload.error || `http_${resp.status}`;
           if (resp.status === 401) {
-            addMessage("error", "Token 无效或已撤销，请联系管理员。");
+            addMessage("error", "Token 无效或已撤销，请重新登录。");
+            setTimeout(() => {
+              localStorage.removeItem(LS.token);
+              location.replace("/login");
+            }, 1500);
           } else if (resp.status === 429 && err === "quota_exceeded") {
             setBadge(0, payload.daily_quota);
             addMessage("notice", "今日额度已用完，明日 0 点重置。");
@@ -417,6 +402,7 @@
           sendBtn.disabled = false;
         }
       }
+      })();
     </script>
   </body>
 </html>
