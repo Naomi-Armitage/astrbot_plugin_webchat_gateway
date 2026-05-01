@@ -47,6 +47,13 @@
     "hint": "落地页页脚显示；空则隐藏。",
     "default": ""
   },
+  "theme_family": {
+    "type": "string",
+    "description": "落地页与聊天页视觉主题",
+    "hint": "classic = 经典 GitHub 风（默认），notebook = 手写笔记本风。",
+    "options": ["notebook", "classic"],
+    "default": "classic"
+  },
   "allowed_origins": {
     "type": "string",
     "description": "允许的网页来源（CORS Origin）",

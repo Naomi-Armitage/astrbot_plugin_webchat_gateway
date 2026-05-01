@@ -29,6 +29,7 @@ class SiteDeps:
     welcome_message: str
     show_github_link: bool
     privacy_url: str
+    theme_family: str
     allowed_origins: set[str]
     trust_referer_as_origin: bool
 
@@ -42,6 +43,7 @@ def make_site_handlers(deps: SiteDeps):
         "welcome_message": deps.welcome_message,
         "show_github_link": deps.show_github_link,
         "privacy_url": deps.privacy_url,
+        "theme_family": deps.theme_family,
     }
 
     async def get_site(request: web.Request) -> web.Response:

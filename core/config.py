@@ -119,6 +119,7 @@ class ConfigView:
     welcome_message: str
     show_github_link: bool
     privacy_url: str
+    theme_family: str
     storage: StorageConfig
 
     @property
@@ -199,6 +200,9 @@ class ConfigView:
         welcome_message = str(_get(cfg, "welcome_message") or "").strip()
         show_github_link = _parse_bool(_get(cfg, "show_github_link"), default=True)
         privacy_url = str(_get(cfg, "privacy_url") or "").strip()
+        theme_family = str(_get(cfg, "theme_family") or "classic").strip().lower()
+        if theme_family not in ("notebook", "classic"):
+            theme_family = "classic"
 
         raw_storage = _get(cfg, "storage", {}) or {}
         driver = str(_get(raw_storage, "driver", "sqlite")).strip().lower() or "sqlite"
@@ -233,6 +237,7 @@ class ConfigView:
             welcome_message=welcome_message,
             show_github_link=show_github_link,
             privacy_url=privacy_url,
+            theme_family=theme_family,
             storage=StorageConfig(
                 driver=driver,
                 sqlite_path=sqlite_path,

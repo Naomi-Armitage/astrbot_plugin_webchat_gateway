@@ -1,109 +1,202 @@
 <!doctype html>
-<html lang="zh-CN" data-theme="dark">
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>WebChat Gateway</title>
     <meta name="description" content="WebChat Gateway 入口" />
     <meta name="robots" content="noindex" />
+    <script>
+      // Sync theme init: runs before <style> applies, so the correct
+      // :root[data-theme="..."] block wins from first paint (no flash).
+      // Family default is classic (matches operator-side default in
+      // _conf_schema.json); mode follows OS unless the user toggled.
+      (function(){
+        try {
+          var family = localStorage.getItem("wcg.theme.family") || "classic";
+          var mode = localStorage.getItem("wcg.theme.mode")
+            || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+          var t = family === "notebook"
+            ? (mode === "dark" ? "midnight" : "paper")
+            : (mode === "dark" ? "classic-dark" : "classic-light");
+          document.documentElement.setAttribute("data-theme", t);
+        } catch (e) {
+          document.documentElement.setAttribute("data-theme", "classic-light");
+        }
+      })();
+    </script>
     <style>
-      :root[data-theme="dark"] {
-        --bg: #0d1117;
-        --bg-elev: #0b0f15;
-        --surface: #161b22;
-        --surface-2: #1c2330;
-        --border: #30363d;
-        --border-soft: #21262d;
-        --text: #e6edf3;
-        --text-strong: #f0f6fc;
-        --muted: #8b949e;
-        --accent: #a371f7;
-        --accent-strong: #b692ff;
-        --accent-soft: rgba(163, 113, 247, 0.14);
-        --good: #3fb950;
-        --bad: #f85149;
-        --grid: rgba(139, 148, 158, 0.08);
+      /* ----- design tokens ----- */
+      :root[data-theme="paper"] {
+        --paper:        #fafaf9;
+        --paper-deep:   #f5f5f4;
+        --rule:         #e7e5e4;
+        --ink:          #1c1917;
+        --ink-soft:     #57534e;
+        --card:         #ffffff;
+        --accent:       #1d4ed8;
+        --accent-strong:#1e3a8a;
+        --accent-soft:  rgba(29, 78, 216, 0.10);
+        --highlight:    #dbeafe;
+        --on-highlight: #1e3a8a;
+        --good:         #15803d;
+        --warn:         #a16207;
+        --bad:          #b91c1c;
+        --shadow:       rgba(28, 25, 23, 0.06);
+        --shadow-strong:rgba(28, 25, 23, 0.10);
+        --ring:         rgba(29, 78, 216, 0.20);
+        --glow-a:       rgba(29, 78, 216, 0.10);
+        --glow-b:       rgba(99, 102, 241, 0.07);
       }
-      :root[data-theme="light"] {
-        --bg: #ffffff;
-        --bg-elev: #f6f8fa;
-        --surface: #ffffff;
-        --surface-2: #f6f8fa;
-        --border: #d0d7de;
-        --border-soft: #eaeef2;
-        --text: #1f2328;
-        --text-strong: #0a0c10;
-        --muted: #59636e;
-        --accent: #6639ba;
-        --accent-strong: #5226a3;
-        --accent-soft: rgba(102, 57, 186, 0.10);
-        --good: #1a7f37;
-        --bad: #cf222e;
-        --grid: rgba(31, 35, 40, 0.06);
+      :root[data-theme="midnight"] {
+        --paper:        #000000;
+        --paper-deep:   #141828;
+        --rule:         #262c3e;
+        --ink:          #f5f5f7;
+        --ink-soft:     #9ca3af;
+        --card:         #161b2a;
+        --accent:       #60a5fa;
+        --accent-strong:#3b82f6;
+        --accent-soft:  rgba(96, 165, 250, 0.14);
+        --highlight:    #1e3a8a;
+        --on-highlight: #dbeafe;
+        --good:         #22c55e;
+        --warn:         #eab308;
+        --bad:          #f87171;
+        --shadow:       rgba(0, 0, 0, 0.30);
+        --shadow-strong:rgba(0, 0, 0, 0.50);
+        --ring:         rgba(96, 165, 250, 0.30);
+        --glow-a:       rgba(96, 165, 250, 0.32);
+        --glow-b:       rgba(168, 85, 247, 0.22);
+      }
+      :root,
+      :root[data-theme="classic-light"] {
+        --paper:        #ffffff;
+        --paper-deep:   #f6f8fa;
+        --rule:         #d0d7de;
+        --ink:          #0a0c10;
+        --ink-soft:     #59636e;
+        --card:         #ffffff;
+        --accent:       #6639ba;
+        --accent-strong:#5226a3;
+        --accent-soft:  rgba(102, 57, 186, 0.10);
+        --highlight:    rgba(102, 57, 186, 0.10);
+        --on-highlight: #5226a3;
+        --good:         #1a7f37;
+        --warn:         #9a6700;
+        --bad:          #cf222e;
+        --shadow:       rgba(31, 35, 40, 0.06);
+        --shadow-strong:rgba(31, 35, 40, 0.10);
+        --ring:         rgba(102, 57, 186, 0.25);
+        --glow-a:       rgba(102, 57, 186, 0.08);
+        --glow-b:       rgba(99, 102, 241, 0.05);
+      }
+      :root[data-theme="classic-dark"] {
+        --paper:        #0d1117;
+        --paper-deep:   #1c2330;
+        --rule:         #30363d;
+        --ink:          #f0f6fc;
+        --ink-soft:     #8b949e;
+        --card:         #161b22;
+        --accent:       #a371f7;
+        --accent-strong:#b692ff;
+        --accent-soft:  rgba(163, 113, 247, 0.14);
+        --highlight:    #2f1c5e;
+        --on-highlight: #f3eaff;
+        --good:         #3fb950;
+        --warn:         #d29922;
+        --bad:          #f85149;
+        --shadow:       rgba(0, 0, 0, 0.25);
+        --shadow-strong:rgba(0, 0, 0, 0.45);
+        --ring:         rgba(163, 113, 247, 0.30);
+        --glow-a:       rgba(163, 113, 247, 0.22);
+        --glow-b:       rgba(120, 80, 200, 0.14);
+      }
+      :root {
+        --font-display: "Comic Sans MS", "Comic Neue", "Chalkboard SE", "Marker Felt", system-ui, sans-serif;
+        --font-ui:      system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", Roboto, "Helvetica Neue", sans-serif;
       }
 
+      /* ----- base ----- */
       *, *::before, *::after { box-sizing: border-box; }
       body {
         margin: 0;
-        background: var(--bg);
-        color: var(--text);
-        font: 15px/1.55 "Comic Sans MS", "Comic Neue", "Chalkboard SE", system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+        background:
+          radial-gradient(ellipse 900px 600px at 5% 0%, var(--glow-a), transparent 55%),
+          radial-gradient(ellipse 800px 600px at 95% 100%, var(--glow-b), transparent 55%),
+          var(--paper);
+        background-attachment: fixed;
+        color: var(--ink);
+        font: 15px/1.55 var(--font-ui);
         -webkit-font-smoothing: antialiased;
         text-rendering: optimizeLegibility;
         min-height: 100vh;
+        min-height: 100dvh;
         display: flex;
         flex-direction: column;
       }
-      a { color: var(--accent-strong); text-decoration: none; }
-      a:hover { text-decoration: underline; }
-      h1, h2, h3 { color: var(--text-strong); margin: 0; letter-spacing: -0.01em; }
+      a { color: var(--accent); text-decoration: none; }
+      a:hover { color: var(--accent-strong); text-decoration: underline; }
+      h1, h2, h3 {
+        color: var(--ink);
+        margin: 0;
+        letter-spacing: -0.01em;
+        font-family: var(--font-display);
+      }
 
       .container { max-width: 720px; margin: 0 auto; padding: 0 20px; width: 100%; }
 
       /* ---------- nav ---------- */
       .nav {
-        border-bottom: 1px solid var(--border-soft);
-        background: color-mix(in oklab, var(--bg) 80%, transparent);
-        backdrop-filter: saturate(140%) blur(10px);
-        -webkit-backdrop-filter: saturate(140%) blur(10px);
+        background: var(--paper);
+        border-bottom: 1px solid var(--rule);
       }
       .nav-inner {
         display: flex;
         align-items: center;
         gap: 12px;
-        height: 56px;
+        height: 60px;
       }
       .brand {
         display: flex; align-items: center; gap: 10px;
-        font-weight: 600; color: var(--text-strong);
+        font-family: var(--font-display);
+        font-weight: 600; color: var(--ink);
         text-decoration: none;
       }
       .brand:hover { text-decoration: none; }
       .brand-mark {
-        width: 28px; height: 28px;
+        width: 30px; height: 30px;
         display: grid; place-items: center;
         background: var(--accent-soft);
-        border: 1px solid var(--border);
+        border: 1px solid var(--rule);
         border-radius: 8px;
+        transition: background .15s ease;
       }
-      .brand-mark svg { width: 16px; height: 16px; color: var(--accent-strong); }
+      .brand:hover .brand-mark { background: color-mix(in oklab, var(--accent) 18%, transparent); }
+      .brand-mark svg { width: 15px; height: 15px; color: var(--accent-strong); }
       .nav-actions {
         margin-left: auto;
-        display: flex; align-items: center; gap: 6px;
+        display: flex; align-items: center; gap: 8px;
       }
       .icon-btn {
         display: inline-grid; place-items: center;
         width: 34px; height: 34px;
         font: inherit;
-        color: var(--muted);
-        background: transparent;
-        border: 1px solid var(--border);
+        color: var(--ink-soft);
+        background: var(--card);
+        border: 1px solid var(--rule);
         border-radius: 8px;
         cursor: pointer;
         text-decoration: none !important;
+        box-shadow: 0 1px 2px var(--shadow);
+        transition: color .15s ease, background .15s ease, border-color .15s ease, box-shadow .15s ease;
       }
-      .icon-btn:hover { color: var(--text-strong); background: var(--surface); }
-      .icon-btn svg { width: 16px; height: 16px; }
+      .icon-btn:hover {
+        color: var(--ink);
+        background: var(--paper-deep);
+        border-color: color-mix(in oklab, var(--ink-soft) 50%, var(--rule));
+      }
+      .icon-btn svg { width: 15px; height: 15px; }
 
       /* ---------- main ---------- */
       main {
@@ -115,19 +208,9 @@
       /* ---------- hero ---------- */
       .hero {
         position: relative;
-        padding: 72px 0 24px;
-        overflow: hidden;
+        padding: 64px 0 16px;
       }
-      .hero-bg {
-        position: absolute; inset: 0;
-        pointer-events: none;
-        background:
-          radial-gradient(60% 60% at 50% 0%, var(--accent-soft) 0%, transparent 60%),
-          linear-gradient(var(--grid) 1px, transparent 1px) 0 0 / 40px 40px,
-          linear-gradient(90deg, var(--grid) 1px, transparent 1px) 0 0 / 40px 40px;
-        mask-image: radial-gradient(ellipse at 50% 30%, #000 30%, transparent 75%);
-        -webkit-mask-image: radial-gradient(ellipse at 50% 30%, #000 30%, transparent 75%);
-      }
+      .hero-bg { display: none; }
       .hero-inner {
         position: relative;
         text-align: center;
@@ -138,11 +221,11 @@
         font-size: clamp(28px, 5vw, 40px);
         line-height: 1.15;
         font-weight: 700;
-        letter-spacing: -0.02em;
+        letter-spacing: -0.015em;
       }
       .hero p.welcome {
-        color: var(--muted);
-        font-size: 16px;
+        color: var(--ink-soft);
+        font-size: 15px;
         max-width: 540px;
         margin: 0 auto;
       }
@@ -151,126 +234,174 @@
       /* ---------- entry card ---------- */
       .entry { padding: 24px 0 56px; }
       .card {
-        background: var(--surface);
-        border: 1px solid var(--border);
-        border-radius: 14px;
-        padding: 28px;
-        box-shadow: 0 12px 40px -24px rgba(0,0,0,.6);
+        background: var(--card);
+        border: 1px solid var(--rule);
+        border-radius: 12px;
+        padding: 30px;
+        box-shadow: 0 4px 16px var(--shadow), 0 1px 3px var(--shadow-strong);
       }
       .card h2 {
+        font-family: var(--font-display);
         font-size: 18px;
-        font-weight: 650;
+        font-weight: 600;
         margin-bottom: 4px;
+        color: var(--ink);
       }
       .card p.lede {
-        color: var(--muted);
-        font-size: 13px;
-        margin: 0 0 18px;
+        color: var(--ink-soft);
+        font-size: 13.5px;
+        margin: 0 0 20px;
       }
-      .field { display: grid; gap: 6px; margin-bottom: 14px; }
+      .field { display: grid; gap: 6px; margin-bottom: 16px; }
       .field label {
-        font-size: 12px;
+        font-size: 12.5px;
         font-weight: 600;
-        color: var(--muted);
-        letter-spacing: 0.02em;
+        color: var(--ink-soft);
+        letter-spacing: 0.01em;
       }
       .field input {
         font: inherit;
-        padding: 11px 13px;
-        background: var(--bg-elev);
-        color: var(--text);
-        border: 1px solid var(--border);
+        font-size: 14px;
+        padding: 10px 13px;
+        background: var(--card);
+        color: var(--ink);
+        border: 1px solid var(--rule);
         border-radius: 8px;
-        transition: border-color .12s ease, box-shadow .12s ease;
+        transition: border-color .15s ease, box-shadow .15s ease;
       }
+      .field input::placeholder { color: var(--ink-soft); }
       .field input:focus {
         outline: none;
         border-color: var(--accent);
-        box-shadow: 0 0 0 3px var(--accent-soft);
+        box-shadow: 0 0 0 3px var(--ring);
       }
       .field-row {
-        display: flex; align-items: center; gap: 6px;
+        display: flex; align-items: stretch; gap: 8px;
       }
       .field-row input { flex: 1; }
       .reveal-btn {
-        font: inherit; font-size: 12px;
-        padding: 0 12px;
-        height: 40px;
-        color: var(--muted);
-        background: var(--surface-2);
-        border: 1px solid var(--border);
+        font: inherit; font-size: 13px; font-weight: 500;
+        padding: 0 13px;
+        color: var(--ink-soft);
+        background: var(--paper-deep);
+        border: 1px solid var(--rule);
         border-radius: 8px;
         cursor: pointer;
+        transition: color .15s ease, border-color .15s ease, background .15s ease;
       }
-      .reveal-btn:hover { color: var(--text-strong); }
+      .reveal-btn:hover {
+        color: var(--ink);
+        border-color: color-mix(in oklab, var(--ink-soft) 50%, var(--rule));
+      }
 
       .submit {
         width: 100%;
-        font: inherit; font-weight: 600;
+        font: inherit; font-weight: 600; font-size: 14.5px;
         padding: 12px 18px;
-        margin-top: 6px;
+        margin-top: 8px;
         background: var(--accent);
         color: #fff;
         border: 1px solid var(--accent);
-        border-radius: 9px;
+        border-radius: 10px;
+        box-shadow: 0 1px 2px var(--shadow);
         cursor: pointer;
-        display: inline-flex; align-items: center; justify-content: center; gap: 8px;
-        transition: background .12s ease, transform .1s ease;
+        display: inline-flex; align-items: center; justify-content: center; gap: 10px;
+        transition: background .15s ease, border-color .15s ease, box-shadow .15s ease, transform .12s ease;
       }
-      .submit:hover { background: var(--accent-strong); }
-      .submit:active { transform: translateY(1px); }
+      .submit:hover:not(:disabled) {
+        background: var(--accent-strong);
+        border-color: var(--accent-strong);
+        box-shadow: 0 2px 4px var(--shadow-strong);
+      }
+      .submit:active:not(:disabled) { transform: translateY(1px); }
       .submit:disabled { opacity: .5; cursor: not-allowed; }
       .submit svg { width: 14px; height: 14px; }
 
       .err {
-        margin-top: 12px;
+        margin-top: 14px;
         padding: 10px 12px;
         font-size: 13px;
-        background: color-mix(in oklab, var(--bad) 15%, transparent);
-        border: 1px solid color-mix(in oklab, var(--bad) 40%, transparent);
+        background: color-mix(in oklab, var(--bad) 8%, var(--card));
+        border: 1px solid color-mix(in oklab, var(--bad) 30%, transparent);
         color: var(--bad);
         border-radius: 8px;
       }
       .err:empty { display: none; }
 
       .hint {
-        margin-top: 16px;
+        margin-top: 18px;
         font-size: 12.5px;
-        color: var(--muted);
+        color: var(--ink-soft);
         text-align: center;
       }
 
       /* ---------- footer ---------- */
       footer {
-        border-top: 1px solid var(--border-soft);
-        padding: 20px 0 28px;
-        color: var(--muted);
-        font-size: 12px;
+        border-top: 1px solid var(--rule);
+        padding: 20px 0 calc(28px + env(safe-area-inset-bottom));
+        color: var(--ink-soft);
+        font-size: 12.5px;
       }
       .foot-row {
         display: flex; flex-wrap: wrap; gap: 14px;
         align-items: center; justify-content: center;
       }
-      .foot-row a { color: var(--muted); }
-      .foot-row a:hover { color: var(--text-strong); }
+      .foot-row a { color: var(--ink-soft); }
+      .foot-row a:hover { color: var(--ink); }
       .foot-row .sep {
         width: 3px; height: 3px; border-radius: 999px;
-        background: var(--border);
+        background: var(--rule);
       }
 
-      ::selection { background: color-mix(in oklab, var(--accent) 35%, transparent); }
+      ::selection { background: var(--highlight); color: var(--on-highlight); }
 
+      /* ---------- mobile ---------- */
+      @media (max-width: 520px) {
+        .hero { padding: 40px 0 12px; }
+        .card { padding: 22px; }
+        /* iOS Safari prevents auto-zoom on input focus when font-size >= 16px */
+        .field input { font-size: 16px; }
+      }
+
+      /* ---------- Classic family overrides ----------
+         Base is already aligned with soft-UI; classic only adds the
+         GitHub-style translucent nav and the marketing hero pattern. */
+      [data-theme^="classic"] h1,
+      [data-theme^="classic"] h2,
+      [data-theme^="classic"] h3,
+      [data-theme^="classic"] .brand,
+      [data-theme^="classic"] .card h2 {
+        font-family: var(--font-ui);
+      }
+      [data-theme^="classic"] .nav {
+        position: relative;
+        background: color-mix(in oklab, var(--paper) 80%, transparent);
+        backdrop-filter: blur(10px);
+        -webkit-backdrop-filter: blur(10px);
+      }
+      [data-theme^="classic"] .hero {
+        padding: 72px 0 24px;
+        overflow: hidden;
+      }
+      [data-theme^="classic"] .hero-bg {
+        display: block;
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        background:
+          radial-gradient(60% 60% at 50% 0%, var(--accent-soft) 0%, transparent 60%),
+          linear-gradient(rgba(139, 148, 158, 0.08) 1px, transparent 1px) 0 0 / 40px 40px,
+          linear-gradient(90deg, rgba(139, 148, 158, 0.08) 1px, transparent 1px) 0 0 / 40px 40px;
+        mask-image: radial-gradient(ellipse at 50% 30%, #000 30%, transparent 75%);
+        -webkit-mask-image: radial-gradient(ellipse at 50% 30%, #000 30%, transparent 75%);
+      }
+
+      /* ---------- reduced motion ---------- */
       @media (prefers-reduced-motion: reduce) {
         *, *::before, *::after {
           transition-duration: 0.001ms !important;
           animation-duration: 0.001ms !important;
         }
-        .submit:active { transform: none; }
-      }
-
-      @media (max-width: 520px) {
-        .hero { padding: 48px 0 16px; }
-        .card { padding: 22px; }
       }
     </style>
   </head>
@@ -287,6 +418,13 @@
           <span id="brandName">WebChat Gateway</span>
         </a>
         <div class="nav-actions">
+          <button id="themeToggle" class="icon-btn" type="button"
+            aria-label="切换深浅色" aria-pressed="false">
+            <svg id="themeIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+              stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+            </svg>
+          </button>
           <a id="githubLink" class="icon-btn" hidden
              href="https://github.com/Naomi-Armitage/astrbot_plugin_webchat_gateway"
              target="_blank" rel="noopener" aria-label="GitHub">
@@ -294,13 +432,6 @@
               <path d="M12 .5C5.7.5.5 5.7.5 12c0 5.1 3.3 9.4 7.9 10.9.6.1.8-.3.8-.6v-2c-3.2.7-3.9-1.4-3.9-1.4-.5-1.3-1.3-1.7-1.3-1.7-1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.7 1.3 3.4 1 .1-.7.4-1.3.7-1.6-2.6-.3-5.4-1.3-5.4-5.9 0-1.3.5-2.4 1.2-3.2-.1-.3-.5-1.5.1-3.2 0 0 1-.3 3.3 1.2 1-.3 2-.4 3-.4s2 .1 3 .4c2.3-1.5 3.3-1.2 3.3-1.2.7 1.7.3 2.9.1 3.2.8.8 1.2 1.9 1.2 3.2 0 4.6-2.8 5.6-5.4 5.9.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6 4.6-1.5 7.9-5.8 7.9-10.9C23.5 5.7 18.3.5 12 .5z"/>
             </svg>
           </a>
-          <button id="themeToggle" class="icon-btn" type="button"
-            aria-label="切换主题" aria-pressed="true">
-            <svg id="themeIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-              stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
-            </svg>
-          </button>
         </div>
       </div>
     </header>
@@ -360,27 +491,8 @@
 
     <script>
       (() => {
-        const THEME_KEY = "wcg.landing.theme";
         const LS_TOKEN = "wcg.token";
         const LS_USERNAME = "wcg.username";
-
-        const root = document.documentElement;
-        const themeBtn = document.getElementById("themeToggle");
-        const themeIcon = document.getElementById("themeIcon");
-        const sunPath = '<path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/><circle cx="12" cy="12" r="4"/>';
-        const moonPath = '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>';
-
-        function applyTheme(t) {
-          root.setAttribute("data-theme", t);
-          themeIcon.innerHTML = t === "dark" ? moonPath : sunPath;
-          themeBtn.setAttribute("aria-pressed", String(t === "dark"));
-        }
-        applyTheme(localStorage.getItem(THEME_KEY) || "dark");
-        themeBtn.addEventListener("click", () => {
-          const next = root.getAttribute("data-theme") === "dark" ? "light" : "dark";
-          localStorage.setItem(THEME_KEY, next);
-          applyTheme(next);
-        });
 
         // Hydrate token / username from any prior visit (returning user).
         const tokenInput = document.getElementById("token");
@@ -444,11 +556,52 @@
                 a.rel = "noopener";
               }
             }
+            const family = (data.theme_family === "classic") ? "classic" : "notebook";
+            const stored = localStorage.getItem("wcg.theme.family");
+            if (stored !== family) {
+              try { localStorage.setItem("wcg.theme.family", family); } catch {}
+              const cur = document.documentElement.getAttribute("data-theme");
+              const isDark = cur === "midnight" || cur === "classic-dark";
+              const mode = isDark ? "dark" : "light";
+              const resolved = family === "classic"
+                ? (mode === "dark" ? "classic-dark" : "classic-light")
+                : (mode === "dark" ? "midnight" : "paper");
+              if (resolved !== cur) {
+                document.documentElement.setAttribute("data-theme", resolved);
+              }
+            }
           } catch {
             /* offline / network error — keep defaults */
           }
         }
         loadSite();
+
+        // Theme toggle. Init script in <head> sets data-theme on first paint;
+        // here we just wire the sun/moon button and persist the user's choice.
+        (function setupThemeToggle() {
+          const btn = document.getElementById("themeToggle");
+          const icon = document.getElementById("themeIcon");
+          const sunPath = '<path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/><circle cx="12" cy="12" r="4"/>';
+          const moonPath = '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>';
+          function resolveTheme(mode) {
+            const family = localStorage.getItem("wcg.theme.family") || "notebook";
+            if (family === "classic") return mode === "dark" ? "classic-dark" : "classic-light";
+            return mode === "dark" ? "midnight" : "paper";
+          }
+          function applyMode(mode, persist) {
+            document.documentElement.setAttribute("data-theme", resolveTheme(mode));
+            icon.innerHTML = mode === "dark" ? moonPath : sunPath;
+            btn.setAttribute("aria-pressed", String(mode === "dark"));
+            if (persist) { try { localStorage.setItem("wcg.theme.mode", mode); } catch {} }
+          }
+          const cur = document.documentElement.getAttribute("data-theme");
+          const initialMode = (cur === "midnight" || cur === "classic-dark") ? "dark" : "light";
+          applyMode(initialMode, false);
+          btn.addEventListener("click", () => {
+            const isDark = btn.getAttribute("aria-pressed") === "true";
+            applyMode(isDark ? "light" : "dark", true);
+          });
+        })();
       })();
     </script>
   </body>
