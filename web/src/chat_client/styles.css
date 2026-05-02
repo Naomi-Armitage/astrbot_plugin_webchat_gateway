@@ -91,12 +91,11 @@
 
 /* ----- base ----- */
 * { box-sizing: border-box; }
-html, body { background: var(--paper); }
+html, body { background: var(--paper); height: 100%; overflow: hidden; }
 body {
   margin: 0;
   font: 15px/1.55 var(--font-ui);
   color: var(--ink);
-  min-height: 100vh;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
   background:

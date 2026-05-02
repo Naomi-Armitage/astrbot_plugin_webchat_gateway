@@ -18,7 +18,7 @@ revealBtn.addEventListener("click", () => {
 const form = $<HTMLFormElement>("entryForm");
 const errEl = $("err");
 const submitBtn = $<HTMLButtonElement>("submitBtn");
-form.addEventListener("submit", (e) => {
+form.addEventListener("submit", async (e) => {
   e.preventDefault();
   errEl.textContent = "";
   const token = tokenInput.value.trim();
@@ -28,10 +28,35 @@ form.addEventListener("submit", (e) => {
     tokenInput.focus();
     return;
   }
-  try { localStorage.setItem(LS_TOKEN, token); } catch {}
-  try { localStorage.setItem(LS_USERNAME, username); } catch {}
   submitBtn.disabled = true;
-  location.href = "/chat";
+  try {
+    // Probe /me with the candidate token so a wrong token shows the error
+    // here, instead of letting /chat bounce back after a redirect flash.
+    const resp = await fetch("/api/webchat/me", {
+      headers: { Authorization: `Bearer ${token}` },
+      credentials: "same-origin",
+    });
+    if (resp.status === 401) {
+      errEl.textContent = "Token 无效或已撤销。";
+      tokenInput.focus();
+      return;
+    }
+    if (resp.status === 429) {
+      errEl.textContent = "请求过于频繁，请稍后再试。";
+      return;
+    }
+    if (!resp.ok) {
+      errEl.textContent = `服务异常 (${resp.status})，请稍后再试。`;
+      return;
+    }
+    try { localStorage.setItem(LS_TOKEN, token); } catch {}
+    try { localStorage.setItem(LS_USERNAME, username); } catch {}
+    location.href = "/chat";
+  } catch {
+    errEl.textContent = "网络错误，请检查连接后重试。";
+  } finally {
+    submitBtn.disabled = false;
+  }
 });
 
 loadSite();
