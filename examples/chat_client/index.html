@@ -343,11 +343,6 @@
       }
       /* hide empty state once any sibling .msg appears */
       #messages:has(.msg) .empty-state { display: none; }
-      /* in classic family, swap to system-ui for the title */
-      [data-theme^="classic"] .empty-state .empty-title {
-        font-family: var(--font-ui);
-        font-weight: 600;
-      }
 
       /* ----- footer / composer ----- */
       footer {
@@ -429,16 +424,14 @@
       }
 
       /* ---------- Classic family overrides ----------
-         Classic stays close to base now (the base IS soft-UI clean), so
-         only color-driven tweaks needed: GitHub-style flat user bubbles,
-         remove the comic-font on messages for a more uniform feel. */
+         Classic stays close to base structurally; only color-driven tweaks
+         needed: GitHub-style flat user bubbles + tighter heading sizing.
+         Display font (Comic Sans) is shared with notebook on purpose. */
       [data-theme^="classic"] header h1 {
-        font-family: var(--font-ui);
         font-size: 14px;
         font-weight: 600;
       }
       [data-theme^="classic"] .msg {
-        font-family: var(--font-ui);
         font-size: 14px;
       }
       [data-theme^="classic"] .msg.user {
