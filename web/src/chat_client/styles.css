@@ -119,11 +119,11 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
 .sidebar {
   flex: 0 0 240px; width: 240px;
   display: flex; flex-direction: column;
-  border-right: 1px solid var(--rule);
-  background: color-mix(in oklab, var(--paper) 70%, var(--paper-deep));
   min-height: 0;
+  /* Desktop: column sits on the page gradient with no fill of its own;
+     items are floating cards. Mobile drawer adds a solid panel below. */
 }
-.sidebar-head { padding: 14px 12px 10px; border-bottom: 1px solid var(--rule); }
+.sidebar-head { padding: 14px 12px 8px; }
 .sidebar-new {
   width: 100%;
   display: inline-flex; align-items: center; justify-content: center;
@@ -132,12 +132,16 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
   color: var(--accent); background: var(--card);
   border: 1px dashed color-mix(in oklab, var(--accent) 40%, var(--rule));
   border-radius: 10px; cursor: pointer;
-  transition: background .15s ease, border-color .15s ease, color .15s ease;
+  box-shadow: 0 1px 2px var(--shadow);
+  transition: background .15s ease, border-color .15s ease, color .15s ease, box-shadow .15s ease;
 }
-.sidebar-new:hover { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-strong); }
+.sidebar-new:hover {
+  background: var(--accent-soft); border-color: var(--accent); color: var(--accent-strong);
+  box-shadow: 0 2px 4px var(--shadow-strong);
+}
 .sidebar-new svg { width: 14px; height: 14px; }
 
-.session-list { list-style: none; margin: 0; padding: 6px 0; flex: 1; overflow-y: auto; min-height: 0; }
+.session-list { list-style: none; margin: 0; padding: 4px 0 6px; flex: 1; overflow-y: auto; min-height: 0; }
 .session-list::-webkit-scrollbar { width: 6px; }
 .session-list::-webkit-scrollbar-thumb {
   background: color-mix(in oklab, var(--ink-soft) 30%, transparent);
@@ -145,19 +149,30 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
 }
 
 .session-item {
-  display: flex; align-items: stretch; gap: 2px; padding: 0 6px;
-  position: relative;
-  border-left: 3px solid transparent;
-  transition: background .12s ease;
+  display: flex; align-items: stretch; gap: 2px;
+  margin: 4px 10px;
+  background: var(--card);
+  border: 1px solid var(--rule);
+  border-radius: 12px;
+  box-shadow: 0 1px 2px var(--shadow);
+  overflow: hidden;
+  transition: background .12s ease, border-color .12s ease, box-shadow .12s ease;
 }
-.session-item:hover { background: var(--paper-deep); }
-.session-item[aria-current="page"] { background: var(--accent-soft); border-left-color: var(--accent); }
+.session-item:hover {
+  border-color: color-mix(in oklab, var(--ink-soft) 35%, var(--rule));
+  box-shadow: 0 2px 4px var(--shadow-strong);
+}
+.session-item[aria-current="page"] {
+  background: var(--accent-soft);
+  border-color: color-mix(in oklab, var(--accent) 45%, var(--rule));
+  box-shadow: 0 1px 3px var(--shadow);
+}
 .session-pick {
   flex: 1; min-width: 0;
   display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
-  padding: 10px; background: transparent; border: 0;
+  padding: 10px 12px; background: transparent; border: 0;
   text-align: left; cursor: pointer; font: inherit;
-  color: var(--ink); border-radius: 6px; min-height: 44px;
+  color: var(--ink); min-height: 44px;
 }
 .session-pick:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .session-title {
@@ -171,7 +186,7 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
   display: inline-grid; place-items: center;
   background: transparent; border: 0;
   color: var(--ink-soft); cursor: pointer;
-  border-radius: 6px; opacity: 0;
+  opacity: 0;
   transition: opacity .12s ease, color .12s ease, background .12s ease;
 }
 .session-del svg { width: 14px; height: 14px; }
@@ -476,6 +491,9 @@ footer button:disabled { opacity: .5; cursor: not-allowed; }
     left: 0; top: 0; bottom: 0;
     width: 280px; max-width: 80vw;
     flex: 0 0 auto;
+    /* Drawer needs an opaque panel so it reads against the dimmed backdrop;
+       desktop column stays transparent (cards float on the page gradient). */
+    background: var(--paper);
     border-right: 1px solid var(--rule);
     transform: translateX(-100%);
     z-index: 100;
