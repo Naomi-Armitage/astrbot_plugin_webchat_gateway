@@ -3,6 +3,25 @@
 记录本插件的可见变化。版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)，
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/)。
 
+## v0.2.1 — 2026-05-02
+
+### Added
+- chat 页左侧多会话 sidebar：每个会话独立保留消息历史，标题自动从首条用户消息截前 25 字，按 `lastActiveAt` 倒序排
+- 桌面 ≥720px 固定 240px 列；移动 <720px 改抽屉式 drawer，汉堡按钮触发，backdrop / ESC / 外点击都可关闭
+- 鼠标 hover 显删除（X）按钮，触屏设备恒显（`@media (hover: none)`）
+
+### Changed
+- chat 页 localStorage 模式合并：原 `wcg.sessionId`（localStorage）+ `wcg.history`（sessionStorage）两套键统一为单个 `wcg.chat.sessions` JSON，结构 `{ activeId, sessions: { [id]: { id, title, lastActiveAt, history } } }`。**首次启动自动迁移**——旧的两个键内容会被组装成一个 session 写入新 store，旧键保留作为手动回滚路径
+- 顶部 "新会话" 按钮被 sidebar 的 "+ 新会话" 取代，从 header 移除
+- "清空" 按钮现在表示"清空当前 session 的消息"
+
+### Fixed (defense in depth)
+- chat sidebar 解析 `wcg.chat.sessions` 时按 schema 验证每条 session：损坏的 JSON / 数组以外形状 / 字段缺失 / role 不在枚举内的项目都跳过；store 完全损坏时 fall back 到一个空白 session，永不让坏数据 crash 登录后页面
+
+### Known follow-ups (不阻塞 v0.2.1)
+- localStorage 没设容量上限——长期累积多会话长对话可能撞 5–10MB 浏览器配额，目前 `QuotaExceededError` 静默吞掉
+- 移动端 drawer 没做 focus trap——Tab 键能跳到背景按钮（ESC / backdrop 关闭都正常）
+
 ## v0.2.0 — 2026-05-02
 
 ### ⚠️ Breaking
