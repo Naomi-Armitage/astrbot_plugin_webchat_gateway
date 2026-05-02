@@ -4,6 +4,11 @@
 `index.html`，写回到仓库根的 `examples/<page>/index.html`。Python 后端的
 `_file_handler` 仍然按原路径直接读这些文件，**不要动后端**。
 
+> ⚠️ 不要直接编辑 `examples/<page>/index.html`。它是 `npm run build`
+> 的产物，每次重新构建都会被覆盖。改前端请改 `web/src/<page>/`，然后
+> 跑一次 `npm run build`。产物头部有 `<!-- AUTO-GENERATED ... -->` 注释
+> 提醒。
+
 ## 目录约定
 
 ```
