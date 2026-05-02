@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>WebChat Gateway</title>
+    <meta name="description" content="WebChat Gateway 入口" />
+    <meta name="robots" content="noindex" />
+    <script>
+      // Sync theme init: runs before <style> applies, so the correct
+      // :root[data-theme="..."] block wins from first paint (no flash).
+      // Family default is classic (matches operator-side default in
+      // _conf_schema.json); mode follows OS unless the user toggled.
+      (function(){
+        try {
+          var family = localStorage.getItem("wcg.theme.family") || "classic";
+          var mode = localStorage.getItem("wcg.theme.mode")
+            || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+          var t = family === "notebook"
+            ? (mode === "dark" ? "midnight" : "paper")
+            : (mode === "dark" ? "classic-dark" : "classic-light");
+          document.documentElement.setAttribute("data-theme", t);
+        } catch (e) {
+          document.documentElement.setAttribute("data-theme", "classic-light");
+        }
+      })();
+    </script>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="nav">
+      <div class="container nav-inner">
+        <a class="brand" href="/" aria-label="首页">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+              stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>
+            </svg>
+          </span>
+          <span id="brandName">WebChat Gateway</span>
+        </a>
+        <div class="nav-actions">
+          <button id="themeToggle" class="icon-btn" type="button"
+            aria-label="切换深浅色" aria-pressed="false">
+            <svg id="themeIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+              stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+            </svg>
+          </button>
+          <a id="githubLink" class="icon-btn" hidden
+             href="https://github.com/Naomi-Armitage/astrbot_plugin_webchat_gateway"
+             target="_blank" rel="noopener" aria-label="GitHub">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+              <path d="M12 .5C5.7.5.5 5.7.5 12c0 5.1 3.3 9.4 7.9 10.9.6.1.8-.3.8-.6v-2c-3.2.7-3.9-1.4-3.9-1.4-.5-1.3-1.3-1.7-1.3-1.7-1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.7 1.3 3.4 1 .1-.7.4-1.3.7-1.6-2.6-.3-5.4-1.3-5.4-5.9 0-1.3.5-2.4 1.2-3.2-.1-.3-.5-1.5.1-3.2 0 0 1-.3 3.3 1.2 1-.3 2-.4 3-.4s2 .1 3 .4c2.3-1.5 3.3-1.2 3.3-1.2.7 1.7.3 2.9.1 3.2.8.8 1.2 1.9 1.2 3.2 0 4.6-2.8 5.6-5.4 5.9.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6 4.6-1.5 7.9-5.8 7.9-10.9C23.5 5.7 18.3.5 12 .5z"/>
+            </svg>
+          </a>
+        </div>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div class="hero-bg" aria-hidden="true"></div>
+        <div class="container hero-inner">
+          <span class="hero-pill">
+            <span class="dot" aria-hidden="true"></span>
+            <span>在线 · 可直接使用</span>
+          </span>
+          <h1 id="heroTitle">WebChat Gateway</h1>
+          <p class="sub" id="welcomeMessage"></p>
+          <div class="hero-cta">
+            <a id="primaryCta" class="btn btn-primary" href="/login">
+              <span id="primaryCtaText">开始聊天</span>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M5 12h14M13 5l7 7-7 7"/>
+              </svg>
+            </a>
+            <span id="ctaHint" class="hint">需要先输入访问 token</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="usage">
+        <div class="container">
+          <div class="section-head">
+            <span class="eyebrow">怎么用</span>
+            <h2>三步上手。</h2>
+            <p>把发给你的链接打开就够了，剩下的页面会带你走完。</p>
+          </div>
+          <div class="features">
+            <article class="feature">
+              <div class="feature-icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                  stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <rect x="3" y="11" width="18" height="11" rx="2"/>
+                  <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+                </svg>
+              </div>
+              <h3>1 · 拿到 token</h3>
+              <p>把这个网站发给你的人，会同时把一串访问 token 给你。
+                它就是你这边的钥匙，请妥善保存。</p>
+            </article>
+            <article class="feature">
+              <div class="feature-icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                  stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+                </svg>
+              </div>
+              <h3>2 · 开始聊天</h3>
+              <p>点上面的按钮进入聊天页，把 token 粘进去，
+                像和朋友打字一样直接发送就行。</p>
+            </article>
+            <article class="feature">
+              <div class="feature-icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                  stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M3 12a9 9 0 1 0 9-9"/>
+                  <polyline points="3 4 3 12 11 12"/>
+                </svg>
+              </div>
+              <h3>3 · 随时回来</h3>
+              <p>对话上下文会自动接续，下次回到同一台设备，
+                上一轮的话题还在原地等你。</p>
+            </article>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <div class="container foot-row">
+        <span id="footerName">WebChat Gateway</span>
+        <span class="spacer"></span>
+        <a id="privacyLink" href="#" hidden>隐私声明</a>
+        <span>AGPLv3</span>
+      </div>
+    </footer>
+
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,18 @@
+{
+  "name": "astrbot-webchat-gateway-web",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Frontend source for astrbot_plugin_webchat_gateway. Builds into ../examples/<page>/index.html.",
+  "scripts": {
+    "dev": "vite",
+    "build": "node ./scripts/build.mjs",
+    "build:landing": "vite build --config vite.config.ts --mode landing",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "vite": "^5.4.0",
+    "vite-plugin-singlefile": "^2.0.3"
+  }
+}
