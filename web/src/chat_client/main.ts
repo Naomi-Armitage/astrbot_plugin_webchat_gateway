@@ -157,6 +157,7 @@ async function send(): Promise<void> {
   try {
     const resp = await fetch(CHAT_URL, {
       method: "POST",
+      credentials: "same-origin",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${token}`,
