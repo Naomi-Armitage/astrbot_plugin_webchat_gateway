@@ -7,6 +7,7 @@ import { viteSingleFile } from "vite-plugin-singlefile";
 import { readFileSync, writeFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { themeInitPlugin } from "./theme-init-plugin.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -20,7 +21,7 @@ async function buildPage(page) {
   const outDir = resolve(__dirname, "../../examples", page);
   await build({
     root,
-    plugins: [viteSingleFile()],
+    plugins: [themeInitPlugin(), viteSingleFile()],
     logLevel: "info",
     build: {
       outDir,
