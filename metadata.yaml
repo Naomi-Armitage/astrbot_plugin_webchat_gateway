@@ -1,7 +1,7 @@
 name: astrbot_plugin_webchat_gateway
 display_name: WebChat Gateway
 desc: 受控版 WebChat 网关：每好友独立 Token、每日配额、单飞并发、IP 防爆破、SQLite/MySQL 双后端，附管理面板与聊天示例。
-version: v0.1.0
+version: v0.1.1
 author: Naomi-Armitage
 repo: https://github.com/Naomi-Armitage/astrbot_plugin_webchat_gateway
 astrbot_version: ">=4.17.0"
