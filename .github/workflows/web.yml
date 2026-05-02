@@ -6,11 +6,13 @@ on:
     paths:
       - "web/**"
       - "examples/landing/index.html"
+      - "examples/login/index.html"
       - ".github/workflows/web.yml"
   pull_request:
     paths:
       - "web/**"
       - "examples/landing/index.html"
+      - "examples/login/index.html"
       - ".github/workflows/web.yml"
 
 permissions:
@@ -34,10 +36,10 @@ jobs:
       - working-directory: web
         run: npm run build
 
-      - name: Verify built artifact is committed
+      - name: Verify built artifacts are committed
         run: |
           set -euo pipefail
-          if ! git diff --exit-code -- examples/landing/index.html; then
-            echo "::error::examples/landing/index.html drifted from web/src/landing/. Run 'cd web && npm run build' and commit the result."
+          if ! git diff --exit-code -- examples/landing/index.html examples/login/index.html; then
+            echo "::error::examples/{landing,login}/index.html drifted from web/src/. Run 'cd web && npm run build' and commit the result."
             exit 1
           fi

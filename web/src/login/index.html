@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>WebChat Gateway</title>
+    <meta name="description" content="WebChat Gateway 入口" />
+    <meta name="robots" content="noindex" />
+    <script>
+      // Sync theme init: runs before <style> applies, so the correct
+      // :root[data-theme="..."] block wins from first paint (no flash).
+      // Family default is classic (matches operator-side default in
+      // _conf_schema.json); mode follows OS unless the user toggled.
+      (function(){
+        try {
+          var family = localStorage.getItem("wcg.theme.family") || "classic";
+          var mode = localStorage.getItem("wcg.theme.mode")
+            || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+          var t = family === "notebook"
+            ? (mode === "dark" ? "midnight" : "paper")
+            : (mode === "dark" ? "classic-dark" : "classic-light");
+          document.documentElement.setAttribute("data-theme", t);
+        } catch (e) {
+          document.documentElement.setAttribute("data-theme", "classic-light");
+        }
+      })();
+    </script>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="nav">
+      <div class="container nav-inner">
+        <a class="brand" href="/" aria-label="返回首页">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+              stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>
+            </svg>
+          </span>
+          <span id="brandName">WebChat Gateway</span>
+        </a>
+        <div class="nav-actions">
+          <button id="themeToggle" class="icon-btn" type="button"
+            aria-label="切换深浅色" aria-pressed="false">
+            <svg id="themeIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+              stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+            </svg>
+          </button>
+          <a id="githubLink" class="icon-btn" hidden
+             href="https://github.com/Naomi-Armitage/astrbot_plugin_webchat_gateway"
+             target="_blank" rel="noopener" aria-label="GitHub">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+              <path d="M12 .5C5.7.5.5 5.7.5 12c0 5.1 3.3 9.4 7.9 10.9.6.1.8-.3.8-.6v-2c-3.2.7-3.9-1.4-3.9-1.4-.5-1.3-1.3-1.7-1.3-1.7-1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.7 1.3 3.4 1 .1-.7.4-1.3.7-1.6-2.6-.3-5.4-1.3-5.4-5.9 0-1.3.5-2.4 1.2-3.2-.1-.3-.5-1.5.1-3.2 0 0 1-.3 3.3 1.2 1-.3 2-.4 3-.4s2 .1 3 .4c2.3-1.5 3.3-1.2 3.3-1.2.7 1.7.3 2.9.1 3.2.8.8 1.2 1.9 1.2 3.2 0 4.6-2.8 5.6-5.4 5.9.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6 4.6-1.5 7.9-5.8 7.9-10.9C23.5 5.7 18.3.5 12 .5z"/>
+            </svg>
+          </a>
+        </div>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div class="hero-bg" aria-hidden="true"></div>
+        <div class="container hero-inner">
+          <h1 id="heroTitle">WebChat Gateway</h1>
+          <p class="welcome" id="welcomeMessage"></p>
+        </div>
+      </section>
+
+      <section class="entry">
+        <div class="container">
+          <form class="card" id="entryForm" autocomplete="off" novalidate>
+            <h2>开始聊天</h2>
+            <p class="lede">输入你的访问 token 与昵称，进入聊天页面。</p>
+            <div class="field">
+              <label for="token">访问 Token</label>
+              <div class="field-row">
+                <input id="token" name="token" type="password" required
+                  placeholder="粘贴管理员发给你的 token"
+                  autocomplete="off" spellcheck="false" />
+                <button type="button" class="reveal-btn" id="revealBtn"
+                  aria-pressed="false">显示</button>
+              </div>
+            </div>
+            <div class="field">
+              <label for="username">昵称</label>
+              <input id="username" name="username" type="text"
+                placeholder="Friend" maxlength="32"
+                autocomplete="off" spellcheck="false" />
+            </div>
+            <button type="submit" class="submit" id="submitBtn">
+              开始聊天
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M5 12h14M13 5l7 7-7 7"/>
+              </svg>
+            </button>
+            <div class="err" id="err" role="alert"></div>
+            <p class="hint">没有 token？请联系把这个链接发给你的人。</p>
+          </form>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <div class="container foot-row">
+        <span id="footerName">WebChat Gateway</span>
+        <span class="sep" aria-hidden="true"></span>
+        <span>AGPLv3</span>
+        <a id="privacyLink" href="#" hidden>隐私声明</a>
+      </div>
+    </footer>
+
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>
