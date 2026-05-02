@@ -107,6 +107,7 @@ class ConfigView:
     allowed_origins: set[str]
     max_message_length: int
     history_turns: int
+    auto_title_enabled: bool
     persona_id: str
     default_daily_quota: int
     ip_brute_force_max_fails: int
@@ -130,6 +131,10 @@ class ConfigView:
     @property
     def me_path(self) -> str:
         return f"{self.endpoint_prefix}/me"
+
+    @property
+    def title_path(self) -> str:
+        return f"{self.endpoint_prefix}/title"
 
     @property
     def site_info_path(self) -> str:
@@ -178,6 +183,7 @@ class ConfigView:
             _get(cfg, "max_message_length"), default=4000, lo=16, hi=200_000
         )
         history = _clamp_int(_get(cfg, "history_turns"), default=8, lo=0, hi=50)
+        auto_title = _parse_bool(_get(cfg, "auto_title_enabled"), default=True)
         persona = str(_get(cfg, "persona_id") or "").strip()
         default_quota = _clamp_int(
             _get(cfg, "default_daily_quota"), default=200, lo=1, hi=1_000_000
@@ -227,6 +233,7 @@ class ConfigView:
             allowed_origins=origins,
             max_message_length=max_msg,
             history_turns=history,
+            auto_title_enabled=auto_title,
             persona_id=persona,
             default_daily_quota=default_quota,
             ip_brute_force_max_fails=ip_max,

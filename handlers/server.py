@@ -20,6 +20,7 @@ from .admin_auth_routes import AuthRouteDeps, make_auth_handlers
 from .admin_stats import AdminDeps, make_admin_handlers
 from .chat import ChatDeps, make_chat_handler, make_me_handler, make_preflight_handler
 from .site import SiteDeps, make_site_handlers
+from .title import TitleDeps, make_title_handler
 
 
 @dataclass
@@ -27,6 +28,7 @@ class ServerDeps:
     config: ConfigView
     chat: ChatDeps
     admin: AdminDeps
+    title: TitleDeps
 
 
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
@@ -87,6 +89,10 @@ def build_app(deps: ServerDeps) -> web.Application:
     me_handler = make_me_handler(deps.chat)
     app.router.add_get(cfg.me_path, me_handler)
     app.router.add_options(cfg.me_path, chat_preflight)
+
+    title_handler = make_title_handler(deps.title)
+    app.router.add_post(cfg.title_path, title_handler)
+    app.router.add_options(cfg.title_path, chat_preflight)
 
     admin = make_admin_handlers(deps.admin)
 

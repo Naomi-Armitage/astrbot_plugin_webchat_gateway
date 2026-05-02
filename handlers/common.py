@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Protocol
 from urllib.parse import urlparse
 
 from aiohttp import web
+
+from ..core.audit import AuditLogger
+from ..core.auth import extract_bearer, hash_token
+from ..core.ip_guard import IpGuard
+from ..storage.base import AbstractStorage
 
 
 def extract_origin(
@@ -152,4 +158,101 @@ def preflight_response(
         headers=build_cors_headers(
             origin, allowed, same_origin_host=same_origin_host
         ),
+    )
+
+
+class _GateDeps(Protocol):
+    storage: AbstractStorage
+    audit: AuditLogger
+    ip_guard: IpGuard
+    allowed_origins: set[str]
+    trust_forwarded_for: bool
+    trust_referer_as_origin: bool
+    allow_missing_origin: bool
+
+
+@dataclass
+class GatePass:
+    """Result of a successful pre-LLM gate (origin + IP + auth)."""
+
+    token: Any  # storage Token row
+    ip: str
+    origin: str | None
+    allowed: set[str]
+    same_host: str
+
+
+async def gate_request(
+    request: web.Request, deps: _GateDeps
+) -> GatePass | web.Response:
+    """Run origin → IP brute-force → bearer auth.
+
+    Returns a GatePass on success, or an error Response (already serialized
+    with the right CORS headers) that the caller should return verbatim.
+    Audit + IP-guard side-effects mirror handlers/chat.py exactly so the
+    /title path can't be used to enumerate tokens any cheaper than /chat.
+    """
+    origin = extract_origin(
+        request, trust_referer_as_origin=deps.trust_referer_as_origin
+    )
+    allowed = deps.allowed_origins
+    same_host = request.host
+
+    if not is_origin_allowed(
+        origin,
+        allowed,
+        same_origin_host=same_host,
+        allow_missing=deps.allow_missing_origin,
+    ):
+        return json_response(
+            {"error": "forbidden_origin"},
+            status=403,
+            origin=origin,
+            allowed_origins=allowed,
+            same_origin_host=same_host,
+        )
+
+    ip = client_ip(request, trust_forwarded_for=deps.trust_forwarded_for)
+
+    blocked, retry_after = await deps.ip_guard.is_blocked(ip)
+    if blocked:
+        return json_response(
+            {"error": "ip_blocked", "retry_after": retry_after},
+            status=429,
+            origin=origin,
+            allowed_origins=allowed,
+            extra_headers={"Retry-After": str(retry_after)},
+            same_origin_host=same_host,
+        )
+
+    presented = extract_bearer(request)
+    if not presented:
+        await deps.ip_guard.record_failure(ip)
+        await deps.audit.write("auth_fail", ip=ip, detail={"reason": "no_token"})
+        return json_response(
+            {"error": "unauthorized"},
+            status=401,
+            origin=origin,
+            allowed_origins=allowed,
+            same_origin_host=same_host,
+        )
+    token = await deps.storage.get_token_by_hash(hash_token(presented))
+    if token is None or token.revoked_at is not None:
+        if token is None:
+            await deps.ip_guard.record_failure(ip)
+        await deps.audit.write(
+            "auth_fail",
+            ip=ip,
+            detail={"reason": "revoked" if token else "invalid"},
+        )
+        return json_response(
+            {"error": "unauthorized"},
+            status=401,
+            origin=origin,
+            allowed_origins=allowed,
+            same_origin_host=same_host,
+        )
+    await deps.ip_guard.reset(ip)
+    return GatePass(
+        token=token, ip=ip, origin=origin, allowed=allowed, same_host=same_host
     )

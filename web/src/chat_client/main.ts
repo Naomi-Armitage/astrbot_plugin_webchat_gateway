@@ -10,16 +10,19 @@ const SS_LEGACY_HISTORY = "wcg.history";
 const CHAT_URL = "/api/webchat/chat";
 const ME_URL = "/api/webchat/me";
 const SITE_URL = "/api/webchat/site";
+const TITLE_URL = "/api/webchat/title";
 
 const TITLE_MAX = 25;
+const RENAME_MAX = 40;
 const TRASH_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6M10 11v6M14 11v6"/></svg>';
+const PENCIL_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>';
 
 const token = (localStorage.getItem(LS_TOKEN) || "").trim();
 if (!token) { location.replace("/login"); throw new Error("redirecting to /login"); }
 
 type Role = "user" | "bot" | "error" | "notice";
 interface HistoryItem { role: Role; text: string; ts: number; }
-interface SessionMeta { id: string; title: string; lastActiveAt: number; history: HistoryItem[]; }
+interface SessionMeta { id: string; title: string; titleManual?: boolean; lastActiveAt: number; history: HistoryItem[]; }
 interface ChatStore { activeId: string; sessions: Record<string, SessionMeta>; }
 
 const inputEl = $<HTMLTextAreaElement>("input");
@@ -51,6 +54,7 @@ function isHistoryItem(it: unknown): it is HistoryItem {
 function isSessionMeta(it: unknown): it is SessionMeta {
   if (!it || typeof it !== "object") return false;
   const o = it as Record<string, unknown>;
+  if (o.titleManual !== undefined && typeof o.titleManual !== "boolean") return false;
   return typeof o.id === "string" && typeof o.title === "string" &&
     typeof o.lastActiveAt === "number" && Array.isArray(o.history) && o.history.every(isHistoryItem);
 }
@@ -88,6 +92,7 @@ function migrateLegacy(): ChatStore {
   if (legacyHistory.length) {
     sess.history = legacyHistory;
     sess.title = deriveTitle(legacyHistory);
+    sess.titleManual = true;
     sess.lastActiveAt = legacyHistory[legacyHistory.length - 1]!.ts;
   }
   return { activeId: sess.id, sessions: { [sess.id]: sess } };
@@ -159,6 +164,43 @@ function relativeTime(ts: number): string {
   return `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
+let editingSessionId: string | null = null;
+
+async function requestAutoTitle(sid: string, firstUserMsg: string): Promise<void> {
+  const resp = await fetch(TITLE_URL, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ session_id: sid, conversation: [{ role: "user", text: firstUserMsg }] }),
+  });
+  if (!resp.ok) return;
+  const data = await resp.json() as { title?: string; remaining?: number; daily_quota?: number };
+  const newTitle = (data.title || "").trim();
+  if (!newTitle) return;
+  const sess = store.sessions[sid];
+  if (!sess || sess.titleManual) return;
+  sess.title = newTitle;
+  saveStore();
+  renderSessionList();
+  if (typeof data.remaining === "number" && typeof data.daily_quota === "number") setBadge(data.remaining, data.daily_quota);
+}
+
+function commitRename(sid: string, raw: string): void {
+  const sess = store.sessions[sid];
+  if (!sess) return;
+  sess.title = raw.trim() || "新会话";
+  sess.titleManual = true;
+  editingSessionId = null;
+  saveStore(); renderSessionList();
+}
+
+function cancelRename(): void { editingSessionId = null; renderSessionList(); }
+
+function beginRename(sid: string): void {
+  if (!store.sessions[sid]) return;
+  editingSessionId = sid; renderSessionList();
+}
+
 function renderSessionList(): void {
   sessionListEl.replaceChildren();
   const sorted = Object.values(store.sessions).sort((a, b) => b.lastActiveAt - a.lastActiveAt);
@@ -168,6 +210,26 @@ function renderSessionList(): void {
     li.setAttribute("role", "listitem");
     li.dataset.sessionId = sess.id;
     if (sess.id === store.activeId) li.setAttribute("aria-current", "page");
+    const isEditing = editingSessionId === sess.id;
+    if (isEditing) li.dataset.editing = "true";
+
+    if (isEditing) {
+      const input = document.createElement("input");
+      input.className = "session-title-input"; input.type = "text";
+      input.maxLength = RENAME_MAX; input.value = sess.title || "";
+      input.setAttribute("aria-label", "重命名会话");
+      let settled = false;
+      const commit = () => { if (settled) return; settled = true; commitRename(sess.id, input.value); };
+      const cancel = () => { if (settled) return; settled = true; cancelRename(); };
+      input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") { e.preventDefault(); commit(); }
+        else if (e.key === "Escape") { e.preventDefault(); cancel(); }
+      });
+      input.addEventListener("blur", commit);
+      li.append(input); sessionListEl.appendChild(li);
+      queueMicrotask(() => { input.focus(); input.select(); });
+      continue;
+    }
 
     const pick = document.createElement("button");
     pick.className = "session-pick"; pick.type = "button";
@@ -178,13 +240,19 @@ function renderSessionList(): void {
     pick.append(title, time);
     pick.addEventListener("click", () => switchSession(sess.id));
 
+    const edit = document.createElement("button");
+    edit.className = "session-edit"; edit.type = "button";
+    edit.setAttribute("aria-label", "重命名"); edit.title = "重命名";
+    edit.innerHTML = PENCIL_SVG;
+    edit.addEventListener("click", (e) => { e.stopPropagation(); beginRename(sess.id); });
+
     const del = document.createElement("button");
     del.className = "session-del"; del.type = "button";
     del.setAttribute("aria-label", "删除该会话"); del.title = "删除该会话";
     del.innerHTML = TRASH_SVG;
     del.addEventListener("click", (e) => { e.stopPropagation(); deleteSession(sess.id); });
 
-    li.append(pick, del);
+    li.append(pick, edit, del);
     sessionListEl.appendChild(li);
   }
 }
@@ -265,9 +333,17 @@ async function send(): Promise<void> {
   const message = inputEl.value.trim();
   if (!message) return;
   sendBtn.disabled = true;
+  const sessBefore = currentSession();
+  const isFirstUserMsg = !sessBefore.history.some((h) => h.role === "user");
+  const sidForTitle = sessBefore.id;
+  const eligibleForAutoTitle = isFirstUserMsg && sessBefore.titleManual !== true;
   addMessage("user", message);
   inputEl.value = "";
   showTyping();
+
+  if (eligibleForAutoTitle) {
+    requestAutoTitle(sidForTitle, message).catch(() => {});
+  }
 
   try {
     const resp = await fetch(CHAT_URL, {
@@ -310,7 +386,7 @@ async function send(): Promise<void> {
 
 $<HTMLButtonElement>("clearHistory").onclick = () => {
   const sess = currentSession();
-  sess.history.length = 0; sess.title = "新会话";
+  sess.history.length = 0; sess.title = "新会话"; sess.titleManual = false;
   saveStore(); clearMsgList(); renderSessionList();
 };
 $<HTMLButtonElement>("newSessionBtn").onclick = newSession;

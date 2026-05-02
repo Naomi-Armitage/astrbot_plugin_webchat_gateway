@@ -7,6 +7,7 @@ the original plugin so behavior matches the simple version.
 from __future__ import annotations
 
 import asyncio
+from typing import Sequence
 
 from astrbot.api import logger
 
@@ -170,3 +171,81 @@ class LlmBridge:
             logger.exception("[WebChatGateway] persist conversation failed")
 
         return reply
+
+    # ----- Title generation -----
+
+    _TITLE_SYSTEM_PROMPT = (
+        "你是会话标题生成器。根据下面的对话内容，用 6-12 个简体中文字符总结一个简短标题。\n"
+        "只输出标题文本，不要标点，不要解释，不要引号，不要 emoji。"
+    )
+
+    @staticmethod
+    def _format_conversation(turns: Sequence[dict]) -> str:
+        lines: list[str] = []
+        for turn in turns:
+            role = "user" if str(turn.get("role", "")).lower() == "user" else "bot"
+            text = str(turn.get("text") or "").strip()
+            if not text:
+                continue
+            # Cap each turn so a single huge message can't blow the prompt up.
+            if len(text) > 500:
+                text = text[:500] + "…"
+            lines.append(f"[{role}]: {text}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _post_process_title(raw: str, fallback: str) -> str:
+        text = (raw or "").strip()
+        # Take first line only.
+        if text:
+            text = text.split("\n", 1)[0].strip()
+        # Strip surrounding quotes (ASCII + full-width).
+        for _ in range(2):
+            if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'`“”‘’「」『』《》":
+                text = text[1:-1].strip()
+            else:
+                break
+        if len(text) > 30:
+            text = text[:30]
+        if text:
+            return text
+        return (fallback or "").strip()[:25]
+
+    async def generate_title(
+        self,
+        *,
+        token_name: str,
+        session_id: str,
+        conversation: Sequence[dict],
+    ) -> str:
+        # Match the chat path's umo namespacing so provider routing matches;
+        # persona is intentionally NOT applied (titles are neutral).
+        unified_origin = f"webchat_gateway:{token_name}:{session_id}"
+        body = self._format_conversation(conversation)
+        if not body:
+            raise RuntimeError("empty_conversation")
+        first_user = next(
+            (
+                str(t.get("text") or "")
+                for t in conversation
+                if str(t.get("role", "")).lower() == "user"
+            ),
+            "",
+        )
+        try:
+            provider_id = await self._context.get_current_chat_provider_id(
+                umo=unified_origin
+            )
+            if not provider_id:
+                raise RuntimeError("chat_provider_not_configured")
+            resp = await asyncio.wait_for(
+                self._context.llm_generate(
+                    chat_provider_id=provider_id,
+                    prompt=body,
+                    system_prompt=self._TITLE_SYSTEM_PROMPT,
+                ),
+                timeout=self._timeout,
+            )
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError("llm_timeout") from exc
+        return self._post_process_title(resp.completion_text or "", first_user)

@@ -195,6 +195,38 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
 .session-del:hover { color: var(--bad); background: color-mix(in oklab, var(--bad) 10%, transparent); }
 @media (hover: none) { .session-del { opacity: 1; width: 36px; flex-basis: 36px; } }
 
+.session-edit {
+  width: 32px; flex: 0 0 32px;
+  display: inline-grid; place-items: center;
+  background: transparent; border: 0;
+  color: var(--ink-soft); cursor: pointer;
+  opacity: 0;
+  transition: opacity .12s ease, color .12s ease, background .12s ease;
+}
+.session-edit svg { width: 14px; height: 14px; }
+.session-item:hover .session-edit,
+.session-item:focus-within .session-edit { opacity: 1; }
+.session-edit:hover { color: var(--accent); background: color-mix(in oklab, var(--accent) 10%, transparent); }
+@media (hover: none) { .session-edit { opacity: 1; width: 36px; flex-basis: 36px; } }
+
+.session-title-input {
+  flex: 1; min-width: 0;
+  padding: 9px 12px;
+  font: inherit; font-size: 14px; font-weight: 500;
+  color: var(--ink); background: var(--card);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  outline: none;
+}
+.session-title-input:focus { box-shadow: 0 0 0 3px var(--ring); }
+.session-item[data-editing="true"] .session-pick,
+.session-item[data-editing="true"] .session-edit,
+.session-item[data-editing="true"] .session-del { display: none; }
+.session-item[data-editing="true"] {
+  padding: 4px;
+  background: var(--card);
+}
+
 /* ----- sidebar toggle (mobile) + backdrop ----- */
 .sidebar-toggle {
   display: none;

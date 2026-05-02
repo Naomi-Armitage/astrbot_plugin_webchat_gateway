@@ -72,6 +72,12 @@
     "hint": "每次请求携带最近 N 轮历史，建议 4-12。",
     "default": 8
   },
+  "auto_title_enabled": {
+    "type": "bool",
+    "description": "启用 LLM 自动生成会话标题",
+    "hint": "若关闭，POST /api/webchat/title 直接返回 503 title_disabled。前端会保持自动生成的“新会话”标题，用户仍可手动重命名。",
+    "default": true
+  },
   "llm_timeout_seconds": {
     "type": "int",
     "description": "LLM 调用超时时间（秒）",

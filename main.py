@@ -22,6 +22,7 @@ from .handlers.admin_stats import AdminDeps
 from .handlers.admin_tokens import ServiceError, TokenService
 from .handlers.chat import ChatDeps
 from .handlers.server import ServerDeps, ServerLifecycle, build_app
+from .handlers.title import TitleDeps
 from .storage import AbstractStorage, get_storage
 
 
@@ -115,7 +116,21 @@ class WebChatGatewayPlugin(Star):
                 trust_referer_as_origin=cfg.trust_referer_as_origin,
                 allow_missing_origin=cfg.allow_missing_origin,
             )
-            server_deps = ServerDeps(config=cfg, chat=chat_deps, admin=admin_deps)
+            title_deps = TitleDeps(
+                storage=storage,
+                audit=audit,
+                ip_guard=ip_guard,
+                llm_bridge=llm_bridge,
+                allowed_origins=cfg.allowed_origins,
+                max_message_length=cfg.max_message_length,
+                auto_title_enabled=cfg.auto_title_enabled,
+                trust_forwarded_for=cfg.trust_forwarded_for,
+                trust_referer_as_origin=cfg.trust_referer_as_origin,
+                allow_missing_origin=cfg.allow_missing_origin,
+            )
+            server_deps = ServerDeps(
+                config=cfg, chat=chat_deps, admin=admin_deps, title=title_deps
+            )
             app = build_app(server_deps)
 
             await self._lifecycle.start(app, host=cfg.host, port=cfg.port)
