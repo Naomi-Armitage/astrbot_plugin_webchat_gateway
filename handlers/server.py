@@ -113,6 +113,7 @@ def build_app(deps: ServerDeps) -> web.Application:
             trust_forwarded_for=cfg.trust_forwarded_for,
             trust_referer_as_origin=deps.admin.trust_referer_as_origin,
             cookie_path=cfg.admin_cookie_path,
+            allow_missing_origin=deps.admin.allow_missing_origin,
         )
     )
     app.router.add_post(cfg.admin_login_path, auth["login"])

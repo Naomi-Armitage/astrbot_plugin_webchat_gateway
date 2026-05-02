@@ -40,12 +40,15 @@ def is_origin_allowed(
     allowed: set[str],
     *,
     same_origin_host: str | None = None,
+    allow_missing: bool = True,
 ) -> bool:
     if "*" in allowed:
         return True
     if origin is None:
         # Non-browser clients (curl, server-side) typically omit Origin.
-        return True
+        # State-changing endpoints opt out via allow_missing=False so the
+        # Origin allow-list is not silently neutered for non-browser callers.
+        return allow_missing
     if origin in allowed:
         return True
     if same_origin_host:

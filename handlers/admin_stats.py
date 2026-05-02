@@ -32,6 +32,7 @@ class AdminDeps:
     trust_forwarded_for: bool
     ip_guard: IpGuard
     trust_referer_as_origin: bool = False
+    allow_missing_origin: bool = False
 
 
 def _parse_int(value, default: int, lo: int, hi: int) -> int:
@@ -74,11 +75,20 @@ def make_admin_handlers(deps: AdminDeps):
             same_origin_host=request.host,
         )
 
-    async def _gate(request: web.Request, ip: str, origin: str | None) -> None:
+    async def _gate(
+        request: web.Request,
+        ip: str,
+        origin: str | None,
+        *,
+        allow_missing: bool,
+    ) -> None:
         # Origin allow-list — match chat.py ordering: cheap filter before any
         # IpGuard accounting or master-key probe.
         if not is_origin_allowed(
-            origin, allowed, same_origin_host=request.host
+            origin,
+            allowed,
+            same_origin_host=request.host,
+            allow_missing=allow_missing,
         ):
             raise ServiceError("forbidden_origin", status=403)
         await gate_admin(
@@ -93,7 +103,7 @@ def make_admin_handlers(deps: AdminDeps):
         origin = _origin(request)
         ip = client_ip(request, trust_forwarded_for=deps.trust_forwarded_for)
         try:
-            await _gate(request, ip, origin)
+            await _gate(request, ip, origin, allow_missing=deps.allow_missing_origin)
             body = await _read_json(request)
             result = await deps.token_service.issue(
                 name=str(body.get("name") or ""),
@@ -125,7 +135,7 @@ def make_admin_handlers(deps: AdminDeps):
         ip = client_ip(request, trust_forwarded_for=deps.trust_forwarded_for)
         name = request.match_info.get("name", "")
         try:
-            await _gate(request, ip, origin)
+            await _gate(request, ip, origin, allow_missing=deps.allow_missing_origin)
             ok = await deps.token_service.revoke(name=name, ip=ip)
         except ServiceError as exc:
             return _err(request, origin, exc)
@@ -145,7 +155,7 @@ def make_admin_handlers(deps: AdminDeps):
         origin = _origin(request)
         ip = client_ip(request, trust_forwarded_for=deps.trust_forwarded_for)
         try:
-            await _gate(request, ip, origin)
+            await _gate(request, ip, origin, allow_missing=True)
             include = (request.query.get("include_revoked") or "").lower() in {
                 "1",
                 "true",
@@ -182,7 +192,7 @@ def make_admin_handlers(deps: AdminDeps):
         origin = _origin(request)
         ip = client_ip(request, trust_forwarded_for=deps.trust_forwarded_for)
         try:
-            await _gate(request, ip, origin)
+            await _gate(request, ip, origin, allow_missing=True)
             name = request.query.get("name") or ""
             days = _parse_int(request.query.get("days"), default=7, lo=1, hi=90)
             data = await deps.token_service.stats(name=name, days=days, ip=ip)
@@ -202,7 +212,7 @@ def make_admin_handlers(deps: AdminDeps):
         origin = _origin(request)
         ip = client_ip(request, trust_forwarded_for=deps.trust_forwarded_for)
         try:
-            await _gate(request, ip, origin)
+            await _gate(request, ip, origin, allow_missing=True)
             limit = _parse_int(request.query.get("limit"), default=100, lo=1, hi=500)
             rows = await deps.storage.get_recent_audit(limit=limit)
             await deps.audit.write(

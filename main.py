@@ -102,6 +102,7 @@ class WebChatGatewayPlugin(Star):
                 max_message_length=cfg.max_message_length,
                 trust_forwarded_for=cfg.trust_forwarded_for,
                 trust_referer_as_origin=cfg.trust_referer_as_origin,
+                allow_missing_origin=cfg.allow_missing_origin,
             )
             admin_deps = AdminDeps(
                 storage=storage,
@@ -112,6 +113,7 @@ class WebChatGatewayPlugin(Star):
                 trust_forwarded_for=cfg.trust_forwarded_for,
                 ip_guard=ip_guard,
                 trust_referer_as_origin=cfg.trust_referer_as_origin,
+                allow_missing_origin=cfg.allow_missing_origin,
             )
             server_deps = ServerDeps(config=cfg, chat=chat_deps, admin=admin_deps)
             app = build_app(server_deps)

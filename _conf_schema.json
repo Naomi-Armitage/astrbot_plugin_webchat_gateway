@@ -115,6 +115,12 @@
     "hint": "默认关闭。开启后会削弱 Origin 白名单作为 CSRF 防护的强度（隐私模式或 no-referrer 策略下可绕过），仅在你了解风险并需要兼容老式客户端时启用。",
     "default": false
   },
+  "allow_missing_origin": {
+    "type": "bool",
+    "description": "允许写入类请求缺少 Origin / Referer 头",
+    "hint": "若为 false（默认），未携带 Origin / Referer 头的请求被视为违规，防止 curl/服务端脚本绕过 allow_origins。仅在你明确需要让非浏览器客户端访问 API 时打开。",
+    "default": false
+  },
   "master_admin_key": {
     "type": "string",
     "description": "管理 API 主密钥",

@@ -51,6 +51,7 @@ class ChatDeps:
     max_message_length: int
     trust_forwarded_for: bool
     trust_referer_as_origin: bool = False
+    allow_missing_origin: bool = False
 
 
 @dataclass
@@ -89,7 +90,12 @@ def make_chat_handler(deps: ChatDeps):
         same_host = request.host
 
         # 1. Origin allow-list
-        if not is_origin_allowed(origin, allowed, same_origin_host=same_host):
+        if not is_origin_allowed(
+            origin,
+            allowed,
+            same_origin_host=same_host,
+            allow_missing=deps.allow_missing_origin,
+        ):
             return json_response(
                 {"error": "forbidden_origin"},
                 status=403,
