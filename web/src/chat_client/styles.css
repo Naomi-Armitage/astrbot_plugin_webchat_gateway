@@ -257,6 +257,8 @@ header {
   backdrop-filter: saturate(160%) blur(16px);
   -webkit-backdrop-filter: saturate(160%) blur(16px);
   border-bottom: 1px solid color-mix(in oklab, var(--rule) 60%, transparent);
+  container-type: inline-size;
+  container-name: chathead;
 }
 .brand { display: flex; align-items: center; gap: 10px; text-decoration: none; }
 .brand-mark {
@@ -275,9 +277,22 @@ header h1 {
   font-size: 16px;
   margin: 0;
   flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-weight: 600;
   color: var(--ink);
   letter-spacing: -0.005em;
+}
+
+/* Drop the title once the header itself can't fit it next to the
+   controls, regardless of viewport (sidebar drawer changes header
+   width independently of device size). With h1 gone, the badge takes
+   over the flex-grow gap so the right-side cluster stays right. */
+@container chathead (max-width: 520px) {
+  header h1 { display: none; }
+  header .badge { margin-left: auto; }
 }
 
 .badge {
@@ -454,14 +469,13 @@ header h1 {
 footer {
   display: flex;
   gap: 10px;
-  padding-top: 14px;
-  border-top: 1px solid var(--rule);
+  padding-top: 8px;
 }
 footer textarea {
   flex: 1;
-  min-height: 60px;
+  min-height: 36px;
   max-height: 200px;
-  padding: 10px 14px;
+  padding: 6px 12px;
   background: var(--card);
   color: var(--ink);
   border: 1px solid var(--rule);
@@ -478,7 +492,7 @@ footer textarea:focus {
   box-shadow: 0 0 0 3px var(--ring);
 }
 footer button {
-  padding: 0 20px;
+  padding: 0 14px;
   background: var(--accent);
   color: #fff;
   border: 1px solid var(--accent);
@@ -506,21 +520,19 @@ footer button:disabled { opacity: .5; cursor: not-allowed; }
 @media (max-width: 719px) {
   .main { padding: 0 14px calc(12px + env(safe-area-inset-bottom)); }
   header { gap: 8px; padding: 12px 14px 10px; }
-  header h1 { display: none; }
-  header .badge { margin-left: auto; }
   .who { display: none; }
   .actions { gap: 4px; }
   .actions a, .actions button { padding: 4px 9px; font-size: 12px; }
   #messages { padding: 56px 0 14px; gap: 8px; }
   .msg { max-width: 86%; padding: 9px 12px; font-size: 14px; }
-  footer { gap: 8px; padding-top: 10px; }
+  footer { gap: 8px; padding-top: 6px; }
   footer textarea {
-    min-height: 44px;
+    min-height: 36px;
     max-height: 120px;
     font-size: 16px; /* prevent iOS Safari auto-zoom on focus */
     resize: none;
   }
-  footer button { padding: 0 16px; font-size: 14px; }
+  footer button { padding: 0 12px; font-size: 14px; }
 
   .sidebar-toggle { display: inline-flex; }
   .sidebar {
