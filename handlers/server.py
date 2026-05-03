@@ -35,7 +35,7 @@ _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 _EXAMPLES_DIR = _PLUGIN_ROOT / "examples"
 
 
-def _file_handler(path: Path):
+def _file_handler(path: Path, *, theme_family: str | None = None):
     """Build a GET handler that serves a single static HTML file.
 
     aiohttp's add_static is overkill for three fixed pages and complicates
@@ -48,14 +48,20 @@ def _file_handler(path: Path):
             # Plugin shipped without examples/ — return 404 rather than
             # raising so the API still works.
             return web.Response(status=404, text="ui_not_installed")
-        return web.FileResponse(
-            path,
-            headers={
-                # Short cache so reloads pick up edits during development;
-                # production deployments behind a CDN should override.
-                "Cache-Control": "no-cache",
-            },
-        )
+        headers = {
+            # Short cache so reloads pick up edits during development;
+            # production deployments behind a CDN should override.
+            "Cache-Control": "no-cache",
+        }
+        if theme_family in {"classic", "notebook"}:
+            html = path.read_text(encoding="utf-8")
+            html = html.replace(
+                "<html ",
+                f'<html data-default-theme-family="{theme_family}" ',
+                1,
+            )
+            return web.Response(text=html, content_type="text/html", headers=headers)
+        return web.FileResponse(path, headers=headers)
 
     return handle
 
@@ -148,9 +154,11 @@ def build_app(deps: ServerDeps) -> web.Application:
     login_html = _EXAMPLES_DIR / "login" / "index.html"
     admin_html = _EXAMPLES_DIR / "admin_panel" / "index.html"
     chat_html = _EXAMPLES_DIR / "chat_client" / "index.html"
-    app.router.add_get("/", _file_handler(landing))
+    app.router.add_get("/", _file_handler(landing, theme_family=cfg.theme_family))
     app.router.add_get("/login", _redirect_with_slash)
-    app.router.add_get("/login/", _file_handler(login_html))
+    app.router.add_get(
+        "/login/", _file_handler(login_html, theme_family=cfg.theme_family)
+    )
     # admin UI lives at the operator-chosen path. Only the trailing-slash
     # variant serves the page; the bare path 308s to it so relative links
     # inside the page resolve. We deliberately do NOT register
@@ -160,7 +168,9 @@ def build_app(deps: ServerDeps) -> web.Application:
     app.router.add_get(admin_ui_path, _redirect_with_slash)
     app.router.add_get(admin_ui_path + "/", _file_handler(admin_html))
     app.router.add_get("/chat", _redirect_with_slash)
-    app.router.add_get("/chat/", _file_handler(chat_html))
+    app.router.add_get(
+        "/chat/", _file_handler(chat_html, theme_family=cfg.theme_family)
+    )
 
     return app
 

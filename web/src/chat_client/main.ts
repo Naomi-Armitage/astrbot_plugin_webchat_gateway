@@ -1,4 +1,13 @@
-import { LS_TOKEN, LS_FAMILY, $, resolveTheme, setupThemeToggle } from "../shared/site";
+import {
+  LS_TOKEN,
+  LS_FAMILY,
+  $,
+  modeFromTheme,
+  paintBrowserChrome,
+  reloadIOSChromeOnce,
+  resolveTheme,
+  setupThemeToggle,
+} from "../shared/site";
 import type { SiteConfig } from "../shared/site";
 
 const LS_USERNAME = "wcg.username";
@@ -313,9 +322,13 @@ async function loadChatSite(): Promise<void> {
     if (localStorage.getItem(LS_FAMILY) === family) return;
     try { localStorage.setItem(LS_FAMILY, family); } catch {}
     const cur = document.documentElement.getAttribute("data-theme");
-    const isDark = cur === "midnight" || cur === "classic-dark";
-    const resolved = resolveTheme(family, isDark ? "dark" : "light");
-    if (resolved !== cur) document.documentElement.setAttribute("data-theme", resolved);
+    const mode = modeFromTheme(cur);
+    const resolved = resolveTheme(family, mode);
+    if (resolved !== cur) {
+      document.documentElement.setAttribute("data-theme", resolved);
+      paintBrowserChrome(resolved);
+    }
+    reloadIOSChromeOnce("wcg.theme.family.reload", `${family}:${mode}`);
   } catch {}
 }
 
