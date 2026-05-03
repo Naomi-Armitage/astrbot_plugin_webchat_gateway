@@ -335,14 +335,7 @@ footer {
 }
 
 /* ---------- Classic family overrides ----------
-   Base is already aligned with soft-UI; classic only adds the
-   GitHub-style translucent nav and the marketing hero pattern. */
-[data-theme^="classic"] .nav {
-  position: relative;
-  background: color-mix(in oklab, var(--paper) 80%, transparent);
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
-}
+   Keep the nav opaque; translucent top chrome is unreliable on iOS WebKit. */
 [data-theme^="classic"] .hero {
   padding: 72px 0 24px;
   overflow: hidden;

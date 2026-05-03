@@ -326,17 +326,8 @@ footer {
 }
 
 /* ---------- Classic family overrides ----------
-   Base is already aligned with Soft UI Evolution, so classic only
-   needs the GitHub-marketing flourishes: sticky blurred nav and the
-   radial+grid masked hero background. */
-[data-theme^="classic"] .nav {
-  position: sticky;
-  top: 0;
-  z-index: 50;
-  background: color-mix(in oklab, var(--paper) 80%, transparent);
-  backdrop-filter: saturate(140%) blur(10px);
-  -webkit-backdrop-filter: saturate(140%) blur(10px);
-}
+   Keep classic close to the base page. A sticky translucent nav makes iOS
+   browser chrome keep a stale top strip, so classic only adds the hero pattern. */
 [data-theme^="classic"] .hero-bg {
   display: block;
   position: absolute;
