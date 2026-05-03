@@ -111,7 +111,12 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
   height: 100vh; height: 100dvh;
   max-width: 1180px; margin: 0 auto;
 }
-.main { flex: 1; min-width: 0; display: flex; flex-direction: column; padding: 18px 20px; }
+.main {
+  flex: 1; min-width: 0;
+  display: flex; flex-direction: column;
+  padding: 0 20px 18px;
+  position: relative;
+}
 
 /* ----- sidebar ----- */
 .sidebar {
@@ -237,13 +242,21 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
 .sidebar-toggle:hover { color: var(--ink); background: var(--paper-deep); }
 .sidebar-backdrop { display: none; position: fixed; inset: 0; background: rgba(0, 0, 0, .4); z-index: 99; }
 
-/* ----- header ----- */
+/* ----- header -----
+   Absolute overlay so messages scroll behind it; translucent + blur
+   keeps it from feeling like a solid bar that eats into chat area. */
 header {
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  z-index: 5;
   display: flex;
   align-items: center;
   gap: 12px;
-  padding-bottom: 14px;
-  border-bottom: 1px solid var(--rule);
+  padding: 18px 20px 14px;
+  background: color-mix(in oklab, var(--paper) 72%, transparent);
+  backdrop-filter: saturate(140%) blur(12px);
+  -webkit-backdrop-filter: saturate(140%) blur(12px);
+  border-bottom: 1px solid color-mix(in oklab, var(--rule) 60%, transparent);
 }
 .brand { display: flex; align-items: center; gap: 10px; text-decoration: none; }
 .brand-mark {
@@ -325,7 +338,7 @@ header h1 {
 #messages {
   flex: 1;
   overflow-y: auto;
-  padding: 18px 0;
+  padding: 72px 0 18px;
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -491,20 +504,13 @@ footer button:disabled { opacity: .5; cursor: not-allowed; }
 
 /* ----- mobile ----- */
 @media (max-width: 719px) {
-  .main { padding: 12px 14px calc(12px + env(safe-area-inset-bottom)); }
-  header { flex-wrap: wrap; gap: 8px; padding-bottom: 10px; }
-  header h1 {
-    flex: 1 1 auto;
-    min-width: 0;
-    font-size: 13.5px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
+  .main { padding: 0 14px calc(12px + env(safe-area-inset-bottom)); }
+  header { gap: 8px; padding: 12px 14px 10px; }
+  header h1 { display: none; }
   .who { display: none; }
-  .actions { flex: 1 0 100%; justify-content: flex-end; }
+  .actions { gap: 4px; }
   .actions a, .actions button { padding: 4px 9px; font-size: 12px; }
-  #messages { padding: 14px 0; gap: 8px; }
+  #messages { padding: 56px 0 14px; gap: 8px; }
   .msg { max-width: 86%; padding: 9px 12px; font-size: 14px; }
   footer { gap: 8px; padding-top: 10px; }
   footer textarea {
