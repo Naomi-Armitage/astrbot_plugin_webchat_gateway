@@ -253,9 +253,9 @@ header {
   align-items: center;
   gap: 12px;
   padding: 18px 20px 14px;
-  background: color-mix(in oklab, var(--paper) 72%, transparent);
-  backdrop-filter: saturate(140%) blur(12px);
-  -webkit-backdrop-filter: saturate(140%) blur(12px);
+  background: color-mix(in oklab, var(--paper) 55%, transparent);
+  backdrop-filter: saturate(160%) blur(16px);
+  -webkit-backdrop-filter: saturate(160%) blur(16px);
   border-bottom: 1px solid color-mix(in oklab, var(--rule) 60%, transparent);
 }
 .brand { display: flex; align-items: center; gap: 10px; text-decoration: none; }
@@ -507,6 +507,7 @@ footer button:disabled { opacity: .5; cursor: not-allowed; }
   .main { padding: 0 14px calc(12px + env(safe-area-inset-bottom)); }
   header { gap: 8px; padding: 12px 14px 10px; }
   header h1 { display: none; }
+  header .badge { margin-left: auto; }
   .who { display: none; }
   .actions { gap: 4px; }
   .actions a, .actions button { padding: 4px 9px; font-size: 12px; }
