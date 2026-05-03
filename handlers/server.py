@@ -108,7 +108,12 @@ def build_app(deps: ServerDeps) -> web.Application:
 
     item_path = cfg.admin_tokens_item_path
     app.router.add_delete(item_path, admin["delete_token"])
+    app.router.add_patch(item_path, admin["patch_token"])
     app.router.add_options(item_path, admin["preflight"])
+
+    regen_path = cfg.admin_tokens_regenerate_path
+    app.router.add_post(regen_path, admin["regenerate_token"])
+    app.router.add_options(regen_path, admin["preflight"])
 
     app.router.add_get(cfg.admin_stats_path, admin["get_stats"])
     app.router.add_options(cfg.admin_stats_path, admin["preflight"])

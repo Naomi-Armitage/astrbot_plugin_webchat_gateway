@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .base import (
+    _UNSET,
     AbstractStorage,
     AuditRow,
     TokenRow,
@@ -39,5 +40,6 @@ __all__ = [
     "TokenRow",
     "UsageRow",
     "AuditRow",
+    "_UNSET",
     "get_storage",
 ]

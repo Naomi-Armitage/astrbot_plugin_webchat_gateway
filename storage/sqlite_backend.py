@@ -8,8 +8,12 @@ from datetime import date, timedelta
 
 import aiosqlite
 
-from .base import AbstractStorage, AuditRow, TokenRow, UsageRow
-from .ddl import CURRENT_SCHEMA_VERSION, SCHEMA_SQLITE
+from .base import _UNSET, AbstractStorage, AuditRow, TokenRow, UsageRow, _Sentinel
+from .ddl import (
+    ALTER_TOKENS_ADD_EXPIRES_AT_SQLITE,
+    CURRENT_SCHEMA_VERSION,
+    SCHEMA_SQLITE,
+)
 
 
 class SqliteStorage(AbstractStorage):
@@ -40,10 +44,31 @@ class SqliteStorage(AbstractStorage):
         await self._conn.execute("PRAGMA foreign_keys=ON")
         for stmt in SCHEMA_SQLITE:
             await self._conn.execute(stmt)
-        await self._conn.execute(
-            "INSERT OR IGNORE INTO _schema_meta(key, value) VALUES('schema_version', ?)",
-            (CURRENT_SCHEMA_VERSION,),
-        )
+        async with self._conn.execute(
+            "SELECT value FROM _schema_meta WHERE key = 'schema_version'"
+        ) as cursor:
+            row = await cursor.fetchone()
+        stored = row["value"] if row else None
+        if stored is None:
+            # Fresh install — CREATE TABLE already includes expires_at.
+            await self._conn.execute(
+                "INSERT INTO _schema_meta(key, value) VALUES('schema_version', ?)",
+                (CURRENT_SCHEMA_VERSION,),
+            )
+        elif stored == "1":
+            # Upgrade from v1: add expires_at. Tolerate "duplicate column"
+            # so the migration is idempotent if a previous attempt crashed
+            # between ALTER and the version write.
+            try:
+                await self._conn.execute(ALTER_TOKENS_ADD_EXPIRES_AT_SQLITE)
+            except aiosqlite.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
+            await self._conn.execute(
+                "UPDATE _schema_meta SET value = ? WHERE key = 'schema_version'",
+                (CURRENT_SCHEMA_VERSION,),
+            )
+        # stored == CURRENT_SCHEMA_VERSION (or any future version): no-op.
         await self._conn.commit()
 
     async def close(self) -> None:
@@ -66,6 +91,7 @@ class SqliteStorage(AbstractStorage):
             note=row["note"] or "",
             created_at=int(row["created_at"]),
             revoked_at=(int(row["revoked_at"]) if row["revoked_at"] is not None else None),
+            expires_at=(int(row["expires_at"]) if row["expires_at"] is not None else None),
         )
 
     # ----- tokens -----
@@ -77,12 +103,13 @@ class SqliteStorage(AbstractStorage):
         daily_quota: int,
         note: str,
         now: int,
+        expires_at: int | None = None,
     ) -> None:
         async with self._write_lock:
             await self._db.execute(
-                "INSERT INTO tokens(name, token_hash, daily_quota, note, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (name, token_hash, daily_quota, note, now),
+                "INSERT INTO tokens(name, token_hash, daily_quota, note, created_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (name, token_hash, daily_quota, note, now, expires_at),
             )
             await self._db.commit()
 
@@ -119,6 +146,110 @@ class SqliteStorage(AbstractStorage):
         async with self._db.execute(sql, args) as cursor:
             rows = await cursor.fetchall()
         return [self._row_to_token(r) for r in rows]
+
+    async def update_token(
+        self,
+        name: str,
+        *,
+        daily_quota: int | None = None,
+        note: str | None = None,
+        expires_at: int | None | _Sentinel = _UNSET,
+    ) -> bool:
+        sets: list[str] = []
+        args: list = []
+        if daily_quota is not None:
+            sets.append("daily_quota = ?")
+            args.append(daily_quota)
+        if note is not None:
+            sets.append("note = ?")
+            args.append(note)
+        if expires_at is not _UNSET:
+            sets.append("expires_at = ?")
+            args.append(expires_at)
+        if not sets:
+            # No-op call. Treat as "matched if the token exists" so callers
+            # can rely on the boolean return value uniformly.
+            async with self._db.execute(
+                "SELECT 1 FROM tokens WHERE name = ?", (name,)
+            ) as cursor:
+                return await cursor.fetchone() is not None
+        sql = f"UPDATE tokens SET {', '.join(sets)} WHERE name = ?"
+        args.append(name)
+        async with self._write_lock:
+            cursor = await self._db.execute(sql, args)
+            await self._db.commit()
+            return cursor.rowcount > 0
+
+    async def set_token_revoked(
+        self, name: str, *, revoked: bool, now: int
+    ) -> bool:
+        async with self._write_lock:
+            if revoked:
+                cursor = await self._db.execute(
+                    "UPDATE tokens SET revoked_at = ? WHERE name = ?",
+                    (now, name),
+                )
+            else:
+                cursor = await self._db.execute(
+                    "UPDATE tokens SET revoked_at = NULL WHERE name = ?",
+                    (name,),
+                )
+            await self._db.commit()
+            return cursor.rowcount > 0
+
+    async def regenerate_token(self, name: str, new_token_hash: str) -> bool:
+        async with self._write_lock:
+            cursor = await self._db.execute(
+                "UPDATE tokens SET token_hash = ? WHERE name = ?",
+                (new_token_hash, name),
+            )
+            await self._db.commit()
+            return cursor.rowcount > 0
+
+    async def rename_token(self, old_name: str, new_name: str) -> bool:
+        if old_name == new_name:
+            async with self._db.execute(
+                "SELECT 1 FROM tokens WHERE name = ?", (old_name,)
+            ) as cursor:
+                return await cursor.fetchone() is not None
+        async with self._write_lock:
+            # Check both the source row and the destination collision atomically
+            # under the write lock. BEGIN/COMMIT brackets the cascade so a
+            # crash mid-rename can't leave daily_usage / audit_log pointing
+            # at the old name while tokens already moved.
+            async with self._db.execute(
+                "SELECT 1 FROM tokens WHERE name = ?", (old_name,)
+            ) as cursor:
+                src = await cursor.fetchone()
+            if not src:
+                return False
+            async with self._db.execute(
+                "SELECT 1 FROM tokens WHERE name = ?", (new_name,)
+            ) as cursor:
+                if await cursor.fetchone():
+                    return False
+            await self._db.execute("BEGIN")
+            try:
+                await self._db.execute(
+                    "UPDATE tokens SET name = ? WHERE name = ?",
+                    (new_name, old_name),
+                )
+                await self._db.execute(
+                    "UPDATE daily_usage SET name = ? WHERE name = ?",
+                    (new_name, old_name),
+                )
+                await self._db.execute(
+                    "UPDATE audit_log SET name = ? WHERE name = ?",
+                    (new_name, old_name),
+                )
+                await self._db.commit()
+            except BaseException:
+                try:
+                    await self._db.rollback()
+                except Exception:
+                    pass
+                raise
+            return True
 
     # ----- daily usage -----
     async def increment_daily_usage(self, name: str, *, day: date) -> int:

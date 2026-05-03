@@ -8,9 +8,20 @@ from typing import AsyncIterator
 from urllib.parse import unquote, urlparse
 
 import aiomysql
+from pymysql.constants import CLIENT as _MYSQL_CLIENT_FLAGS
 
-from .base import AbstractStorage, AuditRow, TokenRow, UsageRow
-from .ddl import CURRENT_SCHEMA_VERSION, SCHEMA_MYSQL
+from .base import _UNSET, AbstractStorage, AuditRow, TokenRow, UsageRow, _Sentinel
+from .ddl import (
+    ALTER_TOKENS_ADD_EXPIRES_AT_MYSQL,
+    CURRENT_SCHEMA_VERSION,
+    SCHEMA_MYSQL,
+)
+
+
+# MySQL error 1060: Duplicate column name. Catching by code (rather than
+# string-matching the message) keeps the migration robust against locale-
+# translated server messages.
+_ERR_DUP_COLUMN = 1060
 
 
 def _parse_dsn(dsn: str) -> dict:
@@ -42,10 +53,20 @@ class MysqlStorage(AbstractStorage):
         self._pool: aiomysql.Pool | None = None
 
     async def initialize(self) -> None:
+        # CLIENT.FOUND_ROWS switches MySQL's UPDATE rowcount semantics from
+        # "rows changed" to "rows matched". Without it, an UPDATE that sets
+        # a column to its current value reports rowcount=0, which storage
+        # callers here interpret as "row missing" — incorrectly turning
+        # set_token_revoked(False) on a non-revoked token (NULL→NULL) into
+        # a 404. Switching to FOUND_ROWS aligns mysql with sqlite's default
+        # "matched" semantics for these methods. The original revoke_token
+        # SQL keeps `AND revoked_at IS NULL` in its WHERE clause so its
+        # "did we transition" semantic is unaffected by this flag.
         self._pool = await aiomysql.create_pool(
             minsize=1,
             maxsize=5,
             pool_recycle=3600,
+            client_flag=_MYSQL_CLIENT_FLAGS.FOUND_ROWS,
             **self._kwargs,
         )
         async with self._write_tx() as conn:
@@ -53,9 +74,27 @@ class MysqlStorage(AbstractStorage):
                 for stmt in SCHEMA_MYSQL:
                     await cur.execute(stmt)
                 await cur.execute(
-                    "INSERT IGNORE INTO _schema_meta(`key`, value) VALUES('schema_version', %s)",
-                    (CURRENT_SCHEMA_VERSION,),
+                    "SELECT value FROM _schema_meta WHERE `key` = 'schema_version'"
                 )
+                row = await cur.fetchone()
+                stored = row[0] if row else None
+                if stored is None:
+                    await cur.execute(
+                        "INSERT INTO _schema_meta(`key`, value) VALUES('schema_version', %s)",
+                        (CURRENT_SCHEMA_VERSION,),
+                    )
+                elif stored == "1":
+                    try:
+                        await cur.execute(ALTER_TOKENS_ADD_EXPIRES_AT_MYSQL)
+                    except aiomysql.OperationalError as exc:
+                        # exc.args[0] is the MySQL error code on aiomysql.
+                        if not exc.args or exc.args[0] != _ERR_DUP_COLUMN:
+                            raise
+                    await cur.execute(
+                        "UPDATE _schema_meta SET value = %s WHERE `key` = 'schema_version'",
+                        (CURRENT_SCHEMA_VERSION,),
+                    )
+                # stored == CURRENT_SCHEMA_VERSION (or any future version): no-op.
 
     async def close(self) -> None:
         if self._pool is not None:
@@ -114,6 +153,7 @@ class MysqlStorage(AbstractStorage):
             note=row["note"] or "",
             created_at=int(row["created_at"]),
             revoked_at=(int(row["revoked_at"]) if row["revoked_at"] is not None else None),
+            expires_at=(int(row["expires_at"]) if row["expires_at"] is not None else None),
         )
 
     # ----- tokens -----
@@ -125,13 +165,14 @@ class MysqlStorage(AbstractStorage):
         daily_quota: int,
         note: str,
         now: int,
+        expires_at: int | None = None,
     ) -> None:
         async with self._write_tx() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "INSERT INTO tokens(name, token_hash, daily_quota, note, created_at) "
-                    "VALUES (%s, %s, %s, %s, %s)",
-                    (name, token_hash, daily_quota, note, now),
+                    "INSERT INTO tokens(name, token_hash, daily_quota, note, created_at, expires_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s)",
+                    (name, token_hash, daily_quota, note, now, expires_at),
                 )
 
     async def get_token_by_hash(self, token_hash: str) -> TokenRow | None:
@@ -171,6 +212,104 @@ class MysqlStorage(AbstractStorage):
                 await cur.execute(sql)
                 rows = await cur.fetchall()
         return [self._row_to_token(r) for r in rows]
+
+    async def update_token(
+        self,
+        name: str,
+        *,
+        daily_quota: int | None = None,
+        note: str | None = None,
+        expires_at: int | None | _Sentinel = _UNSET,
+    ) -> bool:
+        sets: list[str] = []
+        args: list = []
+        if daily_quota is not None:
+            sets.append("daily_quota = %s")
+            args.append(daily_quota)
+        if note is not None:
+            sets.append("note = %s")
+            args.append(note)
+        if expires_at is not _UNSET:
+            sets.append("expires_at = %s")
+            args.append(expires_at)
+        if not sets:
+            async with self._read_tx() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT 1 FROM tokens WHERE name = %s", (name,)
+                    )
+                    return await cur.fetchone() is not None
+        args.append(name)
+        sql = f"UPDATE tokens SET {', '.join(sets)} WHERE name = %s"
+        async with self._write_tx() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(sql, args)
+                affected = cur.rowcount
+        return affected > 0
+
+    async def set_token_revoked(
+        self, name: str, *, revoked: bool, now: int
+    ) -> bool:
+        async with self._write_tx() as conn:
+            async with conn.cursor() as cur:
+                if revoked:
+                    await cur.execute(
+                        "UPDATE tokens SET revoked_at = %s WHERE name = %s",
+                        (now, name),
+                    )
+                else:
+                    await cur.execute(
+                        "UPDATE tokens SET revoked_at = NULL WHERE name = %s",
+                        (name,),
+                    )
+                affected = cur.rowcount
+        return affected > 0
+
+    async def regenerate_token(self, name: str, new_token_hash: str) -> bool:
+        async with self._write_tx() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE tokens SET token_hash = %s WHERE name = %s",
+                    (new_token_hash, name),
+                )
+                affected = cur.rowcount
+        return affected > 0
+
+    async def rename_token(self, old_name: str, new_name: str) -> bool:
+        if old_name == new_name:
+            async with self._read_tx() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT 1 FROM tokens WHERE name = %s", (old_name,)
+                    )
+                    return await cur.fetchone() is not None
+        async with self._write_tx() as conn:
+            async with conn.cursor() as cur:
+                # SELECT FOR UPDATE locks both rows together so a parallel
+                # rename can't slip in between the existence check and the
+                # cascade. _write_tx commits on success, rolls back otherwise.
+                await cur.execute(
+                    "SELECT name FROM tokens WHERE name IN (%s, %s) FOR UPDATE",
+                    (old_name, new_name),
+                )
+                found = {r[0] for r in await cur.fetchall()}
+                if old_name not in found:
+                    return False
+                if new_name in found:
+                    return False
+                await cur.execute(
+                    "UPDATE tokens SET name = %s WHERE name = %s",
+                    (new_name, old_name),
+                )
+                await cur.execute(
+                    "UPDATE daily_usage SET name = %s WHERE name = %s",
+                    (new_name, old_name),
+                )
+                await cur.execute(
+                    "UPDATE audit_log SET name = %s WHERE name = %s",
+                    (new_name, old_name),
+                )
+        return True
 
     # ----- daily usage -----
     async def increment_daily_usage(self, name: str, *, day: date) -> int:

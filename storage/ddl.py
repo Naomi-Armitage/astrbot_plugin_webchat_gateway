@@ -10,17 +10,16 @@ Schema parity goals
 - `ip_failures` is a hot, small table; brute-force guard reads/writes it on every
   failed auth.
 - `_schema_meta` is a forward hook for migrations: each backend seeds
-  `(schema_version, "1")` on `initialize()`. Future versions can read this row
-  to decide whether to run an ALTER chain. Not a migration framework — just the
-  handshake row so future-us has somewhere to look.
+  `(schema_version, "<version>")` on `initialize()` and reads it back to drive
+  any pending ALTERs. Not a migration framework — additive columns only.
 
 Both schemas use idempotent `IF NOT EXISTS`, so re-running on an existing database
-is safe but does *not* perform migrations — additive-only changes for now.
+is safe. Cross-version upgrades happen inside each backend's `initialize()`.
 """
 
 from __future__ import annotations
 
-CURRENT_SCHEMA_VERSION = "1"
+CURRENT_SCHEMA_VERSION = "2"
 
 SCHEMA_SQLITE: tuple[str, ...] = (
     """
@@ -36,7 +35,8 @@ SCHEMA_SQLITE: tuple[str, ...] = (
         daily_quota  INTEGER NOT NULL DEFAULT 200,
         note         TEXT NOT NULL DEFAULT '',
         created_at   INTEGER NOT NULL,
-        revoked_at   INTEGER
+        revoked_at   INTEGER,
+        expires_at   INTEGER
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_tokens_hash ON tokens(token_hash)",
@@ -86,6 +86,7 @@ SCHEMA_MYSQL: tuple[str, ...] = (
         note         VARCHAR(255) NOT NULL DEFAULT '',
         created_at   BIGINT NOT NULL,
         revoked_at   BIGINT NULL,
+        expires_at   BIGINT NULL,
         INDEX idx_tokens_hash (token_hash)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
@@ -117,4 +118,14 @@ SCHEMA_MYSQL: tuple[str, ...] = (
         INDEX idx_audit_ts_id (ts, id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
+)
+
+
+# v1 → v2: tokens.expires_at. Each backend runs the ALTER guarded by a
+# duplicate-column catch so re-runs (and parallel pods) are safe.
+ALTER_TOKENS_ADD_EXPIRES_AT_SQLITE = (
+    "ALTER TABLE tokens ADD COLUMN expires_at INTEGER"
+)
+ALTER_TOKENS_ADD_EXPIRES_AT_MYSQL = (
+    "ALTER TABLE tokens ADD COLUMN expires_at BIGINT NULL"
 )

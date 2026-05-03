@@ -149,6 +149,10 @@ class ConfigView:
         return f"{self.endpoint_prefix}/admin/tokens/{{name}}"
 
     @property
+    def admin_tokens_regenerate_path(self) -> str:
+        return f"{self.admin_tokens_item_path}/regenerate"
+
+    @property
     def admin_stats_path(self) -> str:
         return f"{self.endpoint_prefix}/admin/stats"
 

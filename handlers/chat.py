@@ -16,6 +16,7 @@ concurrency slot):
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
@@ -29,7 +30,7 @@ from ..core.auth import extract_bearer, hash_token
 from ..core.ip_guard import IpGuard
 from ..core.llm_bridge import LlmBridge
 from ..core.ratelimit import PerTokenConcurrency
-from ..storage.base import AbstractStorage
+from ..storage.base import AbstractStorage, TokenRow
 from .common import (
     build_cors_headers,
     client_ip,
@@ -38,6 +39,10 @@ from .common import (
     json_response,
     preflight_response,
 )
+
+
+def _is_expired(token: TokenRow, now: int) -> bool:
+    return token.expires_at is not None and token.expires_at <= now
 
 
 @dataclass
@@ -131,17 +136,25 @@ def make_chat_handler(deps: ChatDeps):
                 same_origin_host=same_host,
             )
         token = await deps.storage.get_token_by_hash(hash_token(presented))
-        if token is None or token.revoked_at is not None:
+        now_ts = int(time.time())
+        expired = token is not None and _is_expired(token, now_ts)
+        if token is None or token.revoked_at is not None or expired:
             # Only blind probing (token not found) counts toward IP brute-force.
-            # A friend retrying a freshly revoked token is misconfiguration, not
-            # an attacker — penalising their IP would lock them out for
-            # ip_brute_force_block_seconds with no recourse.
+            # A friend retrying a freshly revoked OR expired token is
+            # misconfiguration, not an attacker — penalising their IP would
+            # lock them out for ip_brute_force_block_seconds with no recourse.
             if token is None:
                 await deps.ip_guard.record_failure(ip)
+            if token is None:
+                reason = "invalid"
+            elif token.revoked_at is not None:
+                reason = "revoked"
+            else:
+                reason = "expired"
             await deps.audit.write(
                 "auth_fail",
                 ip=ip,
-                detail={"reason": "revoked" if token else "invalid"},
+                detail={"reason": reason},
             )
             return json_response(
                 {"error": "unauthorized"},
@@ -392,7 +405,8 @@ def make_me_handler(deps: ChatDeps):
                 same_origin_host=same_host,
             )
         token = await deps.storage.get_token_by_hash(hash_token(presented))
-        if token is None or token.revoked_at is not None:
+        now_ts = int(time.time())
+        if token is None or token.revoked_at is not None or _is_expired(token, now_ts):
             if token is None:
                 await deps.ip_guard.record_failure(ip)
             return json_response(

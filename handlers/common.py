@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 from urllib.parse import urlparse
@@ -75,7 +76,7 @@ def build_cors_headers(
     same_origin_host: str | None = None,
 ) -> dict[str, str]:
     headers = {
-        "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+        "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
         "Access-Control-Allow-Headers": "Content-Type, Authorization, X-API-Key",
         "Access-Control-Allow-Credentials": "true",
         "Access-Control-Max-Age": "600",
@@ -237,13 +238,25 @@ async def gate_request(
             same_origin_host=same_host,
         )
     token = await deps.storage.get_token_by_hash(hash_token(presented))
-    if token is None or token.revoked_at is not None:
+    now_ts = int(time.time())
+    expired = (
+        token is not None
+        and token.expires_at is not None
+        and token.expires_at <= now_ts
+    )
+    if token is None or token.revoked_at is not None or expired:
         if token is None:
             await deps.ip_guard.record_failure(ip)
+        if token is None:
+            reason = "invalid"
+        elif token.revoked_at is not None:
+            reason = "revoked"
+        else:
+            reason = "expired"
         await deps.audit.write(
             "auth_fail",
             ip=ip,
-            detail={"reason": "revoked" if token else "invalid"},
+            detail={"reason": reason},
         )
         return json_response(
             {"error": "unauthorized"},

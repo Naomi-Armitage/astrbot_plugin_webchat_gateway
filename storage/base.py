@@ -7,6 +7,19 @@ from dataclasses import dataclass
 from datetime import date
 
 
+# Sentinel for partial updates where None is a meaningful value (e.g.
+# clearing tokens.expires_at to NULL). `_UNSET` means "leave the column
+# alone"; `None` means "set to NULL". Implementations check identity.
+class _Sentinel:
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debug only
+        return "_UNSET"
+
+
+_UNSET: _Sentinel = _Sentinel()
+
+
 @dataclass(frozen=True)
 class TokenRow:
     name: str
@@ -15,6 +28,7 @@ class TokenRow:
     note: str
     created_at: int
     revoked_at: int | None
+    expires_at: int | None
 
 
 @dataclass(frozen=True)
@@ -53,6 +67,7 @@ class AbstractStorage(ABC):
         daily_quota: int,
         note: str,
         now: int,
+        expires_at: int | None = None,
     ) -> None: ...
 
     @abstractmethod
@@ -66,6 +81,43 @@ class AbstractStorage(ABC):
 
     @abstractmethod
     async def list_tokens(self, *, include_revoked: bool = False) -> list[TokenRow]: ...
+
+    @abstractmethod
+    async def update_token(
+        self,
+        name: str,
+        *,
+        daily_quota: int | None = None,
+        note: str | None = None,
+        expires_at: int | None | _Sentinel = _UNSET,
+    ) -> bool:
+        """Partial UPDATE on tokens. Returns True if a row matched.
+
+        `expires_at` uses a sentinel because None is a meaningful value
+        (clear expiry). Pass `_UNSET` to leave the column alone.
+        """
+
+    @abstractmethod
+    async def set_token_revoked(
+        self, name: str, *, revoked: bool, now: int
+    ) -> bool:
+        """Set or clear `revoked_at`. Returns True if a row matched."""
+
+    @abstractmethod
+    async def regenerate_token(self, name: str, new_token_hash: str) -> bool:
+        """Rotate `token_hash` for an existing token. Returns True if matched.
+
+        Does NOT touch `revoked_at`, `daily_quota`, `note`, `expires_at`,
+        or `daily_usage`.
+        """
+
+    @abstractmethod
+    async def rename_token(self, old_name: str, new_name: str) -> bool:
+        """Rename a token, cascading to `daily_usage` + `audit_log`.
+
+        Atomic (single transaction). Returns False if `old_name` is missing
+        or `new_name` already exists. Caller must validate names beforehand.
+        """
 
     # ----- daily usage -----
     @abstractmethod
