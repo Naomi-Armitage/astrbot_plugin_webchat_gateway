@@ -74,7 +74,7 @@ export function setupThemeToggle(): void {
   const sunPath = '<path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/><circle cx="12" cy="12" r="4"/>';
   const moonPath = '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>';
   function applyMode(mode: "light" | "dark", persist: boolean): void {
-    const family = localStorage.getItem(LS_FAMILY) || "notebook";
+    const family = localStorage.getItem(LS_FAMILY) || "classic";
     document.documentElement.setAttribute("data-theme", resolveTheme(family, mode));
     icon.innerHTML = mode === "dark" ? moonPath : sunPath;
     btn.setAttribute("aria-pressed", String(mode === "dark"));

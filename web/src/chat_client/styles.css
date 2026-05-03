@@ -102,7 +102,6 @@ body {
     radial-gradient(ellipse 900px 600px at 5% 0%, var(--glow-a), transparent 55%),
     radial-gradient(ellipse 800px 600px at 95% 100%, var(--glow-b), transparent 55%),
     var(--paper);
-  background-attachment: fixed;
 }
 a { color: var(--accent); text-decoration: none; }
 a:hover { color: var(--accent-strong); text-decoration: underline; }
