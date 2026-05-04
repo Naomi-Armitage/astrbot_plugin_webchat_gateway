@@ -9,6 +9,8 @@ import {
   setupThemeToggle,
 } from "../shared/site";
 import type { SiteConfig } from "../shared/site";
+import { marked } from "marked";
+import DOMPurify from "dompurify";
 
 const LS_USERNAME = "wcg.username";
 const LS_STORE = "wcg.chat.sessions";
@@ -221,11 +223,48 @@ function replayActive(): void {
 // Render-only: never mutates store, never persists. Used by replay + by
 // applyEvents (which mutates store separately so that user/error/notice
 // flows can opt out).
+// Markdown rendering for assistant replies. marked → DOMPurify → DOM.
+// `breaks: true` so single newlines from the LLM render as <br> (most LLMs
+// do not double-newline paragraphs aggressively, especially in Chinese
+// output). User echo, error, and notice bubbles stay plain-text via
+// `textContent` because their content is either user-typed (don't trust)
+// or our own status copy (no markdown features needed).
+marked.setOptions({ gfm: true, breaks: true });
+
+// Open every link in a new tab with safe rel. DOMPurify lets attributes
+// like target/rel through but doesn't add them — that's a separate hook.
+DOMPurify.addHook("afterSanitizeAttributes", (node) => {
+  if (node.tagName === "A") {
+    node.setAttribute("target", "_blank");
+    node.setAttribute("rel", "noopener noreferrer");
+  }
+});
+
+function renderMarkdown(text: string): string {
+  // marked.parse runs sync when given a string with no async extensions,
+  // but its declared return type is `string | Promise<string>`. Force
+  // sync via the parse-as-string options.
+  const html = marked.parse(text, { async: false }) as string;
+  return DOMPurify.sanitize(html, {
+    FORBID_TAGS: ["style", "script", "iframe", "object", "embed", "form"],
+    FORBID_ATTR: ["formaction"],
+  });
+}
+
+// Append a chat bubble. `text` is the raw content as stored in history;
+// for the bot role we render markdown (sanitized), everything else stays
+// plain text (textContent) — user input must never be HTML-rendered
+// because it's untrusted input echoed back to the same DOM.
 function addMessageBubble(role: Role, text: string): void {
   hideTyping();
   const div = document.createElement("div");
   div.className = "msg " + role;
-  div.textContent = text;
+  if (role === "bot") {
+    div.classList.add("md");
+    div.innerHTML = renderMarkdown(text);
+  } else {
+    div.textContent = text;
+  }
   msgs.appendChild(div);
   scrollToEnd();
 }
