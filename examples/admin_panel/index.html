@@ -736,14 +736,14 @@
           </div>
 
           <div class="section-divider">
-            <h4>Token 旋转</h4>
+            <h4>更换 Token</h4>
             <div class="row-inline">
               <button type="button" id="ed-regen-random" class="ghost small">重新生成 token</button>
               <span class="help" style="flex:1;">旧 token 立刻失效，仅显示一次</span>
             </div>
             <div class="field">
-              <label for="ed-custom-token">或自定义 token <span class="help" style="margin-left:6px;">(保存时一并旋转)</span></label>
-              <input id="ed-custom-token" type="text" autocomplete="off" maxlength="256" placeholder="留空表示不旋转" />
+              <label for="ed-custom-token">或自定义 token <span class="help" style="margin-left:6px;">(保存时一并更换)</span></label>
+              <input id="ed-custom-token" type="text" autocomplete="off" maxlength="256" placeholder="留空表示不更换" />
             </div>
             <div id="ed-token-reveal" hidden></div>
           </div>
@@ -1411,7 +1411,7 @@
             showTokenReveal(result.token);
             edCustomToken.value = "";
             edPendingRegen = false;
-            setEditorStatus("已保存并旋转 token，请立即记录", "success");
+            setEditorStatus("已保存并更换 token，请立即记录", "success");
             loadList();
             // Stay open so the user can copy the plaintext.
           } else {
