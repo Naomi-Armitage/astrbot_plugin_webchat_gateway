@@ -1,6 +1,12 @@
 import { LS_TOKEN, $, loadSite, setupThemeToggle } from "../shared/site";
 
 const LS_USERNAME = "wcg.username";
+// Chat-page cache keys. We don't import these from chat_client (login
+// must not pull the chat bundle), but they MUST stay in sync. The login
+// page nukes them on any submit so a different token can't read the
+// previous user's session list / pts cursor.
+const LS_CHAT_STORE = "wcg.chat.sessions";
+const LS_CHAT_LAST_PTS = "wcg.chat.lastPts";
 
 const tokenInput = $<HTMLInputElement>("token");
 const usernameInput = $<HTMLInputElement>("username");
@@ -51,6 +57,12 @@ form.addEventListener("submit", async (e) => {
     }
     try { localStorage.setItem(LS_TOKEN, token); } catch {}
     try { localStorage.setItem(LS_USERNAME, username); } catch {}
+    // Drop chat-page caches whenever a token is committed here. Skipping
+    // this would let the *previous* token's session list and last_pts
+    // cursor leak into the new login (cross-token state pollution; a
+    // particularly bad one because session titles are user-visible).
+    try { localStorage.removeItem(LS_CHAT_STORE); } catch {}
+    try { localStorage.removeItem(LS_CHAT_LAST_PTS); } catch {}
     location.href = "/chat";
   } catch {
     errEl.textContent = "网络错误，请检查连接后重试。";

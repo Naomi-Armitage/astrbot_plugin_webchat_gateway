@@ -354,6 +354,18 @@ class MysqlStorage(AbstractStorage):
                     "UPDATE audit_log SET name = %s WHERE name = %s",
                     (new_name, old_name),
                 )
+                # Chat-sync cascade — see sqlite_backend.rename_token for the
+                # rationale + CM-side caveat.
+                await cur.execute(
+                    "UPDATE webchat_session_meta SET token_name = %s "
+                    "WHERE token_name = %s",
+                    (new_name, old_name),
+                )
+                await cur.execute(
+                    "UPDATE webchat_updates SET token_name = %s "
+                    "WHERE token_name = %s",
+                    (new_name, old_name),
+                )
         return True
 
     # ----- daily usage -----

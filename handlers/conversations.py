@@ -468,9 +468,32 @@ class ConversationService:
                 # the sidebar list endpoint stays single-query (no CM read).
                 # No event for the bump itself — the message_added pair
                 # already conveys the change.
+                #
+                # Stale-tab race: another device may have soft-deleted this
+                # session while this tab kept its old view. The deleted
+                # row is excluded from list_conversations, but the new
+                # message_added events would still land — peers would see
+                # the chat resurface only as bubbles, with the session
+                # itself filtered out (visible-elsewhere mismatch). Clear
+                # `deleted_at` to undelete and emit a meta_updated event
+                # before the message pair so all peers re-create / reveal
+                # the row consistently.
+                deleted_arg: int | None | object = _UNSET
+                if existing.deleted_at is not None:
+                    deleted_arg = None
+                    events.append(
+                        NewEvent(
+                            event_type=EVENT_SESSION_META_UPDATED,
+                            session_id=session_id,
+                            payload=json.dumps(
+                                {"deleted": False}, ensure_ascii=False
+                            ),
+                        )
+                    )
                 await self._storage.upsert_session_meta(
                     token_name=token_name,
                     session_id=session_id,
+                    deleted_at=deleted_arg,
                     message_count=new_count,
                     preview=preview,
                     now=now,
@@ -529,6 +552,20 @@ class ConversationService:
         if since_pts < 0:
             raise ServiceError("invalid_since", status=400)
         timeout = max(0.0, min(timeout, _MAX_EVENT_TIMEOUT))
+
+        # Wrap-around / pts-rewind detection. `append_updates` allocates pts
+        # via `MAX(pts) + 1`, so a token whose entire event log was wiped by
+        # the retention prune restarts numbering from 1. A client that was
+        # offline with `since=N` (N ≫ new_max) would otherwise loop forever
+        # asking for `pts > N` — get_updates returns nothing, the relative-
+        # threshold check `current_max - since > 1000` underflows (negative
+        # > 1000 is False), and the client never advances. Force tooFar.
+        current_max = await self._storage.get_max_pts(token_name=token_name)
+        if since_pts > current_max:
+            return EventsResult(
+                events=[], last_pts=current_max, has_more=False, too_far=True
+            )
+
         rows = await self._storage.get_updates(
             token_name=token_name, since_pts=since_pts, limit=_GET_EVENTS_LIMIT
         )
@@ -544,12 +581,10 @@ class ConversationService:
             and rows
             and rows[0].pts > since_pts + 1
         ):
-            current_max = await self._storage.get_max_pts(token_name=token_name)
             return EventsResult(
                 events=[], last_pts=current_max, has_more=False, too_far=True
             )
         if not rows and timeout > 0:
-            current_max = await self._storage.get_max_pts(token_name=token_name)
             if current_max - since_pts > _TOO_FAR_THRESHOLD:
                 # Client is too stale to catch up via the event log — let it
                 # know to drop the cache and call list_conversations.
@@ -576,7 +611,14 @@ class ConversationService:
         if rows:
             last_pts = rows[-1].pts
         else:
+            # The wait may have changed current_max; re-read so the response
+            # reflects post-wait state. Without this, a client polling at
+                # `since=N` after a prune would keep seeing the stale max.
             last_pts = await self._storage.get_max_pts(token_name=token_name)
+            if since_pts > last_pts:
+                return EventsResult(
+                    events=[], last_pts=last_pts, has_more=False, too_far=True
+                )
         # tooFar applies on the immediate-return path too: if a client
         # short-polls with a wildly stale `since`, the fast read above could
         # still be empty and we would have skipped the threshold check.

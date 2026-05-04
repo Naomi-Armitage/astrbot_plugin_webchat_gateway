@@ -191,19 +191,48 @@ def make_auth_handlers(deps: AuthRouteDeps):
 
     async def me(request: web.Request) -> web.Response:
         origin = _origin(request)
+        ip = client_ip(request, trust_forwarded_for=deps.trust_forwarded_for)
         if not is_origin_allowed(
             origin, allowed, same_origin_host=request.host
         ):
             return _err(request, origin, ServiceError("forbidden_origin", status=403))
         if not deps.master_admin_key:
             return _err(request, origin, ServiceError("admin_disabled", status=403))
+        # Same IP-guard pipeline as /login: an attacker hitting /me with a
+        # parade of bearer guesses would otherwise have an unrate-limited
+        # oracle for the master_admin_key. A bare credential probe (no
+        # bearer / cookie at all) is treated as a no-op so the admin panel
+        # can poll harmlessly on first paint.
+        bearer_present = bool(extract_bearer(request))
+        cookie_present = bool(extract_session_cookie(request))
+        if bearer_present or cookie_present:
+            blocked, retry_after = await deps.ip_guard.is_blocked(ip)
+            if blocked:
+                return _err(
+                    request,
+                    origin,
+                    ServiceError("ip_blocked", status=429, message=str(retry_after)),
+                )
         if has_admin_credentials(request, deps.master_admin_key):
+            await deps.ip_guard.reset(ip)
             kind = "bearer" if is_master_admin(request, deps.master_admin_key) else "session"
             return json_response(
                 {"ok": True, "kind": kind},
                 origin=origin,
                 allowed_origins=allowed,
                 same_origin_host=request.host,
+            )
+        if bearer_present or cookie_present:
+            await deps.ip_guard.record_failure(ip)
+            await deps.audit.write(
+                "admin_auth_fail",
+                ip=ip,
+                detail={
+                    "reason": "invalid_key" if bearer_present and not cookie_present
+                    else "invalid_session" if cookie_present and not bearer_present
+                    else "invalid_credentials",
+                    "endpoint": "me",
+                },
             )
         return _err(request, origin, ServiceError("unauthorized", status=401))
 

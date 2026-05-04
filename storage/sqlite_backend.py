@@ -284,6 +284,23 @@ class SqliteStorage(AbstractStorage):
                     "UPDATE audit_log SET name = ? WHERE name = ?",
                     (new_name, old_name),
                 )
+                # Chat-sync tables are keyed by token_name; cascade so the
+                # sidebar list and the long-poll event stream survive the
+                # rename. NB: AstrBot's conversation_manager keys its
+                # `unified_msg_origin` on `webchat_gateway:{token_name}:...`
+                # — that namespace is NOT migrated (no CM API to do so),
+                # so LLM context for prior sessions is detached. Service
+                # layer audits this separately.
+                await self._db.execute(
+                    "UPDATE webchat_session_meta SET token_name = ? "
+                    "WHERE token_name = ?",
+                    (new_name, old_name),
+                )
+                await self._db.execute(
+                    "UPDATE webchat_updates SET token_name = ? "
+                    "WHERE token_name = ?",
+                    (new_name, old_name),
+                )
                 await self._db.commit()
             except BaseException:
                 try:

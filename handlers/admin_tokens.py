@@ -387,7 +387,14 @@ class TokenService:
             "rename",
             name=new,
             ip=ip,
-            detail={"from": old, "to": new},
+            # NB: chat-sync tables (webchat_session_meta, webchat_updates)
+            # cascade with the rename, but AstrBot's conversation_manager
+            # keys LLM context on `webchat_gateway:{name}:{session_id}` and
+            # has no public rename API — prior LLM history is detached
+            # post-rename. Audit detail flags the cm_detached side-effect
+            # so operators reviewing log can correlate user reports of
+            # "history is empty after rename" without guessing.
+            detail={"from": old, "to": new, "cm_detached": True},
         )
         return await self._summary_for(new)
 
