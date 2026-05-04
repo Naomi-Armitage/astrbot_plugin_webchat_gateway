@@ -10,11 +10,25 @@ from urllib.parse import unquote, urlparse
 import aiomysql
 from pymysql.constants import CLIENT as _MYSQL_CLIENT_FLAGS
 
-from .base import _UNSET, AbstractStorage, AuditRow, TokenRow, UsageRow, _Sentinel
+from .base import (
+    _UNSET,
+    AbstractStorage,
+    AuditRow,
+    NewEvent,
+    SessionMetaRow,
+    TokenRow,
+    UpdateRow,
+    UsageRow,
+    _Sentinel,
+)
 from .ddl import (
+    ALTER_META_ADD_COUNT_MYSQL,
+    ALTER_META_ADD_PREVIEW_MYSQL,
     ALTER_TOKENS_ADD_EXPIRES_AT_MYSQL,
+    ALTER_UPDATES_ADD_TS_INDEX_MYSQL,
     CURRENT_SCHEMA_VERSION,
     SCHEMA_MYSQL,
+    V2_TO_V3_MYSQL,
 )
 
 
@@ -22,6 +36,8 @@ from .ddl import (
 # string-matching the message) keeps the migration robust against locale-
 # translated server messages.
 _ERR_DUP_COLUMN = 1060
+# MySQL error 1061: Duplicate key name (re-running CREATE INDEX).
+_ERR_DUP_KEY_NAME = 1061
 
 
 def _parse_dsn(dsn: str) -> dict:
@@ -83,13 +99,42 @@ class MysqlStorage(AbstractStorage):
                         "INSERT INTO _schema_meta(`key`, value) VALUES('schema_version', %s)",
                         (CURRENT_SCHEMA_VERSION,),
                     )
-                elif stored == "1":
-                    try:
-                        await cur.execute(ALTER_TOKENS_ADD_EXPIRES_AT_MYSQL)
-                    except aiomysql.OperationalError as exc:
-                        # exc.args[0] is the MySQL error code on aiomysql.
-                        if not exc.args or exc.args[0] != _ERR_DUP_COLUMN:
-                            raise
+                else:
+                    if stored == "1":
+                        try:
+                            await cur.execute(ALTER_TOKENS_ADD_EXPIRES_AT_MYSQL)
+                        except aiomysql.OperationalError as exc:
+                            # exc.args[0] is the MySQL error code on aiomysql.
+                            if not exc.args or exc.args[0] != _ERR_DUP_COLUMN:
+                                raise
+                        stored = "2"
+                    if stored == "2":
+                        # v2 → v3: webchat_session_meta + webchat_updates.
+                        # CREATE TABLE IF NOT EXISTS is idempotent; SCHEMA_MYSQL
+                        # already ran the same statements above.
+                        for stmt in V2_TO_V3_MYSQL:
+                            await cur.execute(stmt)
+                        stored = "3"
+                    if stored == "3":
+                        # v3 → v4: cache message_count + preview on session_meta
+                        # to drop the N+1 CM read in list_conversations, plus an
+                        # index on webchat_updates(ts) so the retention prune
+                        # range-scans instead of full-scans.
+                        for alter in (
+                            ALTER_META_ADD_COUNT_MYSQL,
+                            ALTER_META_ADD_PREVIEW_MYSQL,
+                        ):
+                            try:
+                                await cur.execute(alter)
+                            except aiomysql.OperationalError as exc:
+                                if not exc.args or exc.args[0] != _ERR_DUP_COLUMN:
+                                    raise
+                        try:
+                            await cur.execute(ALTER_UPDATES_ADD_TS_INDEX_MYSQL)
+                        except aiomysql.OperationalError as exc:
+                            if not exc.args or exc.args[0] != _ERR_DUP_KEY_NAME:
+                                raise
+                        stored = "4"
                     await cur.execute(
                         "UPDATE _schema_meta SET value = %s WHERE `key` = 'schema_version'",
                         (CURRENT_SCHEMA_VERSION,),
@@ -489,3 +534,287 @@ class MysqlStorage(AbstractStorage):
             )
             for r in rows
         ]
+
+    # ----- chat sync (v3) -----
+    @staticmethod
+    def _row_to_session_meta(row: dict) -> SessionMetaRow:
+        # message_count / preview were added in v4; tolerate missing keys on
+        # rows fetched between the migration ALTER and any later refresh.
+        return SessionMetaRow(
+            token_name=row["token_name"],
+            session_id=row["session_id"],
+            title=row["title"] or "",
+            title_manual=bool(row["title_manual"]),
+            pinned_at=(
+                int(row["pinned_at"]) if row["pinned_at"] is not None else None
+            ),
+            deleted_at=(
+                int(row["deleted_at"]) if row["deleted_at"] is not None else None
+            ),
+            updated_at=int(row["updated_at"]),
+            message_count=int(row.get("message_count") or 0),
+            preview=row.get("preview") or "",
+        )
+
+    async def upsert_session_meta(
+        self,
+        *,
+        token_name: str,
+        session_id: str,
+        title: str | None = None,
+        title_manual: bool | None = None,
+        pinned_at: int | None | _Sentinel = _UNSET,
+        deleted_at: int | None | _Sentinel = _UNSET,
+        message_count: int | None = None,
+        preview: str | None = None,
+        now: int,
+    ) -> SessionMetaRow:
+        async with self._write_tx() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                # SELECT FOR UPDATE locks the existing row (if any) so a
+                # parallel upsert serializes; if absent, the unique PK on
+                # INSERT below catches the race and we fall through to the
+                # UPDATE branch via IntegrityError.
+                await cur.execute(
+                    "SELECT * FROM webchat_session_meta "
+                    "WHERE token_name = %s AND session_id = %s FOR UPDATE",
+                    (token_name, session_id),
+                )
+                existing = await cur.fetchone()
+                if existing is None:
+                    new_title = title if title is not None else ""
+                    new_manual = (
+                        bool(title_manual) if title_manual is not None else False
+                    )
+                    new_pinned = pinned_at if pinned_at is not _UNSET else None
+                    new_deleted = deleted_at if deleted_at is not _UNSET else None
+                    new_count = message_count if message_count is not None else 0
+                    new_preview = preview if preview is not None else ""
+                    try:
+                        await cur.execute(
+                            "INSERT INTO webchat_session_meta("
+                            "token_name, session_id, title, title_manual, "
+                            "pinned_at, deleted_at, updated_at, "
+                            "message_count, preview) "
+                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                            (
+                                token_name,
+                                session_id,
+                                new_title,
+                                1 if new_manual else 0,
+                                new_pinned,
+                                new_deleted,
+                                now,
+                                new_count,
+                                new_preview,
+                            ),
+                        )
+                    except aiomysql.IntegrityError:
+                        # Lost the existence race; re-read and fall through
+                        # to the UPDATE branch as if `existing` had been
+                        # populated on the first SELECT.
+                        await cur.execute(
+                            "SELECT * FROM webchat_session_meta "
+                            "WHERE token_name = %s AND session_id = %s FOR UPDATE",
+                            (token_name, session_id),
+                        )
+                        existing = await cur.fetchone()
+                if existing is not None:
+                    sets: list[str] = []
+                    args: list = []
+                    if title is not None:
+                        sets.append("title = %s")
+                        args.append(title)
+                    if title_manual is not None:
+                        sets.append("title_manual = %s")
+                        args.append(1 if title_manual else 0)
+                    if pinned_at is not _UNSET:
+                        sets.append("pinned_at = %s")
+                        args.append(pinned_at)
+                    if deleted_at is not _UNSET:
+                        sets.append("deleted_at = %s")
+                        args.append(deleted_at)
+                    if message_count is not None:
+                        sets.append("message_count = %s")
+                        args.append(message_count)
+                    if preview is not None:
+                        sets.append("preview = %s")
+                        args.append(preview)
+                    sets.append("updated_at = %s")
+                    args.append(now)
+                    args.extend([token_name, session_id])
+                    await cur.execute(
+                        f"UPDATE webchat_session_meta SET {', '.join(sets)} "
+                        "WHERE token_name = %s AND session_id = %s",
+                        args,
+                    )
+                await cur.execute(
+                    "SELECT * FROM webchat_session_meta "
+                    "WHERE token_name = %s AND session_id = %s",
+                    (token_name, session_id),
+                )
+                row = await cur.fetchone()
+        if row is None:
+            raise RuntimeError("upsert_session_meta: row vanished after write")
+        return self._row_to_session_meta(row)
+
+    async def get_session_meta(
+        self, *, token_name: str, session_id: str
+    ) -> SessionMetaRow | None:
+        async with self._read_tx() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT * FROM webchat_session_meta "
+                    "WHERE token_name = %s AND session_id = %s",
+                    (token_name, session_id),
+                )
+                row = await cur.fetchone()
+        return self._row_to_session_meta(row) if row else None
+
+    async def list_session_meta(
+        self, *, token_name: str, include_deleted: bool = False
+    ) -> list[SessionMetaRow]:
+        if include_deleted:
+            sql = (
+                "SELECT * FROM webchat_session_meta WHERE token_name = %s "
+                "ORDER BY updated_at DESC"
+            )
+        else:
+            sql = (
+                "SELECT * FROM webchat_session_meta "
+                "WHERE token_name = %s AND deleted_at IS NULL "
+                "ORDER BY updated_at DESC"
+            )
+        async with self._read_tx() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(sql, (token_name,))
+                rows = await cur.fetchall()
+        return [self._row_to_session_meta(r) for r in rows]
+
+    async def append_updates(
+        self,
+        *,
+        token_name: str,
+        events: list[NewEvent],
+        now: int,
+    ) -> list[int]:
+        if not events:
+            return []
+        async with self._write_tx() as conn:
+            async with conn.cursor() as cur:
+                # SELECT MAX(pts) FOR UPDATE acquires a next-key lock on the
+                # token's index range under InnoDB's default REPEATABLE READ,
+                # so a concurrent appender for the same token blocks here
+                # until our INSERTs commit. The PK collision retry below is
+                # belt-and-braces — it only fires if isolation drops to
+                # READ COMMITTED (no gap locks) and we lose the race.
+                assigned: list[int] = []
+                for attempt in range(2):
+                    assigned = []
+                    await cur.execute(
+                        "SELECT COALESCE(MAX(pts), 0) "
+                        "FROM webchat_updates WHERE token_name = %s FOR UPDATE",
+                        (token_name,),
+                    )
+                    row = await cur.fetchone()
+                    base = int(row[0]) if row else 0
+                    try:
+                        for i, ev in enumerate(events):
+                            pts = base + i + 1
+                            await cur.execute(
+                                "INSERT INTO webchat_updates("
+                                "token_name, pts, ts, event_type, "
+                                "session_id, payload) "
+                                "VALUES (%s, %s, %s, %s, %s, %s)",
+                                (
+                                    token_name,
+                                    pts,
+                                    now,
+                                    ev.event_type,
+                                    ev.session_id,
+                                    ev.payload,
+                                ),
+                            )
+                            assigned.append(pts)
+                        return assigned
+                    except aiomysql.IntegrityError:
+                        if attempt == 0:
+                            # Roll back the partial transaction so the retry
+                            # doesn't observe phantom rows from this batch.
+                            await conn.rollback()
+                            continue
+                        raise
+                return assigned
+
+    async def get_updates(
+        self,
+        *,
+        token_name: str,
+        since_pts: int,
+        limit: int,
+    ) -> list[UpdateRow]:
+        limit = max(1, min(limit, 500))
+        async with self._read_tx() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT token_name, pts, ts, event_type, session_id, payload "
+                    "FROM webchat_updates "
+                    "WHERE token_name = %s AND pts > %s "
+                    "ORDER BY pts ASC LIMIT %s",
+                    (token_name, since_pts, limit),
+                )
+                rows = await cur.fetchall()
+        return [
+            UpdateRow(
+                token_name=r["token_name"],
+                pts=int(r["pts"]),
+                ts=int(r["ts"]),
+                event_type=r["event_type"],
+                session_id=r["session_id"],
+                payload=r["payload"] or "{}",
+            )
+            for r in rows
+        ]
+
+    async def get_max_pts(self, *, token_name: str) -> int:
+        async with self._read_tx() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT COALESCE(MAX(pts), 0) FROM webchat_updates "
+                    "WHERE token_name = %s",
+                    (token_name,),
+                )
+                row = await cur.fetchone()
+        return int(row[0]) if row else 0
+
+    async def get_min_pts(self, *, token_name: str) -> int:
+        async with self._read_tx() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT COALESCE(MIN(pts), 0) FROM webchat_updates "
+                    "WHERE token_name = %s",
+                    (token_name,),
+                )
+                row = await cur.fetchone()
+        return int(row[0]) if row else 0
+
+    async def prune_chat_sync(
+        self,
+        *,
+        events_before_ts: int,
+        deleted_meta_before_ts: int,
+    ) -> tuple[int, int]:
+        async with self._write_tx() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "DELETE FROM webchat_updates WHERE ts < %s",
+                    (events_before_ts,),
+                )
+                events_pruned = cur.rowcount or 0
+                await cur.execute(
+                    "DELETE FROM webchat_session_meta "
+                    "WHERE deleted_at IS NOT NULL AND deleted_at < %s",
+                    (deleted_meta_before_ts,),
+                )
+                meta_pruned = cur.rowcount or 0
+        return events_pruned, meta_pruned

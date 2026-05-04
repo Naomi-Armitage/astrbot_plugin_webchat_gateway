@@ -19,6 +19,11 @@ from ..core.config import ConfigView
 from .admin_auth_routes import AuthRouteDeps, make_auth_handlers
 from .admin_stats import AdminDeps, make_admin_handlers
 from .chat import ChatDeps, make_chat_handler, make_me_handler, make_preflight_handler
+from .conversations import (
+    ConversationDeps,
+    ConversationService,
+    make_conversation_handlers,
+)
 from .site import SiteDeps, make_site_handlers
 from .title import TitleDeps, make_title_handler
 
@@ -29,6 +34,8 @@ class ServerDeps:
     chat: ChatDeps
     admin: AdminDeps
     title: TitleDeps
+    conv: ConversationDeps
+    conv_service: ConversationService
 
 
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
@@ -99,6 +106,17 @@ def build_app(deps: ServerDeps) -> web.Application:
     title_handler = make_title_handler(deps.title)
     app.router.add_post(cfg.title_path, title_handler)
     app.router.add_options(cfg.title_path, chat_preflight)
+
+    conv = make_conversation_handlers(deps.conv, deps.conv_service)
+    app.router.add_get(cfg.conversations_path, conv["list"])
+    app.router.add_options(cfg.conversations_path, conv["preflight"])
+    app.router.add_get(cfg.conversations_item_path, conv["get"])
+    app.router.add_patch(cfg.conversations_item_path, conv["patch"])
+    app.router.add_options(cfg.conversations_item_path, conv["preflight"])
+    app.router.add_post(cfg.conversations_clear_path, conv["clear"])
+    app.router.add_options(cfg.conversations_clear_path, conv["preflight"])
+    app.router.add_get(cfg.events_path, conv["events"])
+    app.router.add_options(cfg.events_path, conv["preflight"])
 
     admin = make_admin_handlers(deps.admin)
 

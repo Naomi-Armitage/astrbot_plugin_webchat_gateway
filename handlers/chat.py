@@ -52,6 +52,7 @@ class ChatDeps:
     ip_guard: IpGuard
     concurrency: PerTokenConcurrency
     llm_bridge: LlmBridge
+    conv_service: Any  # handlers.conversations.ConversationService — avoid import cycle
     allowed_origins: set[str]
     max_message_length: int
     trust_forwarded_for: bool
@@ -312,6 +313,17 @@ def make_chat_handler(deps: ChatDeps):
             # 8. Increment usage (atomic)
             new_count = await deps.storage.increment_daily_usage(token.name, day=today)
             remaining = max(0, token.daily_quota - new_count)
+
+            # Record the user/assistant pair into the chat-sync event log so
+            # peer devices on the same token long-poll their way to the new
+            # state. record_chat_pair swallows its own errors — a failure
+            # here must NOT block the chat reply that's already complete.
+            await deps.conv_service.record_chat_pair(
+                token_name=token.name,
+                session_id=data.session_id,
+                user_text=data.message,
+                assistant_text=reply,
+            )
 
             # 9. Audit + respond
             await deps.audit.write(

@@ -308,6 +308,35 @@ header h1 {
 .badge.warn { background: color-mix(in oklab, var(--warn) 12%, transparent); border-color: color-mix(in oklab, var(--warn) 35%, transparent); color: var(--warn); }
 .badge.bad  { background: color-mix(in oklab, var(--bad)  12%, transparent); border-color: color-mix(in oklab, var(--bad)  35%, transparent); color: var(--bad);  }
 
+.sync-status {
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  font-weight: 500;
+  padding: 3px 9px;
+  position: relative;
+  padding-left: 18px;
+}
+.sync-status::before {
+  content: "";
+  position: absolute;
+  left: 8px; top: 50%;
+  width: 6px; height: 6px;
+  margin-top: -3px;
+  border-radius: 999px;
+  background: currentColor;
+}
+.sync-status[data-state="live"]    { color: var(--good); border-color: color-mix(in oklab, var(--good) 30%, transparent); background: color-mix(in oklab, var(--good) 10%, transparent); }
+.sync-status[data-state="polling"] { color: var(--warn); border-color: color-mix(in oklab, var(--warn) 30%, transparent); background: color-mix(in oklab, var(--warn) 10%, transparent); }
+.sync-status[data-state="offline"] { color: var(--bad);  border-color: color-mix(in oklab, var(--bad)  30%, transparent); background: color-mix(in oklab, var(--bad)  10%, transparent); }
+.sync-status[data-state="live"]::before { animation: syncPulse 2s ease-in-out infinite; }
+@keyframes syncPulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.35; }
+}
+@media (max-width: 719px) {
+  .sync-status { display: none; }
+}
+
 .actions { display: flex; gap: 6px; }
 .actions a, .actions button {
   font: inherit;

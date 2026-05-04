@@ -6,7 +6,9 @@ command group whose handlers share `TokenService` with the HTTP admin layer.
 
 from __future__ import annotations
 
+import asyncio
 import datetime as _dt
+import time
 from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
@@ -15,12 +17,14 @@ from astrbot.api.star import Context, Star
 
 from .core.audit import AuditLogger
 from .core.config import ConfigView
+from .core.event_bus import EventBus
 from .core.ip_guard import IpGuard
 from .core.llm_bridge import LlmBridge
 from .core.ratelimit import PerTokenConcurrency
 from .handlers.admin_stats import AdminDeps
 from .handlers.admin_tokens import ServiceError, TokenService
 from .handlers.chat import ChatDeps
+from .handlers.conversations import ConversationDeps, ConversationService
 from .handlers.server import ServerDeps, ServerLifecycle, build_app
 from .handlers.title import TitleDeps
 from .storage import AbstractStorage, get_storage
@@ -28,6 +32,14 @@ from .storage import AbstractStorage, get_storage
 
 class WebChatGatewayPlugin(Star):
     """Managed WebChat gateway plugin."""
+
+    # Chat-sync retention. Events older than this are pruned by a daily
+    # background task; the long-poll endpoint forces clients past the
+    # cutoff to do a cold refetch via tooFar. Soft-deleted session_meta
+    # rows older than the deleted-meta cutoff are physically removed.
+    _CHAT_SYNC_PRUNE_INTERVAL_SECONDS = 24 * 3600
+    _CHAT_SYNC_EVENTS_RETENTION_SECONDS = 14 * 86400
+    _CHAT_SYNC_DELETED_META_RETENTION_SECONDS = 90 * 86400
 
     def __init__(
         self,
@@ -41,6 +53,7 @@ class WebChatGatewayPlugin(Star):
         self._lifecycle = ServerLifecycle()
         self._token_service: TokenService | None = None
         self._audit: AuditLogger | None = None
+        self._prune_task: asyncio.Task[None] | None = None
 
     async def initialize(self) -> None:
         await self._start()
@@ -93,12 +106,21 @@ class WebChatGatewayPlugin(Star):
                 timeout_seconds=cfg.llm_timeout_seconds,
             )
 
+            event_bus = EventBus()
+            conv_service = ConversationService(
+                storage=storage,
+                audit=audit,
+                event_bus=event_bus,
+                cm=self.context.conversation_manager,
+            )
+
             chat_deps = ChatDeps(
                 storage=storage,
                 audit=audit,
                 ip_guard=ip_guard,
                 concurrency=concurrency,
                 llm_bridge=llm_bridge,
+                conv_service=conv_service,
                 allowed_origins=cfg.allowed_origins,
                 max_message_length=cfg.max_message_length,
                 trust_forwarded_for=cfg.trust_forwarded_for,
@@ -128,8 +150,24 @@ class WebChatGatewayPlugin(Star):
                 trust_referer_as_origin=cfg.trust_referer_as_origin,
                 allow_missing_origin=cfg.allow_missing_origin,
             )
+            conv_deps = ConversationDeps(
+                storage=storage,
+                audit=audit,
+                event_bus=event_bus,
+                cm=self.context.conversation_manager,
+                allowed_origins=cfg.allowed_origins,
+                trust_forwarded_for=cfg.trust_forwarded_for,
+                trust_referer_as_origin=cfg.trust_referer_as_origin,
+                allow_missing_origin=cfg.allow_missing_origin,
+                ip_guard=ip_guard,
+            )
             server_deps = ServerDeps(
-                config=cfg, chat=chat_deps, admin=admin_deps, title=title_deps
+                config=cfg,
+                chat=chat_deps,
+                admin=admin_deps,
+                title=title_deps,
+                conv=conv_deps,
+                conv_service=conv_service,
             )
             app = build_app(server_deps)
 
@@ -140,6 +178,15 @@ class WebChatGatewayPlugin(Star):
             )
             await self._stop()
             return
+
+        # Background retention prune. Drops chat-sync events past the
+        # retention window and physically removes long-soft-deleted session
+        # meta rows. Runs on the same loop as the gateway; daily cadence is
+        # plenty for the volume any single token produces.
+        self._prune_task = asyncio.create_task(
+            self._chat_sync_prune_loop(),
+            name="webchat-chat-sync-prune",
+        )
 
         logger.info(
             "[WebChatGateway] chat=%s admin_api=%s admin_ui=%s storage=%s allowed_origins=%s admin_key=%s llm_timeout=%ss",
@@ -152,7 +199,51 @@ class WebChatGatewayPlugin(Star):
             cfg.llm_timeout_seconds,
         )
 
+    async def _chat_sync_prune_loop(self) -> None:
+        """Periodically prune the event log + soft-deleted session meta.
+
+        Tolerates errors: any failure logs and the next iteration retries
+        on the same cadence. Only exits when the task is cancelled (in
+        `_stop`). Cancellation propagates through `asyncio.sleep`.
+        """
+        try:
+            # Wait one interval before the first run so a startup with a
+            # backlog isn't immediately followed by a heavy DELETE.
+            await asyncio.sleep(self._CHAT_SYNC_PRUNE_INTERVAL_SECONDS)
+            while True:
+                try:
+                    storage = self._storage
+                    if storage is None:
+                        return
+                    now = int(time.time())
+                    events_pruned, meta_pruned = await storage.prune_chat_sync(
+                        events_before_ts=now - self._CHAT_SYNC_EVENTS_RETENTION_SECONDS,
+                        deleted_meta_before_ts=now - self._CHAT_SYNC_DELETED_META_RETENTION_SECONDS,
+                    )
+                    if events_pruned or meta_pruned:
+                        logger.info(
+                            "[WebChatGateway] chat-sync prune: events=%d meta=%d",
+                            events_pruned,
+                            meta_pruned,
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "[WebChatGateway] chat-sync prune iteration failed"
+                    )
+                await asyncio.sleep(self._CHAT_SYNC_PRUNE_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            return
+
     async def _stop(self) -> None:
+        if self._prune_task is not None:
+            self._prune_task.cancel()
+            try:
+                await self._prune_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._prune_task = None
         await self._lifecycle.stop()
         if self._storage is not None:
             try:

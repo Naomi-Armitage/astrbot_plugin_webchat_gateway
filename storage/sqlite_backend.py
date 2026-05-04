@@ -8,11 +8,25 @@ from datetime import date, timedelta
 
 import aiosqlite
 
-from .base import _UNSET, AbstractStorage, AuditRow, TokenRow, UsageRow, _Sentinel
+from .base import (
+    _UNSET,
+    AbstractStorage,
+    AuditRow,
+    NewEvent,
+    SessionMetaRow,
+    TokenRow,
+    UpdateRow,
+    UsageRow,
+    _Sentinel,
+)
 from .ddl import (
+    ALTER_META_ADD_COUNT_SQLITE,
+    ALTER_META_ADD_PREVIEW_SQLITE,
     ALTER_TOKENS_ADD_EXPIRES_AT_SQLITE,
+    ALTER_UPDATES_ADD_TS_INDEX_SQLITE,
     CURRENT_SCHEMA_VERSION,
     SCHEMA_SQLITE,
+    V2_TO_V3_SQLITE,
 )
 
 
@@ -50,20 +64,48 @@ class SqliteStorage(AbstractStorage):
             row = await cursor.fetchone()
         stored = row["value"] if row else None
         if stored is None:
-            # Fresh install — CREATE TABLE already includes expires_at.
+            # Fresh install — CREATE TABLE IF NOT EXISTS in SCHEMA_SQLITE
+            # already produced every v3 table.
             await self._conn.execute(
                 "INSERT INTO _schema_meta(key, value) VALUES('schema_version', ?)",
                 (CURRENT_SCHEMA_VERSION,),
             )
-        elif stored == "1":
-            # Upgrade from v1: add expires_at. Tolerate "duplicate column"
-            # so the migration is idempotent if a previous attempt crashed
-            # between ALTER and the version write.
-            try:
-                await self._conn.execute(ALTER_TOKENS_ADD_EXPIRES_AT_SQLITE)
-            except aiosqlite.OperationalError as exc:
-                if "duplicate column" not in str(exc).lower():
-                    raise
+        else:
+            if stored == "1":
+                # v1 → v2: add tokens.expires_at. Tolerate "duplicate column"
+                # so the migration is idempotent if a previous attempt crashed
+                # between ALTER and the version write.
+                try:
+                    await self._conn.execute(ALTER_TOKENS_ADD_EXPIRES_AT_SQLITE)
+                except aiosqlite.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
+                stored = "2"
+            if stored == "2":
+                # v2 → v3: webchat_session_meta + webchat_updates. Both
+                # statements are CREATE TABLE / CREATE INDEX IF NOT EXISTS,
+                # so the SCHEMA_SQLITE pass already ran them; replaying here
+                # is a no-op but keeps the migration ladder explicit.
+                for stmt in V2_TO_V3_SQLITE:
+                    await self._conn.execute(stmt)
+                stored = "3"
+            if stored == "3":
+                # v3 → v4: add cached message_count + preview to session_meta
+                # so list_conversations doesn't have to do an N+1 CM lookup,
+                # and add the ts index on webchat_updates so the retention
+                # prune can range-scan instead of full-table-scan.
+                for alter in (
+                    ALTER_META_ADD_COUNT_SQLITE,
+                    ALTER_META_ADD_PREVIEW_SQLITE,
+                ):
+                    try:
+                        await self._conn.execute(alter)
+                    except aiosqlite.OperationalError as exc:
+                        if "duplicate column" not in str(exc).lower():
+                            raise
+                # CREATE INDEX IF NOT EXISTS is its own idempotency.
+                await self._conn.execute(ALTER_UPDATES_ADD_TS_INDEX_SQLITE)
+                stored = "4"
             await self._conn.execute(
                 "UPDATE _schema_meta SET value = ? WHERE key = 'schema_version'",
                 (CURRENT_SCHEMA_VERSION,),
@@ -399,3 +441,285 @@ class SqliteStorage(AbstractStorage):
             )
             for r in rows
         ]
+
+    # ----- chat sync (v3) -----
+    @staticmethod
+    def _row_to_session_meta(row: aiosqlite.Row) -> SessionMetaRow:
+        # message_count / preview were added in v4. Older rows may not have
+        # them populated yet on a freshly migrated DB; fall back to defaults.
+        try:
+            mc = int(row["message_count"])
+        except (KeyError, IndexError, TypeError):
+            mc = 0
+        try:
+            preview = row["preview"] or ""
+        except (KeyError, IndexError):
+            preview = ""
+        return SessionMetaRow(
+            token_name=row["token_name"],
+            session_id=row["session_id"],
+            title=row["title"] or "",
+            title_manual=bool(row["title_manual"]),
+            pinned_at=(
+                int(row["pinned_at"]) if row["pinned_at"] is not None else None
+            ),
+            deleted_at=(
+                int(row["deleted_at"]) if row["deleted_at"] is not None else None
+            ),
+            updated_at=int(row["updated_at"]),
+            message_count=mc,
+            preview=preview,
+        )
+
+    async def upsert_session_meta(
+        self,
+        *,
+        token_name: str,
+        session_id: str,
+        title: str | None = None,
+        title_manual: bool | None = None,
+        pinned_at: int | None | _Sentinel = _UNSET,
+        deleted_at: int | None | _Sentinel = _UNSET,
+        message_count: int | None = None,
+        preview: str | None = None,
+        now: int,
+    ) -> SessionMetaRow:
+        async with self._write_lock:
+            async with self._db.execute(
+                "SELECT * FROM webchat_session_meta "
+                "WHERE token_name = ? AND session_id = ?",
+                (token_name, session_id),
+            ) as cursor:
+                existing = await cursor.fetchone()
+            if existing is None:
+                # First-write defaults: anything the caller didn't pin lands
+                # at the column default. This branch sees `_UNSET` for the
+                # nullable fields too — treat it the same as None (NULL).
+                new_title = title if title is not None else ""
+                new_manual = bool(title_manual) if title_manual is not None else False
+                new_pinned = (
+                    pinned_at
+                    if pinned_at is not _UNSET
+                    else None
+                )
+                new_deleted = (
+                    deleted_at
+                    if deleted_at is not _UNSET
+                    else None
+                )
+                new_count = message_count if message_count is not None else 0
+                new_preview = preview if preview is not None else ""
+                await self._db.execute(
+                    "INSERT INTO webchat_session_meta("
+                    "token_name, session_id, title, title_manual, "
+                    "pinned_at, deleted_at, updated_at, "
+                    "message_count, preview) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        token_name,
+                        session_id,
+                        new_title,
+                        1 if new_manual else 0,
+                        new_pinned,
+                        new_deleted,
+                        now,
+                        new_count,
+                        new_preview,
+                    ),
+                )
+            else:
+                sets: list[str] = []
+                args: list = []
+                if title is not None:
+                    sets.append("title = ?")
+                    args.append(title)
+                if title_manual is not None:
+                    sets.append("title_manual = ?")
+                    args.append(1 if title_manual else 0)
+                if pinned_at is not _UNSET:
+                    sets.append("pinned_at = ?")
+                    args.append(pinned_at)
+                if deleted_at is not _UNSET:
+                    sets.append("deleted_at = ?")
+                    args.append(deleted_at)
+                if message_count is not None:
+                    sets.append("message_count = ?")
+                    args.append(message_count)
+                if preview is not None:
+                    sets.append("preview = ?")
+                    args.append(preview)
+                # updated_at is always rewritten so list/sort by updated_at
+                # reflects the write — not the last user-meaningful change.
+                sets.append("updated_at = ?")
+                args.append(now)
+                args.extend([token_name, session_id])
+                await self._db.execute(
+                    f"UPDATE webchat_session_meta SET {', '.join(sets)} "
+                    "WHERE token_name = ? AND session_id = ?",
+                    args,
+                )
+            async with self._db.execute(
+                "SELECT * FROM webchat_session_meta "
+                "WHERE token_name = ? AND session_id = ?",
+                (token_name, session_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+            await self._db.commit()
+        if row is None:
+            raise RuntimeError("upsert_session_meta: row vanished after write")
+        return self._row_to_session_meta(row)
+
+    async def get_session_meta(
+        self, *, token_name: str, session_id: str
+    ) -> SessionMetaRow | None:
+        async with self._db.execute(
+            "SELECT * FROM webchat_session_meta "
+            "WHERE token_name = ? AND session_id = ?",
+            (token_name, session_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return self._row_to_session_meta(row) if row else None
+
+    async def list_session_meta(
+        self, *, token_name: str, include_deleted: bool = False
+    ) -> list[SessionMetaRow]:
+        if include_deleted:
+            sql = (
+                "SELECT * FROM webchat_session_meta WHERE token_name = ? "
+                "ORDER BY updated_at DESC"
+            )
+        else:
+            sql = (
+                "SELECT * FROM webchat_session_meta "
+                "WHERE token_name = ? AND deleted_at IS NULL "
+                "ORDER BY updated_at DESC"
+            )
+        async with self._db.execute(sql, (token_name,)) as cursor:
+            rows = await cursor.fetchall()
+        return [self._row_to_session_meta(r) for r in rows]
+
+    async def append_updates(
+        self,
+        *,
+        token_name: str,
+        events: list[NewEvent],
+        now: int,
+    ) -> list[int]:
+        if not events:
+            return []
+        async with self._write_lock:
+            # _write_lock serializes writes for the whole connection, so the
+            # SELECT MAX(pts) and the INSERT batch run as a contiguous block;
+            # no concurrent appender can slip a row in between. The PK guard
+            # below stays as belt-and-braces against a future change to the
+            # locking model (parallel connections, async pool, etc.).
+            assigned: list[int] = []
+            for attempt in range(2):
+                assigned = []
+                async with self._db.execute(
+                    "SELECT COALESCE(MAX(pts), 0) AS m "
+                    "FROM webchat_updates WHERE token_name = ?",
+                    (token_name,),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                base = int(row["m"]) if row else 0
+                try:
+                    await self._db.execute("BEGIN")
+                    for i, ev in enumerate(events):
+                        pts = base + i + 1
+                        await self._db.execute(
+                            "INSERT INTO webchat_updates("
+                            "token_name, pts, ts, event_type, "
+                            "session_id, payload) "
+                            "VALUES (?, ?, ?, ?, ?, ?)",
+                            (
+                                token_name,
+                                pts,
+                                now,
+                                ev.event_type,
+                                ev.session_id,
+                                ev.payload,
+                            ),
+                        )
+                        assigned.append(pts)
+                    await self._db.commit()
+                    return assigned
+                except aiosqlite.IntegrityError:
+                    try:
+                        await self._db.rollback()
+                    except Exception:
+                        pass
+                    if attempt == 0:
+                        # PK collision means another writer raced us under
+                        # the same lock — only possible if the lock is ever
+                        # bypassed. Recompute MAX(pts) once and retry.
+                        continue
+                    raise
+            return assigned
+
+    async def get_updates(
+        self,
+        *,
+        token_name: str,
+        since_pts: int,
+        limit: int,
+    ) -> list[UpdateRow]:
+        limit = max(1, min(limit, 500))
+        async with self._db.execute(
+            "SELECT token_name, pts, ts, event_type, session_id, payload "
+            "FROM webchat_updates "
+            "WHERE token_name = ? AND pts > ? "
+            "ORDER BY pts ASC LIMIT ?",
+            (token_name, since_pts, limit),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [
+            UpdateRow(
+                token_name=r["token_name"],
+                pts=int(r["pts"]),
+                ts=int(r["ts"]),
+                event_type=r["event_type"],
+                session_id=r["session_id"],
+                payload=r["payload"] or "{}",
+            )
+            for r in rows
+        ]
+
+    async def get_max_pts(self, *, token_name: str) -> int:
+        async with self._db.execute(
+            "SELECT COALESCE(MAX(pts), 0) AS m FROM webchat_updates "
+            "WHERE token_name = ?",
+            (token_name,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return int(row["m"]) if row else 0
+
+    async def get_min_pts(self, *, token_name: str) -> int:
+        async with self._db.execute(
+            "SELECT COALESCE(MIN(pts), 0) AS m FROM webchat_updates "
+            "WHERE token_name = ?",
+            (token_name,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return int(row["m"]) if row else 0
+
+    async def prune_chat_sync(
+        self,
+        *,
+        events_before_ts: int,
+        deleted_meta_before_ts: int,
+    ) -> tuple[int, int]:
+        async with self._write_lock:
+            cur = await self._db.execute(
+                "DELETE FROM webchat_updates WHERE ts < ?",
+                (events_before_ts,),
+            )
+            events_pruned = cur.rowcount or 0
+            cur = await self._db.execute(
+                "DELETE FROM webchat_session_meta "
+                "WHERE deleted_at IS NOT NULL AND deleted_at < ?",
+                (deleted_meta_before_ts,),
+            )
+            meta_pruned = cur.rowcount or 0
+            await self._db.commit()
+        return events_pruned, meta_pruned

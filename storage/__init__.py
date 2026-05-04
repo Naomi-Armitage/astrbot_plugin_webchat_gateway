@@ -6,7 +6,10 @@ from .base import (
     _UNSET,
     AbstractStorage,
     AuditRow,
+    NewEvent,
+    SessionMetaRow,
     TokenRow,
+    UpdateRow,
     UsageRow,
 )
 
@@ -40,6 +43,9 @@ __all__ = [
     "TokenRow",
     "UsageRow",
     "AuditRow",
+    "SessionMetaRow",
+    "UpdateRow",
+    "NewEvent",
     "_UNSET",
     "get_storage",
 ]

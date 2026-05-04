@@ -19,7 +19,7 @@ is safe. Cross-version upgrades happen inside each backend's `initialize()`.
 
 from __future__ import annotations
 
-CURRENT_SCHEMA_VERSION = "2"
+CURRENT_SCHEMA_VERSION = "4"
 
 SCHEMA_SQLITE: tuple[str, ...] = (
     """
@@ -68,6 +68,95 @@ SCHEMA_SQLITE: tuple[str, ...] = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_audit_ts_id ON audit_log(ts DESC, id DESC)",
+    """
+    CREATE TABLE IF NOT EXISTS webchat_session_meta (
+        token_name    TEXT NOT NULL,
+        session_id    TEXT NOT NULL,
+        title         TEXT NOT NULL DEFAULT '',
+        title_manual  INTEGER NOT NULL DEFAULT 0,
+        pinned_at     INTEGER,
+        deleted_at    INTEGER,
+        updated_at    INTEGER NOT NULL,
+        message_count INTEGER NOT NULL DEFAULT 0,
+        preview       TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY (token_name, session_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_session_meta_token_updated "
+    "ON webchat_session_meta(token_name, updated_at DESC)",
+    """
+    CREATE TABLE IF NOT EXISTS webchat_updates (
+        token_name TEXT NOT NULL,
+        pts        INTEGER NOT NULL,
+        ts         INTEGER NOT NULL,
+        event_type TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        payload    TEXT NOT NULL DEFAULT '{}',
+        PRIMARY KEY (token_name, pts)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_webchat_updates_ts "
+    "ON webchat_updates(ts)",
+)
+
+
+# v2 → v3 (additive only). Both backends apply these on upgrade. Idempotent
+# via IF NOT EXISTS so no error guards needed; a fresh install runs these
+# again from SCHEMA_SQLITE / SCHEMA_MYSQL above and lands in the same place.
+V2_TO_V3_SQLITE: tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS webchat_session_meta (
+        token_name    TEXT NOT NULL,
+        session_id    TEXT NOT NULL,
+        title         TEXT NOT NULL DEFAULT '',
+        title_manual  INTEGER NOT NULL DEFAULT 0,
+        pinned_at     INTEGER,
+        deleted_at    INTEGER,
+        updated_at    INTEGER NOT NULL,
+        message_count INTEGER NOT NULL DEFAULT 0,
+        preview       TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY (token_name, session_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_session_meta_token_updated "
+    "ON webchat_session_meta(token_name, updated_at DESC)",
+    """
+    CREATE TABLE IF NOT EXISTS webchat_updates (
+        token_name TEXT NOT NULL,
+        pts        INTEGER NOT NULL,
+        ts         INTEGER NOT NULL,
+        event_type TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        payload    TEXT NOT NULL DEFAULT '{}',
+        PRIMARY KEY (token_name, pts)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_webchat_updates_ts "
+    "ON webchat_updates(ts)",
+)
+
+
+# v3 → v4: cache `message_count` + `preview` on session_meta to avoid the
+# N+1 CM read in list_conversations. Idempotent: catch "duplicate column"
+# so re-runs are safe and a fresh v4 install (which already has the
+# columns from CREATE TABLE) is unaffected.
+ALTER_META_ADD_COUNT_SQLITE = (
+    "ALTER TABLE webchat_session_meta ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0"
+)
+ALTER_META_ADD_PREVIEW_SQLITE = (
+    "ALTER TABLE webchat_session_meta ADD COLUMN preview TEXT NOT NULL DEFAULT ''"
+)
+ALTER_META_ADD_COUNT_MYSQL = (
+    "ALTER TABLE webchat_session_meta ADD COLUMN message_count INT NOT NULL DEFAULT 0"
+)
+ALTER_META_ADD_PREVIEW_MYSQL = (
+    "ALTER TABLE webchat_session_meta ADD COLUMN preview VARCHAR(255) NOT NULL DEFAULT ''"
+)
+ALTER_UPDATES_ADD_TS_INDEX_SQLITE = (
+    "CREATE INDEX IF NOT EXISTS idx_webchat_updates_ts ON webchat_updates(ts)"
+)
+ALTER_UPDATES_ADD_TS_INDEX_MYSQL = (
+    "CREATE INDEX idx_webchat_updates_ts ON webchat_updates(ts)"
 )
 
 
@@ -116,6 +205,64 @@ SCHEMA_MYSQL: tuple[str, ...] = (
         event  VARCHAR(64) NOT NULL,
         detail TEXT NOT NULL,
         INDEX idx_audit_ts_id (ts, id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS webchat_session_meta (
+        token_name    VARCHAR(128) NOT NULL,
+        session_id    VARCHAR(128) NOT NULL,
+        title         VARCHAR(255) NOT NULL DEFAULT '',
+        title_manual  TINYINT(1)   NOT NULL DEFAULT 0,
+        pinned_at     BIGINT NULL,
+        deleted_at    BIGINT NULL,
+        updated_at    BIGINT NOT NULL,
+        message_count INT NOT NULL DEFAULT 0,
+        preview       VARCHAR(255) NOT NULL DEFAULT '',
+        PRIMARY KEY (token_name, session_id),
+        INDEX idx_session_meta_token_updated (token_name, updated_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS webchat_updates (
+        token_name VARCHAR(128) NOT NULL,
+        pts        BIGINT NOT NULL,
+        ts         BIGINT NOT NULL,
+        event_type VARCHAR(64)  NOT NULL,
+        session_id VARCHAR(128) NOT NULL,
+        payload    MEDIUMTEXT   NOT NULL,
+        PRIMARY KEY (token_name, pts),
+        INDEX idx_webchat_updates_ts (ts)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+)
+
+
+V2_TO_V3_MYSQL: tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS webchat_session_meta (
+        token_name    VARCHAR(128) NOT NULL,
+        session_id    VARCHAR(128) NOT NULL,
+        title         VARCHAR(255) NOT NULL DEFAULT '',
+        title_manual  TINYINT(1)   NOT NULL DEFAULT 0,
+        pinned_at     BIGINT NULL,
+        deleted_at    BIGINT NULL,
+        updated_at    BIGINT NOT NULL,
+        message_count INT NOT NULL DEFAULT 0,
+        preview       VARCHAR(255) NOT NULL DEFAULT '',
+        PRIMARY KEY (token_name, session_id),
+        INDEX idx_session_meta_token_updated (token_name, updated_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS webchat_updates (
+        token_name VARCHAR(128) NOT NULL,
+        pts        BIGINT NOT NULL,
+        ts         BIGINT NOT NULL,
+        event_type VARCHAR(64)  NOT NULL,
+        session_id VARCHAR(128) NOT NULL,
+        payload    MEDIUMTEXT   NOT NULL,
+        PRIMARY KEY (token_name, pts),
+        INDEX idx_webchat_updates_ts (ts)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
 )

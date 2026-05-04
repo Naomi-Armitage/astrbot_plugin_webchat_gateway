@@ -48,6 +48,41 @@ class AuditRow:
     detail: str
 
 
+@dataclass(frozen=True)
+class SessionMetaRow:
+    token_name: str
+    session_id: str
+    title: str
+    title_manual: bool
+    pinned_at: int | None
+    deleted_at: int | None
+    updated_at: int
+    message_count: int
+    preview: str
+
+
+@dataclass(frozen=True)
+class UpdateRow:
+    """A row from `webchat_updates`. `payload` is opaque JSON; the service
+    layer is responsible for serialize/deserialize."""
+
+    token_name: str
+    pts: int
+    ts: int
+    event_type: str
+    session_id: str
+    payload: str
+
+
+@dataclass(frozen=True)
+class NewEvent:
+    """Input shape for `append_updates` — pts is assigned by storage."""
+
+    event_type: str
+    session_id: str
+    payload: str
+
+
 class AbstractStorage(ABC):
     """Pluggable storage interface for tokens, usage, IP failures, and audit."""
 
@@ -164,3 +199,95 @@ class AbstractStorage(ABC):
 
     @abstractmethod
     async def get_recent_audit(self, *, limit: int) -> list[AuditRow]: ...
+
+    # ----- chat sync (v3) -----
+    @abstractmethod
+    async def upsert_session_meta(
+        self,
+        *,
+        token_name: str,
+        session_id: str,
+        title: str | None = None,
+        title_manual: bool | None = None,
+        pinned_at: int | None | _Sentinel = _UNSET,
+        deleted_at: int | None | _Sentinel = _UNSET,
+        message_count: int | None = None,
+        preview: str | None = None,
+        now: int,
+    ) -> SessionMetaRow:
+        """UPSERT on (token_name, session_id), always writing updated_at=now.
+
+        `title` / `title_manual` / `message_count` / `preview`: None means
+        "leave alone".
+        `pinned_at` / `deleted_at`: `_UNSET` means "leave alone";
+        `None` means "set to NULL".
+
+        Returns the post-write row.
+        """
+
+    @abstractmethod
+    async def get_session_meta(
+        self, *, token_name: str, session_id: str
+    ) -> SessionMetaRow | None: ...
+
+    @abstractmethod
+    async def list_session_meta(
+        self, *, token_name: str, include_deleted: bool = False
+    ) -> list[SessionMetaRow]: ...
+
+    @abstractmethod
+    async def append_updates(
+        self,
+        *,
+        token_name: str,
+        events: list[NewEvent],
+        now: int,
+    ) -> list[int]:
+        """Atomically allocate pts and INSERT all events under one write
+        transaction so peers see them as a contiguous block. Returns the
+        assigned pts in input order. Empty `events` is a no-op returning
+        an empty list.
+        """
+
+    @abstractmethod
+    async def get_updates(
+        self,
+        *,
+        token_name: str,
+        since_pts: int,
+        limit: int,
+    ) -> list[UpdateRow]:
+        """Return rows where pts > since_pts, ordered by pts ASC, capped
+        at `limit`. Caller paginates via the last returned pts.
+        """
+
+    @abstractmethod
+    async def get_max_pts(self, *, token_name: str) -> int:
+        """Return the largest pts for this token (0 if none).
+
+        Used by the long-poll path to detect `tooFar` and to expose the
+        current high-water mark in list responses.
+        """
+
+    @abstractmethod
+    async def get_min_pts(self, *, token_name: str) -> int:
+        """Return the smallest pts still in the table for this token (0 if
+        empty). Used by the long-poll path: if a client's `since` is below
+        `min_pts`, retention pruning has dropped events the client never saw,
+        so the response forces `tooFar` so the client cold-refetches.
+        """
+
+    @abstractmethod
+    async def prune_chat_sync(
+        self,
+        *,
+        events_before_ts: int,
+        deleted_meta_before_ts: int,
+    ) -> tuple[int, int]:
+        """Delete `webchat_updates` rows older than `events_before_ts` AND
+        `webchat_session_meta` rows whose `deleted_at` is older than
+        `deleted_meta_before_ts`. Returns `(events_pruned, meta_pruned)`.
+
+        Idempotent and safe to run while the gateway is live; events older
+        than the cutoff have no remaining waiters that could observe them.
+        """

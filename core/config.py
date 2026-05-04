@@ -176,6 +176,22 @@ class ConfigView:
     def admin_cookie_path(self) -> str:
         return f"{self.endpoint_prefix}/admin"
 
+    @property
+    def conversations_path(self) -> str:
+        return f"{self.endpoint_prefix}/conversations"
+
+    @property
+    def conversations_item_path(self) -> str:
+        return f"{self.endpoint_prefix}/conversations/{{session_id}}"
+
+    @property
+    def conversations_clear_path(self) -> str:
+        return f"{self.conversations_item_path}/clear"
+
+    @property
+    def events_path(self) -> str:
+        return f"{self.endpoint_prefix}/events"
+
     @classmethod
     def from_raw(cls, cfg: Any) -> "ConfigView":
         host = str(_get(cfg, "host", "0.0.0.0")).strip() or "0.0.0.0"
