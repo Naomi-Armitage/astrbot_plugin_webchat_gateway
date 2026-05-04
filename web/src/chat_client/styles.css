@@ -517,6 +517,57 @@ header h1 {
   border-radius: 6px;
   border: 1px solid var(--rule);
 }
+.msg.md mark {
+  background: color-mix(in oklab, var(--warn) 25%, transparent);
+  color: var(--ink);
+  padding: 0 2px;
+  border-radius: 3px;
+}
+/* GitHub-style alerts via marked-alert. Each kind gets its own accent. */
+.msg.md .markdown-alert {
+  margin: 0.5em 0;
+  padding: 0.5em 0.9em;
+  border-left: 4px solid var(--ink-soft);
+  background: color-mix(in oklab, var(--ink-soft) 6%, transparent);
+  border-radius: 0 6px 6px 0;
+}
+.msg.md .markdown-alert-title {
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+.msg.md .markdown-alert-note      { border-left-color: var(--accent); background: color-mix(in oklab, var(--accent) 8%, transparent); }
+.msg.md .markdown-alert-note      .markdown-alert-title { color: var(--accent-strong); }
+.msg.md .markdown-alert-tip       { border-left-color: var(--good); background: color-mix(in oklab, var(--good) 8%, transparent); }
+.msg.md .markdown-alert-tip       .markdown-alert-title { color: var(--good); }
+.msg.md .markdown-alert-important { border-left-color: var(--accent-strong); background: color-mix(in oklab, var(--accent-strong) 8%, transparent); }
+.msg.md .markdown-alert-important .markdown-alert-title { color: var(--accent-strong); }
+.msg.md .markdown-alert-warning   { border-left-color: var(--warn); background: color-mix(in oklab, var(--warn) 8%, transparent); }
+.msg.md .markdown-alert-warning   .markdown-alert-title { color: var(--warn); }
+.msg.md .markdown-alert-caution   { border-left-color: var(--bad); background: color-mix(in oklab, var(--bad) 8%, transparent); }
+.msg.md .markdown-alert-caution   .markdown-alert-title { color: var(--bad); }
+/* Footnotes (marked-footnote): the section + the reverse-link arrows. */
+.msg.md .footnotes {
+  margin-top: 0.8em;
+  padding-top: 0.5em;
+  border-top: 1px dashed var(--rule);
+  font-size: 0.9em;
+  color: var(--ink-soft);
+}
+.msg.md .footnotes ol { padding-left: 1.4em; }
+.msg.md sup a { text-decoration: none; padding: 0 2px; }
+.msg.md .footnotes a.data-footnote-backref { text-decoration: none; }
+/* Task list items rendered by GFM. Strip the default list bullet so the
+   checkbox is the visual marker. */
+.msg.md ul.contains-task-list,
+.msg.md li.task-list-item { list-style: none; }
+.msg.md ul.contains-task-list { padding-left: 0.4em; }
+.msg.md li.task-list-item input[type="checkbox"] {
+  margin-right: 0.5em;
+  vertical-align: middle;
+}
 
 @keyframes msgIn {
   from { opacity: 0; transform: translateY(4px); }

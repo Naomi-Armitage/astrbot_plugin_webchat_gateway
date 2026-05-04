@@ -10,6 +10,8 @@ import {
 } from "../shared/site";
 import type { SiteConfig } from "../shared/site";
 import { marked } from "marked";
+import markedAlert from "marked-alert";
+import markedFootnote from "marked-footnote";
 import DOMPurify from "dompurify";
 
 const LS_USERNAME = "wcg.username";
@@ -230,6 +232,29 @@ function replayActive(): void {
 // `textContent` because their content is either user-typed (don't trust)
 // or our own status copy (no markdown features needed).
 marked.setOptions({ gfm: true, breaks: true });
+
+// Extension stack — keep additions narrow and grounded. Each one closes a
+// specific "leaks raw symbols" gap from the LLM's typical output:
+//   * markedAlert     → GitHub-style `> [!NOTE]` blockquotes
+//   * markedFootnote  → `[^1]` references + `[^1]: definition` blocks
+//   * highlight ext   → `==text==` mark spans (custom; ~10 lines)
+marked.use(markedAlert());
+marked.use(markedFootnote());
+marked.use({
+  extensions: [
+    {
+      name: "mark",
+      level: "inline",
+      start(src: string) { return src.indexOf("=="); },
+      tokenizer(src: string) {
+        const m = /^==([^=\n]+?)==/.exec(src);
+        if (m) return { type: "mark", raw: m[0], text: m[1]! };
+        return undefined;
+      },
+      renderer(token) { return `<mark>${(token as unknown as { text: string }).text}</mark>`; },
+    },
+  ],
+});
 
 // Open every link in a new tab with safe rel. DOMPurify lets attributes
 // like target/rel through but doesn't add them — that's a separate hook.
