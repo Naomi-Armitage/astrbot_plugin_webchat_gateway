@@ -1081,19 +1081,39 @@ async function send(): Promise<void> {
     if (resp.ok) {
       setBadge(payload.remaining as number, payload.daily_quota as number);
       const reply = (payload.reply as string) || "(空回复)";
-      // Render assistant reply locally on /chat 200 so the user isn't stuck on
-      // the typing indicator if the long-poll is momentarily wedged. Same
-      // dedup mechanism as the user echo: register a pending entry so the
-      // upcoming `message_added` event for the assistant text is suppressed.
-      addMessageBubble("bot", reply);
-      const sess = store.sessions[sid];
-      if (sess) {
-        sess.history.push({ role: "bot", text: reply, ts: Date.now() });
-        sess.lastActiveAt = Date.now();
-        saveStore();
-        renderSessionList();
+      // Race: long-poll's `/events` response can land BEFORE /chat 200,
+      // because record_chat_pair fires + notifies the EventBus right
+      // before the chat handler returns. The two responses then race on
+      // separate HTTP connections. If the event arrives first, applyEvent
+      // already rendered + pushed the assistant bubble (no pending entry
+      // existed because we hadn't reached this branch yet, so dedup
+      // couldn't fire). Without this guard, the same reply gets rendered
+      // twice. Match key: last history entry must be the bot, same exact
+      // content, written within the last 30s.
+      const sessNow = store.sessions[sid];
+      const last = sessNow?.history[sessNow.history.length - 1];
+      const eventAlreadyDelivered = !!(
+        last
+        && last.role === "bot"
+        && last.text === reply
+        && (Date.now() - last.ts) < 30_000
+      );
+      if (!eventAlreadyDelivered) {
+        // Render assistant reply locally on /chat 200 so the user isn't stuck on
+        // the typing indicator if the long-poll is momentarily wedged. Same
+        // dedup mechanism as the user echo: register a pending entry so the
+        // upcoming `message_added` event for the assistant text is suppressed.
+        addMessageBubble("bot", reply);
+        if (sessNow) {
+          sessNow.history.push({ role: "bot", text: reply, ts: Date.now() });
+          sessNow.lastActiveAt = Date.now();
+          saveStore();
+          renderSessionList();
+        }
+        recordOptimistic(sid, "assistant", reply);
+      } else {
+        hideTyping();
       }
-      recordOptimistic(sid, "assistant", reply);
       return;
     }
 
