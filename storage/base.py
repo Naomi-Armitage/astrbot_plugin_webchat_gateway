@@ -270,14 +270,6 @@ class AbstractStorage(ABC):
         """
 
     @abstractmethod
-    async def get_min_pts(self, *, token_name: str) -> int:
-        """Return the smallest pts still in the table for this token (0 if
-        empty). Used by the long-poll path: if a client's `since` is below
-        `min_pts`, retention pruning has dropped events the client never saw,
-        so the response forces `tooFar` so the client cold-refetches.
-        """
-
-    @abstractmethod
     async def prune_chat_sync(
         self,
         *,

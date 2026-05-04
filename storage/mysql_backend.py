@@ -787,17 +787,6 @@ class MysqlStorage(AbstractStorage):
                 row = await cur.fetchone()
         return int(row[0]) if row else 0
 
-    async def get_min_pts(self, *, token_name: str) -> int:
-        async with self._read_tx() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    "SELECT COALESCE(MIN(pts), 0) FROM webchat_updates "
-                    "WHERE token_name = %s",
-                    (token_name,),
-                )
-                row = await cur.fetchone()
-        return int(row[0]) if row else 0
-
     async def prune_chat_sync(
         self,
         *,

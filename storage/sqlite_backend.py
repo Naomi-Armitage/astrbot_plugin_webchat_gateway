@@ -694,15 +694,6 @@ class SqliteStorage(AbstractStorage):
             row = await cursor.fetchone()
         return int(row["m"]) if row else 0
 
-    async def get_min_pts(self, *, token_name: str) -> int:
-        async with self._db.execute(
-            "SELECT COALESCE(MIN(pts), 0) AS m FROM webchat_updates "
-            "WHERE token_name = ?",
-            (token_name,),
-        ) as cursor:
-            row = await cursor.fetchone()
-        return int(row["m"]) if row else 0
-
     async def prune_chat_sync(
         self,
         *,

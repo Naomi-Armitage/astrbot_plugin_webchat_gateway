@@ -532,17 +532,22 @@ class ConversationService:
         rows = await self._storage.get_updates(
             token_name=token_name, since_pts=since_pts, limit=_GET_EVENTS_LIMIT
         )
-        # Retention-aware tooFar: if the client's `since` is below the
-        # smallest pts still in the table, the events between have been
-        # pruned and there's no way to catch the client up incrementally.
-        # Force a cold refetch instead of silently swallowing the gap.
-        if since_pts > 0 and not rows:
-            min_pts = await self._storage.get_min_pts(token_name=token_name)
-            if min_pts > 0 and since_pts < min_pts - 1:
-                current_max = await self._storage.get_max_pts(token_name=token_name)
-                return EventsResult(
-                    events=[], last_pts=current_max, has_more=False, too_far=True
-                )
+        # Retention-aware tooFar: when the first available row is past
+        # `since_pts + 1`, retention pruning consumed events the client
+        # never saw. Streaming forward from `rows` would silently desync
+        # the client; force a cold refetch instead. (Detecting via the
+        # gap on `rows[0].pts` avoids an extra MIN(pts) round-trip; if
+        # rows is empty, no gap is observable yet — the client is at the
+        # head and will pick up new events normally.)
+        if (
+            since_pts > 0
+            and rows
+            and rows[0].pts > since_pts + 1
+        ):
+            current_max = await self._storage.get_max_pts(token_name=token_name)
+            return EventsResult(
+                events=[], last_pts=current_max, has_more=False, too_far=True
+            )
         if not rows and timeout > 0:
             current_max = await self._storage.get_max_pts(token_name=token_name)
             if current_max - since_pts > _TOO_FAR_THRESHOLD:
@@ -551,19 +556,17 @@ class ConversationService:
                 return EventsResult(
                     events=[], last_pts=current_max, has_more=False, too_far=True
                 )
-            # Per-token waiter cap: above the limit, this connection waits
-            # for nothing and returns immediately. The frontend's three-fail
-            # heuristic will see consecutive empties and switch to short-poll
-            # transport for this device, freeing the slot. Net effect: many
-            # tabs on one token degrade collectively to short-poll instead of
-            # holding open sockets indefinitely.
+            # Per-token waiter cap. A 9th concurrent long-poll on the same
+            # token gets a 429 instead of a held connection so the frontend
+            # registers it as a failure, hits its 3-in-5s threshold, and
+            # degrades to short-poll naturally. Returning empty 200 here
+            # would loop the client with no backoff (no failure → no
+            # state-machine transition).
             if (
                 await self._event_bus.waiter_count(token_name)
                 >= _MAX_LONG_POLL_PER_TOKEN
             ):
-                return EventsResult(
-                    events=[], last_pts=current_max, has_more=False, too_far=False
-                )
+                raise ServiceError("too_many_waiters", status=429)
             await self._event_bus.wait(token_name, timeout=timeout)
             rows = await self._storage.get_updates(
                 token_name=token_name,
