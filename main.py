@@ -142,11 +142,17 @@ class WebChatGatewayPlugin(Star):
                         max_global=cfg.streaming.max_global,
                         on_evict=_on_evict,
                     )
-                except RuntimeError:
+                except RuntimeError as exc:
                     # redis-py not installed or DSN unusable. Fall back to
                     # in-memory so the rest of the plugin still starts.
-                    logger.exception(
-                        "[WebChatGateway] RedisBuffer init failed; falling back to in-memory"
+                    # Single-line warning instead of `logger.exception` —
+                    # the missing-optional-dep case is a config-driven
+                    # choice, not a bug, and a full traceback in the bot
+                    # log is noise.
+                    logger.warning(
+                        "[WebChatGateway] RedisBuffer unavailable (%s); "
+                        "falling back to in-memory buffer",
+                        exc,
                     )
                     buffer = InMemoryBuffer(
                         grace_seconds=cfg.streaming.grace_seconds,
