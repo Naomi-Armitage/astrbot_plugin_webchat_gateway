@@ -1971,14 +1971,16 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
     // through /chat where they'd hit the same LLM and fail identically,
     // and disable streaming for unrelated future sends.
     if (sce && sce.status === 0) {
-      // llm_timeout is flow-control (the server intentionally cuts off
-      // when chunk gaps exceed the configured idle timeout) — not a
-      // service failure. Render it as a soft inline notice / amber
-      // notice bubble instead of a red error, so the user doesn't read
-      // it as "the service is broken".
-      const isTimeout = sce.code === "llm_timeout";
+      // llm_timeout (server's idle-chunk timeout cut the stream) and
+      // empty_reply (upstream LLM returned finish_reason=stop with zero
+      // tokens) are both soft outcomes — service is fine, this particular
+      // turn just didn't produce a complete reply. Render them as amber
+      // notices with actionable copy, NOT as red errors. Other mid-stream
+      // error codes (llm_call_failed, internal_error) ARE service-side
+      // failures and keep the red treatment.
+      const isSoft = sce.code === "llm_timeout" || sce.code === "empty_reply";
       if (firstChunkSeen) {
-        if (isTimeout) {
+        if (isSoft) {
           settlePartial("incomplete", true);
         } else {
           settlePartial("error", false);
@@ -1988,7 +1990,7 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
       }
       discardBubble();
       addMessageBubble(
-        isTimeout ? "notice" : "error",
+        isSoft ? "notice" : "error",
         streamErrorCopy(sce.code),
       );
       return "ok";
@@ -2073,10 +2075,11 @@ async function attemptCrossDeviceLiveAttach(sid: string, streamId: string): Prom
 }
 
 function streamErrorCopy(code: string): string {
-  // llm_timeout is flow-control, not a failure — the message reflects
-  // that and gives the user actionable advice instead of "稍后再试"
-  // (which implies a transient outage that will heal on its own).
+  // Soft outcomes (server is healthy, this turn just didn't complete) get
+  // actionable copy that doesn't imply a service outage. Hard failures
+  // keep the "稍后再试" hint.
   if (code === "llm_timeout") return "这次回复没有完整生成。可以重新发送；如果任务较大，请缩小范围或分步提问。";
+  if (code === "empty_reply") return "上游模型这次没有输出内容（可能上下文过长或被过滤）。可换种说法或缩短问题后重新提问。";
   if (code === "llm_call_failed") return "上游模型调用失败，请稍后再试。";
   if (code === "stream_truncated") return "流式响应被截断。";
   return `请求失败: ${code}`;
@@ -2150,6 +2153,8 @@ async function runNonStreamingSend(sid: string, message: string): Promise<void> 
       addMessageBubble("error", `请求过于频繁，已暂时封禁，${retry} 秒后重试。`);
     } else if (s === 400 && err === "message_too_long") addMessageBubble("error", `消息过长 (上限 ${payload.max_length})。`);
     else if (s === 403 && err === "forbidden_origin") addMessageBubble("error", "页面来源未在 allowed_origins 中。");
+    else if (s === 504 && err === "llm_timeout") addMessageBubble("notice", streamErrorCopy("llm_timeout"));
+    else if (s === 502 && err === "empty_reply") addMessageBubble("notice", streamErrorCopy("empty_reply"));
     else addMessageBubble("error", `请求失败: ${err} ${payload.detail || ""}`);
   } catch (error) {
     addMessageBubble("error", `网络错误: ${String(error)}`);

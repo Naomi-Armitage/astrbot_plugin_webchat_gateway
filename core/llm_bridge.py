@@ -11,6 +11,19 @@ from typing import AsyncIterator, Sequence
 
 from astrbot.api import logger
 
+# AstrBot raises this from openai_source / similar provider sources when an
+# upstream LLM responds with finish_reason=stop AND zero completion tokens
+# AND empty content. The user-visible outcome is identical to the bridge's
+# own `RuntimeError("empty_reply")`, so we normalise both into a single
+# error code rather than letting `EmptyModelOutputError` leak as a generic
+# `internal_error` 500. Defensive import: older AstrBot builds without the
+# exception still load the plugin (the except below becomes a no-op).
+try:
+    from astrbot.core.exceptions import EmptyModelOutputError
+except ImportError:  # pragma: no cover
+    class EmptyModelOutputError(Exception):  # type: ignore[no-redef]
+        """Fallback shim when AstrBot doesn't export the real class."""
+
 
 class LlmBridge:
     """Wraps AstrBot LLM/persona/conversation calls for the WebChat pipeline."""
@@ -137,11 +150,19 @@ class LlmBridge:
             message=message, system_prompt=system_prompt, history=history
         )
 
-        resp = await self._context.llm_generate(
-            chat_provider_id=provider_id,
-            prompt=prompt,
-            persona_id=persona_id,
-        )
+        try:
+            resp = await self._context.llm_generate(
+                chat_provider_id=provider_id,
+                prompt=prompt,
+                persona_id=persona_id,
+            )
+        except EmptyModelOutputError as exc:
+            raise RuntimeError("empty_reply") from exc
+        # `llm_generate` may raise EmptyModelOutputError directly (some provider
+        # paths surface it that way); the existing `if not reply` guard below
+        # catches the case where it returns a response object with empty text.
+        # Both collapse into the same code so the handler can render them
+        # uniformly.
         reply = (resp.completion_text or "").strip()
         if not reply:
             raise RuntimeError("empty_reply")
@@ -192,22 +213,29 @@ class LlmBridge:
             )
 
             collected: list[str] = []
-            async for chunk in provider.text_chat_stream(prompt=prompt):
-                # AstrBot providers yield two kinds of LLMResponse:
-                #   is_chunk=True  → per-token delta; chunk.completion_text is
-                #                    the new text since the last yield (Anthropic
-                #                    sets it directly; OpenAI/Gemini set it via
-                #                    result_chain — the property reads through
-                #                    transparently).
-                #   is_chunk=False → final assembled response; emitted once at
-                #                    the end. Skip it (we already accumulated).
-                if not getattr(chunk, "is_chunk", False):
-                    continue
-                text = chunk.completion_text or ""
-                if not text:
-                    continue
-                collected.append(text)
-                yield text
+            try:
+                async for chunk in provider.text_chat_stream(prompt=prompt):
+                    # AstrBot providers yield two kinds of LLMResponse:
+                    #   is_chunk=True  → per-token delta; chunk.completion_text is
+                    #                    the new text since the last yield (Anthropic
+                    #                    sets it directly; OpenAI/Gemini set it via
+                    #                    result_chain — the property reads through
+                    #                    transparently).
+                    #   is_chunk=False → final assembled response; emitted once at
+                    #                    the end. Skip it (we already accumulated).
+                    if not getattr(chunk, "is_chunk", False):
+                        continue
+                    text = chunk.completion_text or ""
+                    if not text:
+                        continue
+                    collected.append(text)
+                    yield text
+            except EmptyModelOutputError as exc:
+                # Upstream returned finish_reason=stop with zero tokens. Same
+                # user-visible outcome as our `if not full: empty_reply` guard
+                # below — normalise so the handler can route it specifically
+                # instead of falling into the generic internal_error branch.
+                raise RuntimeError("empty_reply") from exc
 
             full = "".join(collected).strip()
             if not full:

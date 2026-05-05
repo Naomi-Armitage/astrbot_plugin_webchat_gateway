@@ -328,6 +328,24 @@ def make_chat_handler(deps: ChatDeps):
                         allowed_origins=allowed,
                         same_origin_host=same_host,
                     )
+                if str(exc) == "empty_reply":
+                    # Upstream returned finish_reason=stop with zero tokens.
+                    # Surface the specific code so the frontend can render
+                    # actionable copy ("model produced nothing — try again or
+                    # rephrase") rather than the generic llm_call_failed.
+                    await deps.audit.write(
+                        "chat_empty_reply",
+                        name=token.name,
+                        ip=ip,
+                        detail={"msg_len": len(data.message)},
+                    )
+                    return json_response(
+                        {"error": "empty_reply"},
+                        status=502,
+                        origin=origin,
+                        allowed_origins=allowed,
+                        same_origin_host=same_host,
+                    )
                 # Internal exception text may leak provider names, paths, or
                 # context near credentials — keep it in audit/log only and
                 # return a stable error code to the caller.
@@ -685,6 +703,32 @@ def make_chat_stream_handler(deps: ChatDeps):
                                 ).encode("utf-8")
                             )
                 else:
+                    # `empty_reply` is a soft outcome (upstream returned
+                    # finish_reason=stop with zero tokens) — by definition no
+                    # chunks were yielded, so the close path is always
+                    # close_failed, never close_incomplete. The error frame
+                    # carries the specific code so the frontend can render
+                    # actionable copy instead of generic "请求失败".
+                    if code == "empty_reply":
+                        await deps.registry.close_failed(
+                            handle_obj, error_code="empty_reply"
+                        )
+                        terminal_emitted = True
+                        if not client_gone:
+                            await _write_frame(
+                                (
+                                    "data: "
+                                    + json.dumps(
+                                        {"error": "empty_reply", "seq": last_seq},
+                                        ensure_ascii=False,
+                                    )
+                                    + "\n\n"
+                                ).encode("utf-8")
+                            )
+                        await _drain_pull(pull_task)
+                        pull_task = None
+                        await stream_iter.aclose()
+                        return response
                     logger.exception("[WebChatGateway] LLM stream failed")
                     if collected:
                         new_count = await deps.storage.increment_daily_usage(
