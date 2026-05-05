@@ -1984,6 +1984,15 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
       return "ok";
     }
 
+    if (kind === "peer") {
+      // Cross-device live attach is an opportunistic enhancement. If it
+      // fails, the authoritative message_added events will still populate
+      // the conversation, so showing a red "internal_error" bubble only
+      // makes a harmless fallback look like a failed chat.
+      discardBubble();
+      return "ok";
+    }
+
     if (isAbort) {
       if (firstChunkSeen) {
         settlePartial("interrupted", false);
@@ -2011,7 +2020,7 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
         recordStreamFailure();
         return "fallback";
       }
-      // Resume / peer attach: surface the error inline so the user knows
+      // Resume attach: surface the error inline so the user knows
       // the recovery failed; long-poll will eventually backfill via
       // message_added if the server persisted anything. Don't drop the
       // bubble if we already painted the seeded partial — keep it visible

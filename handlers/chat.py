@@ -463,11 +463,12 @@ def make_chat_stream_handler(deps: ChatDeps):
         data = parsed
 
         # Step 5: open stream via the registry (acquires per-token lock,
-        # creates buffer entry, emits chat-sync `stream_started`, audits).
+        # creates buffer entry and audits). chat-sync `stream_started` is
+        # emitted only after the SSE handshake succeeds, so peer devices
+        # do not attach to a stream the origin client never opened.
         handle_obj = await deps.registry.open(
             token_name=token.name,
             session_id=data.session_id,
-            user_text=data.message,
         )
         if handle_obj is None:
             # Lock contention is a precondition failure, not a stream
@@ -552,6 +553,33 @@ def make_chat_stream_handler(deps: ChatDeps):
                     + "\n\n"
                 ).encode("utf-8")
             )
+            # Now that the origin SSE is actually open and the client has
+            # received the stream_id, announce the stream to peer devices.
+            # This also emits the user's message_added event, so peers can
+            # show the user bubble immediately before assistant chunks arrive.
+            await deps.conv_service.emit_stream_started(
+                token_name=token.name,
+                session_id=data.session_id,
+                user_text=data.message,
+                stream_id=handle_obj.stream_id,
+            )
+        except asyncio.CancelledError:
+            logger.warning(
+                "[WebChatGateway] SSE handshake cancelled sid=%s",
+                handle_obj.stream_id,
+                stack_info=True,
+            )
+            try:
+                await deps.registry.close_failed(
+                    handle_obj, error_code="cancelled"
+                )
+            except Exception:
+                logger.exception(
+                    "[WebChatGateway] close_failed during SSE handshake"
+                    " cancellation cleanup raised sid=%s",
+                    handle_obj.stream_id,
+                )
+            raise
         except Exception:
             logger.exception(
                 "[WebChatGateway] SSE handshake failed sid=%s",

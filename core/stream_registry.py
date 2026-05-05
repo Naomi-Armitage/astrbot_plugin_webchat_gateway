@@ -165,7 +165,7 @@ class StreamRegistry:
     # --- lifecycle ---
 
     async def open(
-        self, *, token_name: str, session_id: str, user_text: str
+        self, *, token_name: str, session_id: str
     ) -> StreamHandle | None:
         """Acquire the per-token lock and create a new buffer entry.
 
@@ -173,12 +173,12 @@ class StreamRegistry:
         token (caller responds with 429). On success, returns a
         StreamHandle the caller drives via append/close_* and emits
         the `chat_stream_started` audit + `stream_started` chat-sync
-        event before any chunks are pushed.
+        audit event before any chunks are pushed.
 
-        `user_text` is the user's message — emitted alongside
-        stream_started so peer devices see the user's bubble immediately
-        instead of waiting for the assistant reply to land. CM still
-        gets the user/assistant pair atomically at close time.
+        The chat-sync `stream_started` event is intentionally emitted by
+        the HTTP handler only after the SSE handshake and stream_id frame
+        are written. Emitting it here would let peer devices attach to a
+        stream that the origin client never successfully opened.
         """
         stream_id = self._new_stream_id(token_name)
         # Defensive: the constructor format always satisfies the
@@ -252,23 +252,6 @@ class StreamRegistry:
             session_id=session_id,
             started_at=time.time(),
         )
-        # Emit chat-sync stream_started before audit so peer devices see
-        # the typing indicator as early as possible. Failures here are
-        # logged but do NOT abort the stream — the live SSE response is
-        # still healthy and the cross-device live attach is a best-
-        # effort optimization.
-        try:
-            await self._conv_service.emit_stream_started(
-                token_name=token_name,
-                session_id=session_id,
-                user_text=user_text,
-                stream_id=stream_id,
-            )
-        except Exception:
-            logger.exception(
-                "[WebChatGateway] emit_stream_started failed sid=%s",
-                stream_id,
-            )
         try:
             await self._audit.write(
                 _AUDIT_STARTED,
