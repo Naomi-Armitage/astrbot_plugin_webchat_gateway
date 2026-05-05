@@ -527,21 +527,47 @@ def make_chat_stream_handler(deps: ChatDeps):
                 "X-Accel-Buffering": "no",
             },
         )
-        await response.prepare(request)
-        # Comment frame so the browser sees bytes immediately and any
-        # transparent proxy flushes its buffer.
-        await response.write(b": ready\n\n")
-        # First data frame announces the stream_id so the client can
-        # persist it and reconnect via /resume on transient failure.
-        await response.write(
-            (
-                "data: "
-                + json.dumps(
-                    {"stream_id": handle_obj.stream_id}, ensure_ascii=False
+        # SSE handshake + first frames. If the peer is already gone (which
+        # can happen if a fast client retry beats the previous request to
+        # response.prepare), `prepare` and `write` raise — without this
+        # try/except the buffer would stay PENDING, the lock would stay
+        # held, and a peer device resuming onto the stream_id from the
+        # already-emitted `stream_started` event would see a stuck buffer.
+        # Force close_failed("internal_error") + a logged stack so the
+        # operator can see the failure in the AstrBot log instead of
+        # debugging a silent "请求失败: internal_error" on the client.
+        try:
+            await response.prepare(request)
+            # Comment frame so the browser sees bytes immediately and any
+            # transparent proxy flushes its buffer.
+            await response.write(b": ready\n\n")
+            # First data frame announces the stream_id so the client can
+            # persist it and reconnect via /resume on transient failure.
+            await response.write(
+                (
+                    "data: "
+                    + json.dumps(
+                        {"stream_id": handle_obj.stream_id}, ensure_ascii=False
+                    )
+                    + "\n\n"
+                ).encode("utf-8")
+            )
+        except Exception:
+            logger.exception(
+                "[WebChatGateway] SSE handshake failed sid=%s",
+                handle_obj.stream_id,
+            )
+            try:
+                await deps.registry.close_failed(
+                    handle_obj, error_code="internal_error"
                 )
-                + "\n\n"
-            ).encode("utf-8")
-        )
+            except Exception:
+                logger.exception(
+                    "[WebChatGateway] close_failed during SSE handshake"
+                    " cleanup raised sid=%s",
+                    handle_obj.stream_id,
+                )
+            raise
 
         collected: list[str] = []
         client_gone = False
