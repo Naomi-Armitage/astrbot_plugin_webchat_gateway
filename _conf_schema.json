@@ -158,5 +158,36 @@
         "default": ""
       }
     }
+  },
+  "streaming": {
+    "type": "object",
+    "description": "流式回复缓冲与恢复",
+    "hint": "断线重连、跨设备实时观看、不完整回复持久化都依赖这一层。默认走内存缓冲；多进程/跨重启场景配置 redis_dsn 启用 Redis 后端（需要安装 redis-py: pip install redis）。",
+    "items": {
+      "redis_dsn": {
+        "type": "string",
+        "description": "Redis 连接串",
+        "hint": "格式 redis://[:password@]host:port[/db] 或 rediss://...（TLS）；留空使用内存缓冲。AstrBot 单进程部署留空即可，多实例或希望跨插件重启保留 in-flight 缓冲再配置。",
+        "default": ""
+      },
+      "grace_seconds": {
+        "type": "int",
+        "description": "流结束后缓冲保留秒数",
+        "hint": "流到达终态后，缓冲保留这么久再清理，用于覆盖客户端 done 帧丢包后的迟到 reconnect。默认 30，范围 5-300。",
+        "default": 30
+      },
+      "max_per_token": {
+        "type": "int",
+        "description": "单 token 缓冲条目上限",
+        "hint": "每个 token 同时存活的缓冲条目（含已结束 grace 期内）不超过此数。配额=1 单飞场景这是兜底防御，默认 3，范围 1-10。",
+        "default": 3
+      },
+      "max_global": {
+        "type": "int",
+        "description": "全局缓冲条目上限",
+        "hint": "全平台同时存活的缓冲条目上限。超过会优先驱逐最旧的已关闭条目；若全部仍活跃则拒绝新流。默认 200，范围 10-10000。",
+        "default": 200
+      }
+    }
   }
 }
