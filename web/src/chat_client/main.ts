@@ -1485,21 +1485,32 @@ async function runStreamingSend(sid: string, message: string): Promise<"ok" | "f
     }
 
     // Mid-stream error frame from the server (`data: {"error": "..."}`).
-    // status is 0 in this branch. Surface the error inline; if we already
-    // rendered partial text, keep it visible above the error banner.
+    // status is 0 in this branch. Surface the outcome inline; if we already
+    // rendered partial text, keep it visible.
     // Note: do NOT call recordStreamFailure() here — the SSE transport
     // worked end-to-end; the LLM (or upstream provider) is the one that
     // errored. Tripping the circuit breaker would force the next sends
     // through /chat where they'd hit the same LLM and fail identically,
     // and disable streaming for unrelated future sends.
     if (sce && sce.status === 0) {
+      // llm_timeout is flow-control (the server intentionally cuts off
+      // when chunk gaps exceed the configured idle timeout) — not a
+      // service failure. Render it as a soft inline notice / amber
+      // notice bubble instead of a red error, so the user doesn't read
+      // it as "the service is broken".
+      const isTimeout = sce.code === "llm_timeout";
       if (firstChunkSeen) {
-        settlePartial("");
-        addMessageBubble("error", streamErrorCopy(sce.code));
+        settlePartial(isTimeout ? "（回复未完整传输）" : "");
+        if (!isTimeout) {
+          addMessageBubble("error", streamErrorCopy(sce.code));
+        }
         return "ok";
       }
       discardBubble();
-      addMessageBubble("error", streamErrorCopy(sce.code));
+      addMessageBubble(
+        isTimeout ? "notice" : "error",
+        streamErrorCopy(sce.code),
+      );
       return "ok";
     }
 
@@ -1522,7 +1533,10 @@ async function runStreamingSend(sid: string, message: string): Promise<"ok" | "f
 }
 
 function streamErrorCopy(code: string): string {
-  if (code === "llm_timeout") return "回复生成超时，请稍后再试。";
+  // llm_timeout is flow-control, not a failure — the message reflects
+  // that and gives the user actionable advice instead of "稍后再试"
+  // (which implies a transient outage that will heal on its own).
+  if (code === "llm_timeout") return "上游回复速度过慢，本次未生成完成。可换种说法或缩短问题后重新提问。";
   if (code === "llm_call_failed") return "上游模型调用失败，请稍后再试。";
   if (code === "stream_truncated") return "流式响应被截断。";
   return `请求失败: ${code}`;
