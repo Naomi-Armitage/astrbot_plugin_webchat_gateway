@@ -1,5 +1,4 @@
 aiosqlite>=0.19
+redis>=4.2
 # Optional: required only when storage.driver = "mysql"
 # aiomysql>=0.2
-# Optional: required only when streaming.redis_dsn is set
-# redis>=4.2
