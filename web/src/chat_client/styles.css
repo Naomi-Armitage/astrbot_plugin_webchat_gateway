@@ -648,7 +648,13 @@ footer textarea {
   color: var(--ink);
   border: 1px solid var(--rule);
   border-radius: 10px;
-  resize: vertical;
+  /* Auto-grow handled by JS (autosizeInput) — drives height from
+     scrollHeight on input. Manual drag-to-resize is removed because the
+     handle sits in the bottom-right corner, awkwardly close to the
+     send button. CSS max-height still caps the auto-grow; once content
+     exceeds it the textarea scrolls internally. */
+  resize: none;
+  overflow-y: auto;
   font: inherit;
   line-height: 1.5;
   transition: border-color .15s ease, box-shadow .15s ease;

@@ -1642,6 +1642,7 @@ async function send(): Promise<void> {
   renderSessionList();
 
   inputEl.value = "";
+  autosizeInput();
 
   if (eligibleForAutoTitle) {
     requestAutoTitle(sid, message).catch(() => {});
@@ -2193,6 +2194,20 @@ inputEl.addEventListener("keydown", (e) => {
     void send();
   }
 });
+
+// Telegram-style auto-grow: the textarea expands as the user types and
+// shrinks back when text is deleted. CSS min-height / max-height cap both
+// ends; once scrollHeight exceeds max-height the browser falls back to
+// internal scrolling. Setting `height = "auto"` first is needed to let
+// scrollHeight collapse before re-measuring (otherwise it only grows,
+// never shrinks).
+function autosizeInput(): void {
+  inputEl.style.height = "auto";
+  inputEl.style.height = inputEl.scrollHeight + "px";
+}
+inputEl.addEventListener("input", autosizeInput);
+// Reset to one line on initial render and any external value clear.
+autosizeInput();
 sendBtn.onclick = (): void => {
   // Same button doubles as stop while a stream is in flight. Click during
   // stream cancels the AbortController; the streaming path catches the
