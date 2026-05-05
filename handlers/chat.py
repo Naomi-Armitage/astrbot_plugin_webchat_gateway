@@ -465,7 +465,9 @@ def make_chat_stream_handler(deps: ChatDeps):
         # Step 5: open stream via the registry (acquires per-token lock,
         # creates buffer entry, emits chat-sync `stream_started`, audits).
         handle_obj = await deps.registry.open(
-            token_name=token.name, session_id=data.session_id,
+            token_name=token.name,
+            session_id=data.session_id,
+            user_text=data.message,
         )
         if handle_obj is None:
             # Lock contention is a precondition failure, not a stream

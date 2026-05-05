@@ -618,6 +618,7 @@ class ConversationService:
         user_text: str,
         assistant_text: str,
         incomplete: bool = False,
+        user_already_emitted: bool = False,
     ) -> None:
         # Must never raise: the chat reply has already been delivered to the
         # client. A failure here is a sync hiccup, not a chat error. We
@@ -631,6 +632,14 @@ class ConversationService:
         # incomplete path needs to persist partial replies too — moving
         # the CM write here keeps a single source of truth for "the turn
         # is done, persist whatever we have".
+        #
+        # `user_already_emitted=True` is set by the streaming close path
+        # (close_ok / close_incomplete) — emit_stream_started has already
+        # emitted the user's message_added event at stream start so peer
+        # devices saw the user's bubble immediately. Skipping the user
+        # event here avoids duplicate renders. CM still gets the FULL
+        # pair via add_message_pair regardless of the flag, because CM
+        # only gets one write per turn (at close).
         try:
             await self._cm_persist_pair(
                 token_name=token_name,
@@ -648,29 +657,49 @@ class ConversationService:
                 token_name=token_name, session_id=session_id
             )
             events: list[NewEvent] = []
-            new_count = (existing.message_count if existing else 0) + 2
+            # +1 if the user message was already counted at stream_started,
+            # +2 otherwise (non-stream /chat that still emits the pair here).
+            count_delta = 1 if user_already_emitted else 2
+            new_count = (existing.message_count if existing else 0) + count_delta
             preview = assistant_text[:_PREVIEW_CHARS]
             if existing is None:
-                # Emit session_created BEFORE the message_added pair so peers
-                # apply them in the natural order. All three land in one
-                # append_updates call → one pts block → atomic from the
-                # client's perspective.
-                events.append(
-                    NewEvent(
-                        event_type=EVENT_SESSION_CREATED,
-                        session_id=session_id,
-                        payload=json.dumps({"title": ""}, ensure_ascii=False),
+                # session_created should NOT fire if user_already_emitted
+                # — emit_stream_started already did. Without this guard
+                # peers would see two session_created events for one new
+                # session and the second would be a no-op only because
+                # applyEvent guards `if (!store.sessions[sid])`.
+                if not user_already_emitted:
+                    events.append(
+                        NewEvent(
+                            event_type=EVENT_SESSION_CREATED,
+                            session_id=session_id,
+                            payload=json.dumps({"title": ""}, ensure_ascii=False),
+                        )
                     )
-                )
-                await self._storage.upsert_session_meta(
-                    token_name=token_name,
-                    session_id=session_id,
-                    title="",
-                    title_manual=False,
-                    message_count=new_count,
-                    preview=preview,
-                    now=now,
-                )
+                    await self._storage.upsert_session_meta(
+                        token_name=token_name,
+                        session_id=session_id,
+                        title="",
+                        title_manual=False,
+                        message_count=new_count,
+                        preview=preview,
+                        now=now,
+                    )
+                else:
+                    # Defensive: a stream that emitted stream_started
+                    # SHOULD have left a session meta row behind. If
+                    # somehow there's no row, recover by upserting one
+                    # without re-firing session_created (peers already
+                    # got it).
+                    await self._storage.upsert_session_meta(
+                        token_name=token_name,
+                        session_id=session_id,
+                        title="",
+                        title_manual=False,
+                        message_count=new_count,
+                        preview=preview,
+                        now=now,
+                    )
             else:
                 # Bump updated_at so list_conversations sort order matches
                 # "most recent activity"; refresh cached count + preview so
@@ -707,16 +736,17 @@ class ConversationService:
                     preview=preview,
                     now=now,
                 )
-            events.append(
-                NewEvent(
-                    event_type=EVENT_MESSAGE_ADDED,
-                    session_id=session_id,
-                    payload=json.dumps(
-                        {"role": "user", "content": user_text},
-                        ensure_ascii=False,
-                    ),
+            if not user_already_emitted:
+                events.append(
+                    NewEvent(
+                        event_type=EVENT_MESSAGE_ADDED,
+                        session_id=session_id,
+                        payload=json.dumps(
+                            {"role": "user", "content": user_text},
+                            ensure_ascii=False,
+                        ),
+                    )
                 )
-            )
             assistant_payload: dict[str, Any] = {
                 "role": "assistant",
                 "content": assistant_text,
@@ -762,31 +792,104 @@ class ConversationService:
         *,
         token_name: str,
         session_id: str,
+        user_text: str,
         stream_id: str,
     ) -> None:
-        """Append a single `stream_started` event and notify the event
-        bus. NO CM write, NO meta upsert. Must never raise — failures
-        are logged + audited like `record_chat_pair`.
+        """Emit `session_created` (if new) + `message_added(user)` +
+        `stream_started` atomically.
+
+        Emitting the user's message at stream START (not stream END)
+        means peer devices render the user's bubble immediately when
+        the stream begins, instead of waiting up to several seconds
+        for the assistant reply to land. The CM write for the
+        (user, assistant) pair still happens at stream close via
+        `record_chat_pair` — atomicity in CM history is preserved
+        because the pair is appended together once the assistant text
+        is final.
+
+        Sidebar count + preview reflect the user's message immediately
+        (count = N+1, preview = user_text); record_chat_pair at close
+        will update count again to N+2 and preview to the assistant
+        text. The intermediate state is visible to peers but harmless.
+
+        Must never raise — failures are logged + audited.
         """
         try:
             now = self._now()
             started_at_ms = int(time.time() * 1000)
-            await self._storage.append_updates(
-                token_name=token_name,
-                events=[
+            existing = await self._storage.get_session_meta(
+                token_name=token_name, session_id=session_id
+            )
+            events: list[NewEvent] = []
+            preview = user_text[:_PREVIEW_CHARS]
+            if existing is None:
+                # New session: emit session_created, upsert meta with
+                # initial count of 1 (just the user message).
+                events.append(
                     NewEvent(
-                        event_type=EVENT_STREAM_STARTED,
+                        event_type=EVENT_SESSION_CREATED,
                         session_id=session_id,
-                        payload=json.dumps(
-                            {
-                                "stream_id": stream_id,
-                                "started_at": started_at_ms,
-                            },
-                            ensure_ascii=False,
-                        ),
+                        payload=json.dumps({"title": ""}, ensure_ascii=False),
                     )
-                ],
-                now=now,
+                )
+                await self._storage.upsert_session_meta(
+                    token_name=token_name,
+                    session_id=session_id,
+                    title="",
+                    title_manual=False,
+                    message_count=1,
+                    preview=preview,
+                    now=now,
+                )
+            else:
+                # Existing session — same un-delete logic as
+                # record_chat_pair so a soft-deleted session resurfaces
+                # consistently when the user resumes typing into it.
+                deleted_arg: int | None | object = _UNSET
+                if existing.deleted_at is not None:
+                    deleted_arg = None
+                    events.append(
+                        NewEvent(
+                            event_type=EVENT_SESSION_META_UPDATED,
+                            session_id=session_id,
+                            payload=json.dumps(
+                                {"deleted": False}, ensure_ascii=False
+                            ),
+                        )
+                    )
+                await self._storage.upsert_session_meta(
+                    token_name=token_name,
+                    session_id=session_id,
+                    deleted_at=deleted_arg,
+                    message_count=existing.message_count + 1,
+                    preview=preview,
+                    now=now,
+                )
+            events.append(
+                NewEvent(
+                    event_type=EVENT_MESSAGE_ADDED,
+                    session_id=session_id,
+                    payload=json.dumps(
+                        {"role": "user", "content": user_text},
+                        ensure_ascii=False,
+                    ),
+                )
+            )
+            events.append(
+                NewEvent(
+                    event_type=EVENT_STREAM_STARTED,
+                    session_id=session_id,
+                    payload=json.dumps(
+                        {
+                            "stream_id": stream_id,
+                            "started_at": started_at_ms,
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+            )
+            await self._storage.append_updates(
+                token_name=token_name, events=events, now=now
             )
             await self._event_bus.notify(token_name)
         except Exception as exc:

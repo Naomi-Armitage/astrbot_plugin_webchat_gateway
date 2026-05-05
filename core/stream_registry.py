@@ -165,7 +165,7 @@ class StreamRegistry:
     # --- lifecycle ---
 
     async def open(
-        self, *, token_name: str, session_id: str
+        self, *, token_name: str, session_id: str, user_text: str
     ) -> StreamHandle | None:
         """Acquire the per-token lock and create a new buffer entry.
 
@@ -174,6 +174,11 @@ class StreamRegistry:
         StreamHandle the caller drives via append/close_* and emits
         the `chat_stream_started` audit + `stream_started` chat-sync
         event before any chunks are pushed.
+
+        `user_text` is the user's message — emitted alongside
+        stream_started so peer devices see the user's bubble immediately
+        instead of waiting for the assistant reply to land. CM still
+        gets the user/assistant pair atomically at close time.
         """
         stream_id = self._new_stream_id(token_name)
         # Defensive: the constructor format always satisfies the
@@ -256,6 +261,7 @@ class StreamRegistry:
             await self._conv_service.emit_stream_started(
                 token_name=token_name,
                 session_id=session_id,
+                user_text=user_text,
                 stream_id=stream_id,
             )
         except Exception:
@@ -331,6 +337,7 @@ class StreamRegistry:
                 user_text=user_text,
                 assistant_text=full_text,
                 incomplete=False,
+                user_already_emitted=True,
             ),
         )
 
@@ -370,6 +377,7 @@ class StreamRegistry:
                 user_text=user_text,
                 assistant_text=partial_text,
                 incomplete=True,
+                user_already_emitted=True,
             ),
         )
 
