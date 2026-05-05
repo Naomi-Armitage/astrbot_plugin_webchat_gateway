@@ -713,6 +713,15 @@ footer button:disabled { opacity: .5; cursor: not-allowed; }
 /* Streaming caret on the bot bubble while chunks are still arriving.
    Inline so the cursor sits flush with the last rendered character even
    inside a final <p> / <li>; uses --accent so it picks up theme colors. */
+.msg.bot.md.streaming {
+  /* During streaming we render plain text via textContent (no markdown
+     parse per frame — too expensive for the rAF typewriter loop). pre-wrap
+     keeps newlines + multiple spaces visible so the user can still tell
+     paragraphs apart; on terminal the bubble swaps to .innerHTML with the
+     full markdown render and `white-space` reverts to normal via the
+     class removal. */
+  white-space: pre-wrap;
+}
 .msg.bot.md.streaming::after {
   content: "";
   display: inline-block;

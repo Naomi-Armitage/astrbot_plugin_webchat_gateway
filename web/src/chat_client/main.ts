@@ -1751,7 +1751,7 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
   let rafToken = 0;
   if (kind === "resume" && typeof opts.initialText === "string" && opts.initialText.length) {
     pending = opts.initialText;
-    bubble.innerHTML = renderMarkdown(pending);
+    bubble.textContent = pending;
     displayedLength = pending.length;
     firstChunkSeen = true;
     scrollToEnd();
@@ -1772,14 +1772,18 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
   // fixed-interval debounce just batches lurches into bigger ones.
   // Instead, decouple network arrival from display: `pending` is the
   // ground truth from chunks, `displayedLength` is what's currently in
-  // the DOM, and a requestAnimationFrame loop closes the gap at
-  // ~120-180 cps (CJK reads ~5-8 chars/sec to a human, so this stays
-  // safely above "readable" speed). When backlog is small the loop
-  // reveals 2 chars/frame — perceptibly typewriter-paced. When backlog
-  // is large (server burst, resume replay, paste-and-stream) the rate
-  // adapts to drain within ~500ms so we never visibly fall behind.
+  // the DOM, and a requestAnimationFrame loop closes the gap.
+  //
+  // Rendering during streaming uses textContent (cheap O(n) DOM update,
+  // no markdown parsing) — running marked + DOMPurify per frame for a
+  // multi-KB reply would saturate the main thread and stutter the
+  // animation, especially on slower devices. Markdown formatting kicks
+  // in once on the terminal frame via flushRender, where the bubble
+  // swaps to innerHTML with the full markdown render. The CSS rule on
+  // `.msg.bot.md.streaming` keeps newlines + spaces visible during the
+  // textContent phase so paragraph structure stays readable.
   const renderTo = (n: number): void => {
-    bubble.innerHTML = renderMarkdown(pending.slice(0, n));
+    bubble.textContent = pending.slice(0, n);
     scrollToEnd();
   };
   const tick = (): void => {
@@ -1797,17 +1801,19 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
     if (rafToken !== 0) return;
     rafToken = requestAnimationFrame(tick);
   };
-  // flushRender snaps to the full pending text immediately — used by
-  // terminal paths (done frame, error frame, finalize) so the user
-  // doesn't watch a stale typewriter animation finish AFTER the stream
-  // already ended.
+  // flushRender: terminal path. Stop the rAF, snap to full text, and
+  // perform the ONE markdown render of the entire reply. The streaming
+  // class is removed by the caller (finalizeBubble / similar), which
+  // also reverts white-space back to the default so nested <pre>
+  // / <code> blocks render correctly.
   const flushRender = (): void => {
     if (rafToken !== 0) {
       cancelAnimationFrame(rafToken);
       rafToken = 0;
     }
     displayedLength = pending.length;
-    renderTo(displayedLength);
+    bubble.innerHTML = renderMarkdown(pending);
+    scrollToEnd();
   };
   const cancelRender = (): void => {
     if (rafToken !== 0) {
