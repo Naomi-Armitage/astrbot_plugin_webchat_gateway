@@ -69,7 +69,6 @@ const DEDUP_CONTENT_LEN = 200;
 const STREAM_FAIL_WINDOW_MS = 60_000;
 const STREAM_FAIL_THRESHOLD = 3;
 const STREAM_SKIP_AFTER_TRIP = 5;
-const STREAM_RENDER_DEBOUNCE_MS = 30;
 
 const token = (localStorage.getItem(LS_TOKEN) || "").trim();
 if (!token) { location.replace("/login"); throw new Error("redirecting to /login"); }
@@ -1745,14 +1744,19 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
   // empty during the reconnect handshake.
   let pending = "";
   let firstChunkSeen = false;
+  // Typewriter state — declared here so the seed-init below can mark the
+  // already-on-screen prefix as fully displayed and the typewriter loop
+  // only animates new chunks that arrive AFTER the resume hook-up.
+  let displayedLength = 0;
+  let rafToken = 0;
   if (kind === "resume" && typeof opts.initialText === "string" && opts.initialText.length) {
     pending = opts.initialText;
     bubble.innerHTML = renderMarkdown(pending);
+    displayedLength = pending.length;
     firstChunkSeen = true;
     scrollToEnd();
   }
 
-  let renderTimer: number | null = null;
   let lastSeq = typeof opts.afterSeq === "number" ? opts.afterSeq : -1;
   let streamId = typeof opts.streamId === "string" ? opts.streamId : "";
   // Persist the PendingStream periodically so a refresh halfway through a
@@ -1762,21 +1766,53 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
   const CHUNKS_PER_PERSIST = 10;
   let chunksSincePersist = 0;
 
-  const flushRender = (): void => {
-    bubble.innerHTML = renderMarkdown(pending);
+  // Typewriter renderer. Provider chunks usually land word-level (5-15
+  // chars at a time) at irregular ~100-300ms intervals. A naive
+  // "render-on-arrival" strategy makes the UI lurch in word-bursts; a
+  // fixed-interval debounce just batches lurches into bigger ones.
+  // Instead, decouple network arrival from display: `pending` is the
+  // ground truth from chunks, `displayedLength` is what's currently in
+  // the DOM, and a requestAnimationFrame loop closes the gap at
+  // ~120-180 cps (CJK reads ~5-8 chars/sec to a human, so this stays
+  // safely above "readable" speed). When backlog is small the loop
+  // reveals 2 chars/frame — perceptibly typewriter-paced. When backlog
+  // is large (server burst, resume replay, paste-and-stream) the rate
+  // adapts to drain within ~500ms so we never visibly fall behind.
+  const renderTo = (n: number): void => {
+    bubble.innerHTML = renderMarkdown(pending.slice(0, n));
     scrollToEnd();
   };
+  const tick = (): void => {
+    rafToken = 0;
+    const backlog = pending.length - displayedLength;
+    if (backlog <= 0) return;
+    const advance = Math.max(2, Math.ceil(backlog / 30));
+    displayedLength = Math.min(pending.length, displayedLength + advance);
+    renderTo(displayedLength);
+    if (displayedLength < pending.length) {
+      rafToken = requestAnimationFrame(tick);
+    }
+  };
   const scheduleRender = (): void => {
-    if (renderTimer !== null) return;
-    renderTimer = window.setTimeout(() => {
-      renderTimer = null;
-      flushRender();
-    }, STREAM_RENDER_DEBOUNCE_MS);
+    if (rafToken !== 0) return;
+    rafToken = requestAnimationFrame(tick);
+  };
+  // flushRender snaps to the full pending text immediately — used by
+  // terminal paths (done frame, error frame, finalize) so the user
+  // doesn't watch a stale typewriter animation finish AFTER the stream
+  // already ended.
+  const flushRender = (): void => {
+    if (rafToken !== 0) {
+      cancelAnimationFrame(rafToken);
+      rafToken = 0;
+    }
+    displayedLength = pending.length;
+    renderTo(displayedLength);
   };
   const cancelRender = (): void => {
-    if (renderTimer !== null) {
-      clearTimeout(renderTimer);
-      renderTimer = null;
+    if (rafToken !== 0) {
+      cancelAnimationFrame(rafToken);
+      rafToken = 0;
     }
   };
 
