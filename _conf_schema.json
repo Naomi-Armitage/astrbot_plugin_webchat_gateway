@@ -167,7 +167,7 @@
       "redis_dsn": {
         "type": "string",
         "description": "Redis 连接串",
-        "hint": "格式 redis://[:password@]host:port[/db] 或 rediss://...（TLS）；留空使用内存缓冲。AstrBot 单进程部署留空即可，多实例或希望跨插件重启保留 in-flight 缓冲再配置。",
+        "hint": "格式 redis://:password@host:port/db 或 rediss://...（TLS）；留空使用内存缓冲。AstrBot 单进程部署留空即可，多实例或希望跨插件重启保留 in-flight 缓冲再配置。",
         "default": ""
       },
       "grace_seconds": {
