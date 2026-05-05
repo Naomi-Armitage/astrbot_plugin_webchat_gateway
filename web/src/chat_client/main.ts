@@ -1321,6 +1321,13 @@ async function send(): Promise<void> {
     if (tryStream) {
       const outcome = await runStreamingSend(sid, message);
       if (outcome === "fallback") {
+        // runStreamingSend's finally re-enabled the button so the stop
+        // button stayed clickable during the streaming attempt; we're
+        // about to fire a second HTTP request, so re-disable to prevent
+        // the user double-clicking through fallback (which would either
+        // duplicate the optimistic user echo or trip server-side
+        // concurrent_request).
+        sendBtn.disabled = true;
         showTyping();
         await runNonStreamingSend(sid, message);
       }

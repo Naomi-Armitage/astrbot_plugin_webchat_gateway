@@ -516,32 +516,64 @@ def make_chat_stream_handler(deps: ChatDeps):
                 message=data.message,
             )
             stream_iter = stream.__aiter__()
+            # Persistent pull task across heartbeats. Reusing the same
+            # task is the only correct way to combine a heartbeat timeout
+            # with `__anext__`: `wait_for(shield(...))` on a *fresh*
+            # `__anext__()` each iteration would leave the prior call
+            # still running in the background, and the next iteration's
+            # `__anext__()` would crash with "asynchronous generator is
+            # already running". Here we drive a single in-flight Task and
+            # only allocate a new one after the previous chunk has been
+            # consumed (or the previous task has terminated).
+            pull_task: asyncio.Task | None = None
+
+            async def _drain_pull(task: asyncio.Task | None) -> None:
+                # Cancel and await the pull task so the inner `__anext__`
+                # finishes (cancelled or otherwise) before we touch the
+                # generator. Calling `stream_iter.aclose()` while a pull
+                # is in flight races with that pull and can raise
+                # "aclose() got called when the generator was already
+                # running" — drain first.
+                if task is None or task.done():
+                    return
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, StopAsyncIteration, Exception):
+                    pass
 
             try:
                 while True:
+                    if pull_task is None:
+                        pull_task = asyncio.ensure_future(stream_iter.__anext__())
                     try:
-                        # `asyncio.shield` is required: wrapping `__anext__`
-                        # directly with `wait_for` lets the timeout cancel
-                        # the awaitable, which on an async generator
-                        # corrupts the generator state (PEP 533 / cpython
-                        # issue 82624) — subsequent calls raise
-                        # "asynchronous generator is already running".
-                        # `shield` keeps the inner await alive across
-                        # heartbeats; only an outer cancel propagates.
+                        # shield protects the persistent task from being
+                        # cancelled when wait_for times out — the task
+                        # keeps running in the background and we re-await
+                        # it on the next iteration.
                         chunk = await asyncio.wait_for(
-                            asyncio.shield(stream_iter.__anext__()),
+                            asyncio.shield(pull_task),
                             timeout=_HEARTBEAT_INTERVAL,
                         )
                     except asyncio.TimeoutError:
-                        # No chunk arrived in 20s — emit a comment frame to
-                        # keep the connection alive through idle proxies and
-                        # to surface a peer disconnect on the next write.
+                        # No chunk in 20s — heartbeat keeps the connection
+                        # alive across idle proxies and surfaces a peer
+                        # disconnect on the next write. The pull_task is
+                        # still in flight; we'll await it again next loop.
                         if not await _write_frame(b": keepalive\n\n"):
+                            await _drain_pull(pull_task)
+                            pull_task = None
                             aborted = True
                             break
                         continue
                     except StopAsyncIteration:
+                        # The persistent task completed with end-of-stream.
+                        pull_task = None
                         break
+
+                    # Chunk consumed → task is done; the next iteration
+                    # creates a fresh task for the next pull.
+                    pull_task = None
 
                     collected.append(chunk)
                     frame = (
@@ -581,12 +613,16 @@ def make_chat_stream_handler(deps: ChatDeps):
                         + "\n\n"
                     ).encode("utf-8")
                 )
-                # Close out the upstream generator so its `finally` runs and
-                # the provider connection is released.
+                # Drain pull then aclose the upstream generator so its
+                # `finally` runs and the provider connection is released.
+                await _drain_pull(pull_task)
+                pull_task = None
                 await stream_iter.aclose()
                 return response
             except asyncio.CancelledError:
                 # Server-initiated shutdown. Abort cleanly; no quota, no CM.
+                await _drain_pull(pull_task)
+                pull_task = None
                 await stream_iter.aclose()
                 await deps.audit.write(
                     "chat_stream_aborted",
@@ -610,13 +646,15 @@ def make_chat_stream_handler(deps: ChatDeps):
                         + "\n\n"
                     ).encode("utf-8")
                 )
+                await _drain_pull(pull_task)
+                pull_task = None
                 await stream_iter.aclose()
                 return response
 
             if aborted:
                 # Client disconnect or transport reset. Skip quota + CM.
-                # generate_reply_stream's `finally` aclose'd its inner async
-                # for, so the provider connection is already released.
+                await _drain_pull(pull_task)
+                pull_task = None
                 await stream_iter.aclose()
                 await deps.audit.write(
                     "chat_stream_aborted",
