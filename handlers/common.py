@@ -27,10 +27,27 @@ def extract_origin(
     indistinguishable from a server-side curl call, weakening the Origin
     allow-list as a CSRF mitigation. Only enable the fallback when the
     deployment knowingly accepts that tradeoff.
+
+    Browsers omit Origin on many same-origin GETs (privacy default);
+    when they do, they include `Sec-Fetch-Site: same-origin` instead.
+    Treat that header as proof of same-origin and synthesize an Origin
+    equal to the request's host so `is_origin_allowed` lets it through
+    via the existing same-origin auto-allow branch. Sec-Fetch-Site is a
+    "forbidden header name" in the Fetch spec — JS can't set it, only
+    the user agent can — so attacker-driven CSRF requests never carry
+    the `same-origin` value.
     """
     origin = (request.headers.get("Origin") or "").strip()
     if origin:
         return origin
+    sec_fetch_site = (request.headers.get("Sec-Fetch-Site") or "").strip().lower()
+    if sec_fetch_site == "same-origin":
+        # Use the same scheme the request came in on (HTTPS via reverse
+        # proxy still presents `request.scheme = "http"` internally — but
+        # urlparse on the synthesized URL only cares about netloc, which
+        # matches `same_origin_host = request.host` either way, so the
+        # scheme prefix is cosmetic).
+        return f"{request.scheme}://{request.host}"
     if not trust_referer_as_origin:
         return None
     referer = (request.headers.get("Referer") or "").strip()
