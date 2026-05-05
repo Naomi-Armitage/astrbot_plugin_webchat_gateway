@@ -686,6 +686,7 @@ class SqliteStorage(AbstractStorage):
             "SELECT token_name, pts, ts, event_type, session_id, payload "
             "FROM webchat_updates "
             "WHERE token_name = ? AND pts > ? "
+            "  AND event_type != '_pruned_marker' "
             "ORDER BY pts ASC LIMIT ?",
             (token_name, since_pts, limit),
         ) as cursor:
@@ -718,11 +719,49 @@ class SqliteStorage(AbstractStorage):
         deleted_meta_before_ts: int,
     ) -> tuple[int, int]:
         async with self._write_lock:
+            # Always retain the latest row per token, even if it's past
+            # the cutoff. Without this guard, a token with all events
+            # past the cutoff would have its MAX(pts) reset to 0 after
+            # the prune; new events would restart at pts=1, and any
+            # client polling with `since=N` (N from before the prune)
+            # would silently miss the new pts 1..N because the
+            # `since > current_max` tooFar check only catches cases
+            # where since runs ahead of MAX. Keeping at least one row
+            # per token preserves MAX(pts) monotonicity.
+            #
+            # The exclusion uses a COMPOSITE key: a bare `pts NOT IN
+            # (SELECT MAX(pts) ...)` would over-protect rows because
+            # token A's stale pts=2 would match token B's MAX(pts)=2
+            # in the subquery. Pairing with token_name fixes that.
             cur = await self._db.execute(
-                "DELETE FROM webchat_updates WHERE ts < ?",
+                "DELETE FROM webchat_updates "
+                "WHERE ts < ? "
+                "  AND (token_name, pts) NOT IN ("
+                "    SELECT token_name, MAX(pts) FROM webchat_updates "
+                "    GROUP BY token_name"
+                "  )",
                 (events_before_ts,),
             )
             events_pruned = cur.rowcount or 0
+            # If the retained row is itself past the cutoff, it still
+            # carries real chat text — which violates the retention
+            # contract (14 days advertised in main.py). Replace such
+            # rows with a content-free `_pruned_marker` so the row
+            # continues to anchor MAX(pts) but no longer leaks payload.
+            # Idempotent: rows that are already markers are excluded by
+            # the `event_type != '_pruned_marker'` guard so daily prune
+            # runs don't re-update the same row.
+            await self._db.execute(
+                "UPDATE webchat_updates "
+                "SET payload = '{}', event_type = '_pruned_marker' "
+                "WHERE ts < ? "
+                "  AND event_type != '_pruned_marker' "
+                "  AND (token_name, pts) IN ("
+                "    SELECT token_name, MAX(pts) FROM webchat_updates "
+                "    GROUP BY token_name"
+                "  )",
+                (events_before_ts,),
+            )
             cur = await self._db.execute(
                 "DELETE FROM webchat_session_meta "
                 "WHERE deleted_at IS NOT NULL AND deleted_at < ?",

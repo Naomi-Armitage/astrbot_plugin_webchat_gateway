@@ -727,6 +727,10 @@ footer button:disabled { opacity: .5; cursor: not-allowed; }
   color: var(--ink-soft);
   font-style: italic;
 }
+.msg.bot .stream-notice.incomplete {
+  color: var(--color-warning, #b8860b);
+  font-style: italic;
+}
 
 /* ----- mobile ----- */
 @media (max-width: 719px) {

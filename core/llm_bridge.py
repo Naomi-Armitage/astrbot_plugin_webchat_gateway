@@ -11,19 +11,6 @@ from typing import AsyncIterator, Sequence
 
 from astrbot.api import logger
 
-try:
-    from astrbot.core.agent.message import (
-        AssistantMessageSegment,
-        TextPart,
-        UserMessageSegment,
-    )
-except ImportError as _e:
-    raise ImportError(
-        "[WebChatGateway] Cannot import AssistantMessageSegment/TextPart/UserMessageSegment "
-        "from astrbot.core.agent.message. This plugin requires AstrBot >= 3.4. "
-        f"Original error: {_e}"
-    ) from _e
-
 
 class LlmBridge:
     """Wraps AstrBot LLM/persona/conversation calls for the WebChat pipeline."""
@@ -159,17 +146,9 @@ class LlmBridge:
         if not reply:
             raise RuntimeError("empty_reply")
 
-        try:
-            await cm.add_message_pair(
-                cid=cid,
-                user_message=UserMessageSegment(content=[TextPart(text=message)]),
-                assistant_message=AssistantMessageSegment(
-                    content=[TextPart(text=reply)]
-                ),
-            )
-        except Exception:
-            logger.exception("[WebChatGateway] persist conversation failed")
-
+        # CM persistence is owned by ConversationService.record_chat_pair so
+        # the streaming/incomplete path can persist partial replies through
+        # the same code path.
         return reply
 
     async def generate_reply_stream(
@@ -234,16 +213,8 @@ class LlmBridge:
             if not full:
                 raise RuntimeError("empty_reply")
 
-            try:
-                await cm.add_message_pair(
-                    cid=cid,
-                    user_message=UserMessageSegment(content=[TextPart(text=message)]),
-                    assistant_message=AssistantMessageSegment(
-                        content=[TextPart(text=full)]
-                    ),
-                )
-            except Exception:
-                logger.exception("[WebChatGateway] persist conversation failed")
+            # CM persistence is owned by ConversationService.record_chat_pair
+            # so partial-reply (incomplete) flows persist via the same path.
 
         # Per-chunk idle timeout, NOT a total wall-clock budget. Streaming
         # responses are explicitly unbounded in length (a search-augmented
@@ -253,23 +224,58 @@ class LlmBridge:
         # max gap between consecutive chunks (and the max time before the
         # first chunk). Non-streaming `generate_reply` retains its total
         # wall-clock semantics — see asyncio.wait_for in that method.
+        #
+        # Persistent-pull pattern: a single in-flight `__anext__()` Task
+        # is reused across iterations and shielded from `wait_for`
+        # cancellation. Calling `__anext__()` on a fresh task each
+        # iteration would leave the previous call running in the
+        # background; the next iteration's call would then crash with
+        # "asynchronous generator is already running". With shield, a
+        # timeout raises but the inner pull keeps running, ready for the
+        # next iteration to await it again — until we explicitly cancel
+        # it on the timeout path below before raising llm_timeout.
         agen = _runner()
+        pull_task: asyncio.Task | None = None
         try:
             while True:
+                if pull_task is None:
+                    pull_task = asyncio.ensure_future(agen.__anext__())
                 try:
                     if self._timeout:
-                        try:
-                            text = await asyncio.wait_for(
-                                agen.__anext__(), timeout=self._timeout
-                            )
-                        except asyncio.TimeoutError as exc:
-                            raise RuntimeError("llm_timeout") from exc
+                        text = await asyncio.wait_for(
+                            asyncio.shield(pull_task),
+                            timeout=self._timeout,
+                        )
                     else:
-                        text = await agen.__anext__()
+                        text = await pull_task
+                except asyncio.TimeoutError as exc:
+                    pull_task.cancel()
+                    try:
+                        await pull_task
+                    except (
+                        asyncio.CancelledError,
+                        StopAsyncIteration,
+                        Exception,
+                    ):
+                        pass
+                    pull_task = None
+                    raise RuntimeError("llm_timeout") from exc
                 except StopAsyncIteration:
+                    pull_task = None
                     return
+                pull_task = None
                 yield text
         finally:
+            if pull_task is not None and not pull_task.done():
+                pull_task.cancel()
+                try:
+                    await pull_task
+                except (
+                    asyncio.CancelledError,
+                    StopAsyncIteration,
+                    Exception,
+                ):
+                    pass
             await agen.aclose()
 
     # ----- Title generation -----

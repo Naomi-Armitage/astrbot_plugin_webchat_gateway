@@ -17,6 +17,12 @@ import DOMPurify from "dompurify";
 const LS_USERNAME = "wcg.username";
 const LS_STORE = "wcg.chat.sessions";
 const LS_LAST_PTS = "wcg.chat.lastPts";
+// Pending streams live in their own LS slot so the persist-every-N-chunks
+// hot path doesn't have to re-serialize the entire ChatStore (which can be
+// hundreds of KB for a chatty user). A 200KB streaming reply was costing
+// ~20 full-store JSON.stringifies and triggering frame jank on weaker
+// hardware. Splitting it keeps streaming writes O(small).
+const LS_PENDING_STREAMS = "wcg.chat.pending_streams";
 
 const API = "/api/webchat";
 const CHAT_URL = `${API}/chat`;
@@ -99,7 +105,7 @@ function fetchWithTimeout(
 
 type Role = "user" | "bot" | "error" | "notice";
 type ServerRole = "user" | "assistant";
-interface HistoryItem { role: Role; text: string; ts: number; }
+interface HistoryItem { role: Role; text: string; ts: number; incomplete?: boolean; }
 interface SessionMeta {
   id: string;
   title: string;
@@ -108,7 +114,28 @@ interface SessionMeta {
   lastActiveAt: number;
   history: HistoryItem[];
 }
-interface ChatStore { activeId: string; sessions: Record<string, SessionMeta>; }
+// Survives refresh. When the SSE stream is interrupted (network drop, page
+// reload) we preserve enough state here to attach back to the same server
+// stream via GET /chat/stream/{id}/resume?after_seq=N.
+//   * stream_id: opaque token assigned by the server in the first SSE data frame.
+//   * last_seq: highest seq we've already consumed; the resume endpoint
+//     replays seq>last_seq plus continues live.
+//   * pending_text: rehydrate seed for the streaming bubble — what the bubble
+//     looked like at last_seq, so a refresh can show the partial immediately
+//     before the resume socket starts delivering more chunks.
+//   * started_at: client-side ms timestamp; useful for diagnostics + future TTL.
+interface PendingStream {
+  stream_id: string;
+  session_id: string;
+  last_seq: number;
+  pending_text: string;
+  started_at: number;
+}
+interface ChatStore {
+  activeId: string;
+  sessions: Record<string, SessionMeta>;
+  pendingStreams: Record<string, PendingStream>;
+}
 
 interface ServerSessionListItem {
   session_id: string;
@@ -123,7 +150,7 @@ interface ServerConversationsResponse {
   last_pts: number;
   conversations: ServerSessionListItem[];
 }
-interface ServerMessage { role: ServerRole; content: string; ts?: number; }
+interface ServerMessage { role: ServerRole; content: string; ts?: number; incomplete?: boolean; }
 interface ServerConversationDetail {
   session_id: string;
   title: string;
@@ -132,7 +159,13 @@ interface ServerConversationDetail {
   updated_at: number;
   messages: ServerMessage[];
 }
-type EventType = "session_created" | "session_meta_updated" | "history_cleared" | "message_added";
+type EventType =
+  | "session_created"
+  | "session_meta_updated"
+  | "history_cleared"
+  | "message_added"
+  | "stream_started"
+  | "stream_ended";
 interface ServerEvent {
   pts: number;
   ts: number;
@@ -172,6 +205,7 @@ const nowSec = (): number => Math.floor(Date.now() / 1000);
 function isHistoryItem(it: unknown): it is HistoryItem {
   if (!it || typeof it !== "object") return false;
   const o = it as Record<string, unknown>;
+  if (o.incomplete !== undefined && typeof o.incomplete !== "boolean") return false;
   return typeof o.text === "string" && typeof o.ts === "number" &&
     (o.role === "user" || o.role === "bot" || o.role === "error" || o.role === "notice");
 }
@@ -183,6 +217,13 @@ function isSessionMeta(it: unknown): it is SessionMeta {
   return typeof o.id === "string" && typeof o.title === "string" &&
     typeof o.lastActiveAt === "number" && Array.isArray(o.history) && o.history.every(isHistoryItem);
 }
+function isPendingStream(it: unknown): it is PendingStream {
+  if (!it || typeof it !== "object") return false;
+  const o = it as Record<string, unknown>;
+  return typeof o.stream_id === "string" && typeof o.session_id === "string" &&
+    typeof o.last_seq === "number" && typeof o.pending_text === "string" &&
+    typeof o.started_at === "number";
+}
 
 // Cache-only loader. Server is authoritative; this just gets us a non-blank
 // first paint while the cold refetch is in flight. Corrupt JSON → blank store.
@@ -191,7 +232,7 @@ function loadStore(): ChatStore {
   try { parsed = JSON.parse(localStorage.getItem(LS_STORE) || "null"); } catch {}
   if (!parsed || typeof parsed !== "object") {
     const fresh = blankSession();
-    return { activeId: fresh.id, sessions: { [fresh.id]: fresh } };
+    return { activeId: fresh.id, sessions: { [fresh.id]: fresh }, pendingStreams: loadPendingStreams() };
   }
   const p = parsed as Record<string, unknown>;
   const sessIn = (p.sessions && typeof p.sessions === "object") ? p.sessions as Record<string, unknown> : {};
@@ -204,7 +245,31 @@ function loadStore(): ChatStore {
     activeId = best;
   }
   if (!activeId) { const fresh = blankSession(); sessions[fresh.id] = fresh; activeId = fresh.id; }
-  return { activeId, sessions };
+  // pendingStreams now persists to its own LS key. Anything still embedded
+  // in the main store is from a build that was running between the v2 ship
+  // and this fix; absorb it here so we don't lose an in-flight resume on
+  // refresh, then a saveStore() at the end of this function will rewrite
+  // the main blob without the field.
+  const legacyPendingIn = (p.pendingStreams && typeof p.pendingStreams === "object")
+    ? p.pendingStreams as Record<string, unknown>
+    : {};
+  const pendingStreams = loadPendingStreams();
+  for (const [k, v] of Object.entries(legacyPendingIn)) {
+    if (pendingStreams[k]) continue;
+    if (isPendingStream(v) && v.session_id === k) pendingStreams[k] = v;
+  }
+  return { activeId, sessions, pendingStreams };
+}
+
+function loadPendingStreams(): Record<string, PendingStream> {
+  let parsed: unknown = null;
+  try { parsed = JSON.parse(localStorage.getItem(LS_PENDING_STREAMS) || "null"); } catch {}
+  if (!parsed || typeof parsed !== "object") return {};
+  const out: Record<string, PendingStream> = {};
+  for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+    if (isPendingStream(v) && v.session_id === k) out[k] = v;
+  }
+  return out;
 }
 
 function loadLastPts(): number {
@@ -221,14 +286,29 @@ function deriveTitle(history: HistoryItem[]): string {
 }
 
 const store: ChatStore = loadStore();
-const saveStore = (): void => { try { localStorage.setItem(LS_STORE, JSON.stringify(store)); } catch {} };
+// Main store does NOT include pendingStreams — that lives in its own LS
+// key (LS_PENDING_STREAMS) so the persist-every-N-chunks hot path doesn't
+// re-serialize the entire history. The destructure picks out the fields we
+// actually want to persist.
+const saveStore = (): void => {
+  try {
+    const { activeId, sessions } = store;
+    localStorage.setItem(LS_STORE, JSON.stringify({ activeId, sessions }));
+  } catch {}
+};
+const savePendingStreams = (): void => {
+  try { localStorage.setItem(LS_PENDING_STREAMS, JSON.stringify(store.pendingStreams)); } catch {}
+};
 const saveLastPts = (pts: number): void => { try { localStorage.setItem(LS_LAST_PTS, String(pts)); } catch {} };
 const currentSession = (): SessionMeta => store.sessions[store.activeId]!;
 const serverRoleToLocal = (r: ServerRole): Role => r === "assistant" ? "bot" : "user";
 
 function replayActive(): void {
   clearMsgList();
-  for (const item of currentSession().history) addMessageBubble(item.role, item.text);
+  for (const item of currentSession().history) {
+    addMessageBubble(item.role, item.text);
+    if (item.role === "bot" && item.incomplete) appendIncompleteNoticeToLastBubble();
+  }
   scrollToEnd();
 }
 
@@ -307,6 +387,21 @@ function addMessageBubble(role: Role, text: string): void {
 const scrollToEnd = (): void => { msgs.scrollTop = msgs.scrollHeight; };
 const clearMsgList = (): void => { msgs.querySelectorAll(".msg").forEach((m) => m.remove()); };
 
+// Append a "（回复未完整）" notice to the most recently rendered bot bubble
+// (assumed to be the last `.msg.bot` in the message list). Used by the
+// history-replay path when a stored assistant message has `incomplete: true`,
+// and by the resume path when the server's terminal frame says incomplete.
+function appendIncompleteNoticeToLastBubble(): void {
+  const list = msgs.querySelectorAll<HTMLDivElement>(".msg.bot");
+  const last = list.length ? list[list.length - 1] : null;
+  if (!last) return;
+  if (last.querySelector(".stream-notice.incomplete")) return;
+  const note = document.createElement("div");
+  note.className = "stream-notice incomplete";
+  note.textContent = "（回复未完整）";
+  last.appendChild(note);
+}
+
 function showTyping(): void {
   if (document.getElementById("_typing")) return;
   const t = document.createElement("div");
@@ -357,9 +452,24 @@ interface SyncState {
   consecutiveBackoffSteps: number;   // index into BACKOFF_LADDER_MS while in offline-ish state
   stopped: boolean;                  // logout sets this; loops bail out
   loopRunning: boolean;              // re-entrancy guard for runLongPoll/runShortPoll
-  streamAbort: AbortController | null;  // active /chat/stream fetch+reader; null when not streaming
+  streamAbort: AbortController | null;  // active /chat/stream POST fetch+reader; null when not streaming
   streamFailedAt: number[];          // ms timestamps of recent /chat/stream failures
   streamSkipRemaining: number;       // sends to bypass /chat/stream after a trip
+  // Per-session resume controllers. A resume runs in the background even
+  // after the user switches away from the session, so we track who owns
+  // each one to avoid double-attaching when the user comes back. Cleared
+  // when the resume settles (success/failure/abort).
+  activeResumeAborts: Record<string, AbortController>;
+  // Peer-device stream notifications keyed by session_id. Populated by
+  // the long-poll `stream_started` event and consumed when the user opens
+  // the session (which triggers attemptCrossDeviceLiveAttach). NOT
+  // persisted — these are ephemeral cues, not durable state.
+  peerStreamsBySession: Record<string, string>;
+  // Sessions with a typing indicator on their sidebar entry (because a
+  // peer device is currently driving a stream there). Mirrors the set
+  // implied by peerStreamsBySession but kept explicit so renderSessionList
+  // can dot the entry without re-checking activeResumeAborts.
+  sidebarTypingFor: Set<string>;
 }
 
 const sync: SyncState = {
@@ -376,6 +486,9 @@ const sync: SyncState = {
   streamAbort: null,
   streamFailedAt: [],
   streamSkipRemaining: 0,
+  activeResumeAborts: {},
+  peerStreamsBySession: {},
+  sidebarTypingFor: new Set(),
 };
 setSyncStatus("live");
 
@@ -496,12 +609,22 @@ function applyEvent(ev: ServerEvent): void {
     case "message_added": {
       const role = payload["role"];
       const content = payload["content"];
+      const incomplete = payload["incomplete"] === true;
       if ((role !== "user" && role !== "assistant") || typeof content !== "string") break;
       // Dedup: if we already rendered this locally on this device, drop the event.
       if (consumeIfDuplicate(sid, role, content, ev.ts)) {
         // Still bump lastActiveAt so the sidebar order matches the server.
         const s = store.sessions[sid];
         if (s) s.lastActiveAt = Math.max(s.lastActiveAt, ev.ts * 1000);
+        // If the originating-device dedup matched but the server says
+        // incomplete and the locally-stored entry doesn't, patch the flag
+        // so a future replay shows the notice. The bubble already on
+        // screen was rendered (potentially with its own notice) by the
+        // streaming path; nothing to mutate there.
+        if (incomplete && role === "assistant") {
+          const last = s?.history[s.history.length - 1];
+          if (last && last.role === "bot" && last.text === content) last.incomplete = true;
+        }
         break;
       }
       let sess = store.sessions[sid];
@@ -510,12 +633,60 @@ function applyEvent(ev: ServerEvent): void {
         store.sessions[sid] = sess;
       }
       const localRole: Role = serverRoleToLocal(role as ServerRole);
-      sess.history.push({ role: localRole, text: content, ts: ev.ts * 1000 });
+      const item: HistoryItem = { role: localRole, text: content, ts: ev.ts * 1000 };
+      if (incomplete && role === "assistant") item.incomplete = true;
+      sess.history.push(item);
       sess.lastActiveAt = ev.ts * 1000;
       if (role === "user" && (sess.title === "新会话" || !sess.title)) {
         sess.title = deriveTitle(sess.history);
       }
-      if (sid === store.activeId) addMessageBubble(localRole, content);
+      if (sid === store.activeId) {
+        addMessageBubble(localRole, content);
+        if (item.incomplete) appendIncompleteNoticeToLastBubble();
+      }
+      break;
+    }
+    case "stream_started": {
+      const streamId = payload["stream_id"];
+      if (typeof streamId !== "string" || !streamId) break;
+      // Three cases:
+      //   1. Originating device, SSE-first-frame already landed — local
+      //      PendingStream has the same stream_id; an attach here would
+      //      duplicate the active driver. Skip.
+      //   2. Originating device, SSE-first-frame hasn't landed yet but
+      //      the POST is in flight (sync.streamAbort set, sid is active).
+      //      Skip; the SSE will deliver chunks to the existing bubble.
+      //   3. Peer device — no local pending state for this stream_id, no
+      //      active POST. Trigger live attach (active session) or sidebar
+      //      mark (closed).
+      const localPending = store.pendingStreams[sid];
+      if (localPending && localPending.stream_id === streamId) break;
+      if (sync.streamAbort && sid === store.activeId) break;
+      // Already running a resume for this session (e.g. duplicate
+      // long-poll delivery from has_more retry) — don't double-attach.
+      if (sync.activeResumeAborts[sid]) break;
+      sync.peerStreamsBySession[sid] = streamId;
+      sync.sidebarTypingFor.add(sid);
+      if (sid === store.activeId) {
+        // Fire-and-forget; live attach manages its own lifecycle and
+        // surfaces failures inline. Errors landing here are already
+        // reported on the bubble or notice channel.
+        void attemptCrossDeviceLiveAttach(sid, streamId);
+      }
+      break;
+    }
+    case "stream_ended": {
+      const streamId = payload["stream_id"];
+      // Drop sidebar typing indicator + clear the peer stream entry. The
+      // message_added events that landed in the same long-poll block
+      // already populated the bubble (existing dedup window covers it).
+      // We do NOT abort an in-flight resume here: the resume's own
+      // terminal frame is the authoritative completion signal, and
+      // cancelling it could drop chunks that haven't been parsed yet.
+      const peerStream = sync.peerStreamsBySession[sid];
+      if (typeof streamId === "string" && peerStream && peerStream !== streamId) break;
+      delete sync.peerStreamsBySession[sid];
+      sync.sidebarTypingFor.delete(sid);
       break;
     }
   }
@@ -596,11 +767,15 @@ function ingestConversationDetail(detail: ServerConversationDetail): void {
   if (typeof detail.title_manual === "boolean") sess.titleManual = detail.title_manual;
   if (typeof detail.pinned === "boolean") sess.pinned = detail.pinned;
   sess.lastActiveAt = detail.updated_at * 1000;
-  sess.history = detail.messages.map((m) => ({
-    role: serverRoleToLocal(m.role),
-    text: m.content,
-    ts: (m.ts ?? detail.updated_at) * 1000,
-  }));
+  sess.history = detail.messages.map((m) => {
+    const item: HistoryItem = {
+      role: serverRoleToLocal(m.role),
+      text: m.content,
+      ts: (m.ts ?? detail.updated_at) * 1000,
+    };
+    if (m.role === "assistant" && m.incomplete === true) item.incomplete = true;
+    return item;
+  });
 }
 
 async function coldRefetch(): Promise<void> {
@@ -681,6 +856,11 @@ function handle401(): void {
   // pts is per-token; a stale value from the old token would make the
   // next login's long-poll trail the new token's max_pts indefinitely.
   localStorage.removeItem(LS_LAST_PTS);
+  // Pending streams reference server-side buffers tied to the OLD token.
+  // The new login can't resume them (cross-token resume returns 404 on
+  // purpose to avoid stream-existence enumeration), so leaving them on
+  // disk would just trigger a doomed resume on the next bootstrap.
+  localStorage.removeItem(LS_PENDING_STREAMS);
   location.replace("/login");
 }
 
@@ -870,7 +1050,16 @@ function renderSessionList(): void {
     const title = document.createElement("span");
     title.className = "session-title"; title.textContent = sess.title || "新会话";
     const time = document.createElement("span");
-    time.className = "session-time"; time.textContent = relativeTime(sess.lastActiveAt);
+    time.className = "session-time";
+    if (sync.sidebarTypingFor.has(sess.id)) {
+      // Peer device is currently driving a stream for this session that
+      // we're not actively attached to. Surface a tiny "正在输入…" cue on
+      // the sidebar entry's time line so the user knows there's activity
+      // they can tab into.
+      time.textContent = "正在输入…";
+    } else {
+      time.textContent = relativeTime(sess.lastActiveAt);
+    }
     pick.append(title, time);
     pick.addEventListener("click", () => switchSession(sess.id));
 
@@ -902,9 +1091,28 @@ function switchSession(id: string): void {
       if (!detail) return;
       ingestConversationDetail(detail);
       saveStore();
-      if (id === store.activeId) replayActive();
+      // Skip the rerender if a resume is in flight for this session: the
+      // streaming bubble is in the DOM and replayActive() would wipe it.
+      // The completed reply will land via the resume's finalize logic +
+      // long-poll's message_added (with dedup), so we won't lose state.
+      if (id === store.activeId && !sync.activeResumeAborts[id]) replayActive();
       renderSessionList();
     }).catch(() => {});
+    // Stream attach decisions, in priority order:
+    //   1. We already have a resume running for this session — leave it
+    //      alone (controller stays in activeResumeAborts).
+    //   2. We have a local PendingStream from a prior POST that didn't
+    //      reach `done` — try to resume it.
+    //   3. A peer device started a stream for this session and we got
+    //      stream_started while it wasn't open — attach now.
+    if (!sync.activeResumeAborts[id]) {
+      if (store.pendingStreams[id]) {
+        void attemptResumeOnLoad(id);
+      } else {
+        const peerStream = sync.peerStreamsBySession[id];
+        if (peerStream) void attemptCrossDeviceLiveAttach(id, peerStream);
+      }
+    }
   }
   closeMobileSidebar();
 }
@@ -1137,7 +1345,26 @@ class StreamChatError extends Error {
   }
 }
 
-interface StreamDoneInfo { remaining: number; daily_quota: number; }
+// Distinguishes a 404 stream_not_found from other resume failures so the
+// caller can fall through to the history-fetch / new-POST path quickly.
+class StreamNotFoundError extends Error {
+  constructor() {
+    super("stream_not_found");
+    this.name = "StreamNotFoundError";
+  }
+}
+
+interface StreamDoneInfo {
+  remaining: number;
+  daily_quota: number;
+  incomplete: boolean;
+  stream_id: string;
+}
+
+// Per-chunk callback. `seq` is the chunk's sequence number from the wire;
+// for legacy frames (no `seq` field) callers receive a synthesized
+// last_seq + 1 so persistence accounting still works.
+type StreamChunkHandler = (seq: number, text: string) => void;
 
 // Streaming requires Response.body (a ReadableStream). All evergreen
 // browsers ship it, but Safari versions before 15.1 / older mobile WebViews
@@ -1156,31 +1383,22 @@ function streamingSupported(): boolean {
 //     parsed as a single JSON object per the backend contract.
 //   - Anything else (event:, id:, retry:) is not used by this contract,
 //     so we silently skip those lines.
-async function streamChat(
-  sid: string,
-  message: string,
-  onChunk: (text: string) => void,
-  signal: AbortSignal,
+//
+// Wire format per PLAN_chat_streaming_v2.md:
+//   - First data frame: `{"stream_id": "..."}` (POST path only)
+//   - Each chunk: `{"chunk": "...", "seq": N}`
+//   - done: `{"done": true, "seq": N, "remaining": ..., "daily_quota": ..., "incomplete": bool}`
+//   - error: `{"error": "<code>", "seq": N}`
+// Legacy frames without `seq` are tolerated — we synthesize last_seq+1 so
+// the persistence path keeps advancing.
+async function consumeSseStream(
+  resp: Response,
+  ctx: {
+    onStreamId?: (id: string) => void;
+    onChunk: StreamChunkHandler;
+    initialSeq: number;
+  },
 ): Promise<StreamDoneInfo> {
-  const resp = await fetchWithTimeout(
-    CHAT_STREAM_URL,
-    {
-      method: "POST",
-      credentials: "same-origin",
-      headers: { "Content-Type": "application/json", ...bearer() },
-      body: JSON.stringify({ session_id: sid, username, message }),
-    },
-    FETCH_TIMEOUT_CHAT_MS,
-    signal,
-  );
-
-  if (!resp.ok) {
-    let payload: Record<string, unknown> = {};
-    try { payload = await resp.json() as Record<string, unknown>; } catch {}
-    const code = typeof payload.error === "string" ? payload.error : `http_${resp.status}`;
-    throw new StreamChatError(code, resp.status, code, payload);
-  }
-
   const ct = resp.headers.get("Content-Type") || "";
   if (!ct.toLowerCase().includes("text/event-stream") || !resp.body) {
     // Server returned 200 but not SSE — treat as unsupported endpoint so
@@ -1192,6 +1410,8 @@ async function streamChat(
   const decoder = new TextDecoder("utf-8", { fatal: false });
   let buffer = "";
   let doneInfo: StreamDoneInfo | null = null;
+  let lastSeq = ctx.initialSeq;
+  let streamId = "";
 
   const handleFrame = (frame: string): void => {
     if (!frame) return;
@@ -1216,17 +1436,32 @@ async function streamChat(
       // and never reach this path.
       return;
     }
+    // First frame on POST path is `{"stream_id":"..."}` with no chunk; the
+    // resume path never receives this frame because the client already
+    // knows the id. Legacy server may interleave it with a chunk in the
+    // same JSON object, so check for both shapes.
+    if (typeof obj.stream_id === "string" && !streamId) {
+      streamId = obj.stream_id;
+      ctx.onStreamId?.(streamId);
+    }
     if (typeof obj.chunk === "string") {
-      onChunk(obj.chunk);
+      const seq = typeof obj.seq === "number" ? obj.seq : lastSeq + 1;
+      lastSeq = Math.max(lastSeq, seq);
+      ctx.onChunk(seq, obj.chunk);
       return;
     }
     if (obj.done === true) {
       const remaining = typeof obj.remaining === "number" ? obj.remaining : 0;
       const daily = typeof obj.daily_quota === "number" ? obj.daily_quota : 0;
-      doneInfo = { remaining, daily_quota: daily };
+      const incomplete = obj.incomplete === true;
+      const seq = typeof obj.seq === "number" ? obj.seq : lastSeq + 1;
+      lastSeq = Math.max(lastSeq, seq);
+      doneInfo = { remaining, daily_quota: daily, incomplete, stream_id: streamId };
       return;
     }
     if (typeof obj.error === "string") {
+      const seq = typeof obj.seq === "number" ? obj.seq : lastSeq + 1;
+      lastSeq = Math.max(lastSeq, seq);
       throw new StreamChatError(obj.error, 0, obj.error, obj);
     }
   };
@@ -1261,6 +1496,94 @@ async function streamChat(
   }
 }
 
+async function streamChat(
+  sid: string,
+  message: string,
+  onChunk: StreamChunkHandler,
+  signal: AbortSignal,
+  onStreamId?: (id: string) => void,
+): Promise<StreamDoneInfo> {
+  // No fetch wall-clock timer here. The server's per-chunk idle timeout
+  // (default 60s, configurable via llm_timeout_seconds) plus the 20s
+  // `: keepalive` SSE comment is the source of truth for "is this stream
+  // alive?". A wall-clock cap on the frontend would kill long-running
+  // replies even when chunks are still flowing — the bug this fix is
+  // targeting. Cancellation is via the AbortController in `signal`
+  // (stop button, page unload, session-level lifecycle).
+  const resp = await fetch(CHAT_STREAM_URL, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json", ...bearer() },
+    body: JSON.stringify({ session_id: sid, username, message }),
+    signal,
+  });
+
+  if (!resp.ok) {
+    let payload: Record<string, unknown> = {};
+    try { payload = await resp.json() as Record<string, unknown>; } catch {}
+    const code = typeof payload.error === "string" ? payload.error : `http_${resp.status}`;
+    throw new StreamChatError(code, resp.status, code, payload);
+  }
+
+  return await consumeSseStream(resp, {
+    onStreamId,
+    onChunk,
+    initialSeq: -1,
+  });
+}
+
+// Reattach to a server-side stream that was created by a prior POST. Used
+// from three places:
+//   1. `runStreamingSend` recovery path — caller hit send while a
+//      PendingStream was still on disk (rare; usually bootstrap handles it).
+//   2. `attemptResumeOnLoad` on chat-page bootstrap / session switch.
+//   3. Cross-device live attach via the `stream_started` long-poll event.
+//
+// `after_seq = -1` means "give me everything"; otherwise the server replays
+// seq > after_seq plus continues live until terminal.
+async function resumeStream(
+  stream_id: string,
+  after_seq: number,
+  onChunk: StreamChunkHandler,
+  signal: AbortSignal,
+): Promise<StreamDoneInfo> {
+  const url = `${CHAT_STREAM_URL}/${encodeURIComponent(stream_id)}/resume?after_seq=${after_seq}`;
+  // Same reasoning as streamChat: no fetch wall-clock cap. The server's
+  // per-chunk idle timeout + 20s heartbeat is the liveness signal. Long
+  // resumes attaching to in-flight streams must not be killed by the
+  // frontend mid-stream.
+  const resp = await fetch(url, {
+    method: "GET",
+    credentials: "same-origin",
+    headers: bearer(),
+    signal,
+  });
+
+  if (resp.status === 404) {
+    let payload: Record<string, unknown> = {};
+    try { payload = await resp.json() as Record<string, unknown>; } catch {}
+    if (payload.error === "stream_not_found") throw new StreamNotFoundError();
+    // Other 404 (mistyped path, etc.) → bubble as generic error so the
+    // caller can decide whether to fall back to history-fetch.
+    throw new StreamChatError("stream_not_found", 404, "stream_not_found", payload);
+  }
+  if (resp.status === 401) {
+    handle401();
+    throw new StreamChatError("unauthorized", 401, "unauthorized");
+  }
+  if (!resp.ok) {
+    let payload: Record<string, unknown> = {};
+    try { payload = await resp.json() as Record<string, unknown>; } catch {}
+    const code = typeof payload.error === "string" ? payload.error : `http_${resp.status}`;
+    throw new StreamChatError(code, resp.status, code, payload);
+  }
+
+  return await consumeSseStream(resp, {
+    onChunk,
+    initialSeq: after_seq,
+  });
+}
+
 function setSendMode(mode: "send" | "stop"): void {
   sendBtn.dataset.mode = mode;
   sendBtn.setAttribute("aria-label", mode === "stop" ? "停止" : "发送");
@@ -1292,9 +1615,18 @@ async function send(): Promise<void> {
   // stop button, so only the streaming click path should reach abort, not
   // a second send().
   if (sync.streamAbort) return;
-  sendBtn.disabled = true;
   const sessBefore = currentSession();
   const sid = sessBefore.id;
+  // Resume-in-flight gate. A PendingStream means we're either mid-resume
+  // for a previous turn or have one queued from a refresh; firing a new
+  // POST now would either 429 concurrent_request server-side or, worse,
+  // race with the resume's persisted reply. Surface a soft notice and
+  // let the user wait for the existing stream to settle.
+  if (store.pendingStreams[sid] || sync.activeResumeAborts[sid]) {
+    addMessageBubble("notice", "正在恢复上一次回复…");
+    return;
+  }
+  sendBtn.disabled = true;
   const isFirstUserMsg = !sessBefore.history.some((h) => h.role === "user");
   const eligibleForAutoTitle = isFirstUserMsg && sessBefore.titleManual !== true;
 
@@ -1342,30 +1674,92 @@ async function send(): Promise<void> {
   }
 }
 
-// Returns "ok" if the stream completed (success, mid-stream error rendered
-// inline, or user-cancel after at least one chunk) and the caller should
-// stop. Returns "fallback" if the streaming attempt failed before any
-// content reached the bubble and the caller should retry via /chat.
-async function runStreamingSend(sid: string, message: string): Promise<"ok" | "fallback"> {
+// Outcome of a single streaming bubble's lifecycle. "ok" includes
+// successful completion, partial-with-content, and user-cancel-after-chunk.
+// "fallback" means the stream attempt failed before any chunk made it to
+// the bubble and the caller should retry via /chat (only the POST path
+// uses this — resume callers always return "ok" because there's no
+// fallback action that makes sense for a server-side stream we attached
+// to after the fact).
+type StreamingOutcome = "ok" | "fallback";
+
+// Snapshot of streaming progress passed to onBeforeFinalize for the
+// race-guard against long-poll's already-emitted message_added.
+interface StreamingFinalizeSnapshot {
+  pending: string;
+  bubble: HTMLDivElement;
+  incomplete: boolean;
+}
+
+// Configuration for a streaming bubble attachment. Three call sites:
+//   1. POST send: kind="post", takes the per-send AbortController as
+//      sync.streamAbort, registers itself in pendingStreams once the
+//      first stream_id frame arrives, and runs streamChat.
+//   2. Recovery resume on bootstrap or session-switch: kind="resume",
+//      seeded with PendingStream.pending_text + last_seq, runs resumeStream.
+//   3. Peer-device live attach via stream_started event: kind="peer",
+//      attaches with after_seq=-1 and no pre-rendered text, runs resumeStream.
+interface StreamingAttachOpts {
+  sid: string;
+  kind: "post" | "resume" | "peer";
+  // For "post": the message body to send. Unused otherwise.
+  message?: string;
+  // For "resume": the stream_id and last_seq to attach with. Unused for "post".
+  streamId?: string;
+  afterSeq?: number;
+  // For "resume": text already rendered before page reload, used to seed
+  // the bubble immediately so the user sees something while the resume
+  // socket reconnects.
+  initialText?: string;
+}
+
+// Heart of the streaming machinery — hosts a single streaming bubble for a
+// given session and drives it to completion via either streamChat or
+// resumeStream. Shared between the POST, recovery-resume, and peer-attach
+// code paths so the bubble lifecycle is identical across them.
+async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<StreamingOutcome> {
+  const { sid, kind } = opts;
   const ac = new AbortController();
-  sync.streamAbort = ac;
-  setSendMode("stop");
-  // Stop button must remain clickable while the rest of the composer is
-  // disabled-ish; sendBtn.disabled was set true at the top of send(), so
-  // re-enable it here for the duration of the stream.
-  sendBtn.disabled = false;
+  if (kind === "post") {
+    sync.streamAbort = ac;
+    setSendMode("stop");
+    sendBtn.disabled = false;
+  } else {
+    // For resume / peer attach, register the controller in
+    // activeResumeAborts so a duplicate stream_started or a session-switch
+    // can detect "already attached" and skip starting a second resume.
+    sync.activeResumeAborts[sid] = ac;
+  }
 
   // Empty bot bubble that chunks render into. The streaming class drives
   // the blinking caret; on completion we strip it so the bubble settles.
   hideTyping();
-  const bubble = document.createElement("div");
+  const bubble = document.createElement("div") as HTMLDivElement;
   bubble.className = "msg bot md streaming";
   msgs.appendChild(bubble);
   scrollToEnd();
 
+  // Resume-from-refresh seed: the user already saw `initialText` rendered
+  // before the page reload. Show it back immediately so the bubble isn't
+  // empty during the reconnect handshake.
   let pending = "";
-  let renderTimer: number | null = null;
   let firstChunkSeen = false;
+  if (kind === "resume" && typeof opts.initialText === "string" && opts.initialText.length) {
+    pending = opts.initialText;
+    bubble.innerHTML = renderMarkdown(pending);
+    firstChunkSeen = true;
+    scrollToEnd();
+  }
+
+  let renderTimer: number | null = null;
+  let lastSeq = typeof opts.afterSeq === "number" ? opts.afterSeq : -1;
+  let streamId = typeof opts.streamId === "string" ? opts.streamId : "";
+  // Persist the PendingStream periodically so a refresh halfway through a
+  // long reply doesn't lose ground. Every CHUNKS_PER_PERSIST chunks is a
+  // good balance: cheap enough to not thrash localStorage, frequent
+  // enough to bound rewind on refresh.
+  const CHUNKS_PER_PERSIST = 10;
+  let chunksSincePersist = 0;
 
   const flushRender = (): void => {
     bubble.innerHTML = renderMarkdown(pending);
@@ -1385,17 +1779,65 @@ async function runStreamingSend(sid: string, message: string): Promise<"ok" | "f
     }
   };
 
-  const onChunk = (text: string): void => {
-    firstChunkSeen = true;
-    pending += text;
-    scheduleRender();
+  const persistPending = (): void => {
+    if (!streamId) return;
+    store.pendingStreams[sid] = {
+      stream_id: streamId,
+      session_id: sid,
+      last_seq: lastSeq,
+      pending_text: pending,
+      started_at: store.pendingStreams[sid]?.started_at ?? Date.now(),
+    };
+    savePendingStreams();
+  };
+  const clearPending = (): void => {
+    if (store.pendingStreams[sid]) {
+      delete store.pendingStreams[sid];
+      savePendingStreams();
+    }
   };
 
-  const finalizeOk = (info: StreamDoneInfo): void => {
+  const onStreamId = (id: string): void => {
+    streamId = id;
+    // Persist immediately on the first stream_id frame so a refresh
+    // BEFORE any chunks arrive can still resume.
+    persistPending();
+  };
+
+  const onChunk: StreamChunkHandler = (seq, text) => {
+    firstChunkSeen = true;
+    pending += text;
+    if (seq > lastSeq) lastSeq = seq;
+    scheduleRender();
+    chunksSincePersist += 1;
+    if (chunksSincePersist >= CHUNKS_PER_PERSIST) {
+      chunksSincePersist = 0;
+      persistPending();
+    }
+  };
+
+  // Render the small notice + persist + dedup-record. Used by both
+  // settlePartial (network drop / abort) and finalizeOk-incomplete
+  // (server's done frame says incomplete). The two callers differ only
+  // in which notice text and which kind of `incomplete` flag they record.
+  const finalizeBubble = (
+    snapshot: StreamingFinalizeSnapshot,
+    noticeKind: "" | "incomplete" | "interrupted" | "error",
+  ): void => {
     cancelRender();
     flushRender();
     bubble.classList.remove("streaming");
-    setBadge(info.remaining, info.daily_quota);
+    if (noticeKind) {
+      const note = document.createElement("div");
+      const isIncomplete = noticeKind === "incomplete";
+      note.className = isIncomplete ? "stream-notice incomplete" : "stream-notice";
+      note.textContent = isIncomplete
+        ? "（回复未完整）"
+        : noticeKind === "interrupted"
+          ? "[已中断]"
+          : "[网络中断]";
+      bubble.appendChild(note);
+    }
     const sess = store.sessions[sid];
     if (sess) {
       // Race-guard, mirror of the non-stream fix in commit 59d5da3:
@@ -1410,18 +1852,29 @@ async function runStreamingSend(sid: string, message: string): Promise<"ok" | "f
       // recordOptimistic (no future event will match).
       const tail = sess.history.slice(-2);
       const echoedByEvent = tail.some(
-        (h) => h.role === "bot" && h.text === pending && (Date.now() - h.ts) < 30_000,
+        (h) => h.role === "bot" && h.text === snapshot.pending && (Date.now() - h.ts) < 30_000,
       );
       if (echoedByEvent) {
         bubble.remove();
         return;
       }
-      sess.history.push({ role: "bot", text: pending, ts: Date.now() });
+      const item: HistoryItem = { role: "bot", text: snapshot.pending, ts: Date.now() };
+      if (snapshot.incomplete) item.incomplete = true;
+      sess.history.push(item);
       sess.lastActiveAt = Date.now();
       saveStore();
       renderSessionList();
     }
-    recordOptimistic(sid, "assistant", pending);
+    recordOptimistic(sid, "assistant", snapshot.pending);
+  };
+
+  const finalizeOk = (info: StreamDoneInfo): void => {
+    setBadge(info.remaining, info.daily_quota);
+    finalizeBubble(
+      { pending, bubble, incomplete: info.incomplete },
+      info.incomplete ? "incomplete" : "",
+    );
+    clearPending();
   };
 
   // Drop the empty/partial bubble. Used when the stream attempt fails
@@ -1429,44 +1882,55 @@ async function runStreamingSend(sid: string, message: string): Promise<"ok" | "f
   const discardBubble = (): void => {
     cancelRender();
     bubble.remove();
+    clearPending();
   };
 
-  // Settle the partial bubble when something cut the stream off after at
-  // least one chunk arrived. We keep what was rendered, append a small
-  // notice, and persist to history + dedup so a future `message_added`
-  // event for the (potentially identical) full reply doesn't double-render.
-  const settlePartial = (noticeText: string): void => {
-    cancelRender();
-    flushRender();
-    bubble.classList.remove("streaming");
-    if (noticeText) {
-      const note = document.createElement("div");
-      note.className = "stream-notice";
-      note.textContent = noticeText;
-      bubble.appendChild(note);
-    }
-    const sess = store.sessions[sid];
-    if (sess) {
-      sess.history.push({ role: "bot", text: pending, ts: Date.now() });
-      sess.lastActiveAt = Date.now();
-      saveStore();
-      renderSessionList();
-    }
-    recordOptimistic(sid, "assistant", pending);
+  const settlePartial = (kind2: "interrupted" | "error" | "incomplete", incomplete: boolean): void => {
+    finalizeBubble({ pending, bubble, incomplete }, kind2);
+    clearPending();
   };
 
   try {
-    const info = await streamChat(sid, message, onChunk, ac.signal);
+    let info: StreamDoneInfo;
+    if (kind === "post") {
+      info = await streamChat(sid, opts.message ?? "", onChunk, ac.signal, onStreamId);
+    } else {
+      info = await resumeStream(streamId, lastSeq, onChunk, ac.signal);
+    }
     finalizeOk(info);
     return "ok";
   } catch (e) {
     const err = e as { name?: string; message?: string };
     const isAbort = err.name === "AbortError";
     const sce = e instanceof StreamChatError ? e : null;
+    const notFound = e instanceof StreamNotFoundError;
+
+    if (notFound) {
+      // Resume target is gone (past the 30s grace TTL or never existed).
+      // For "resume" kind we have rendered partial text; settle it as
+      // incomplete and let the long-poll's eventual message_added (if any)
+      // dedup against this entry.
+      if (kind === "resume" && firstChunkSeen) {
+        settlePartial("incomplete", true);
+        return "ok";
+      }
+      // Peer attach landed too late — server already evicted the buffer.
+      // Drop the empty bubble; the message_added events that were emitted
+      // alongside stream_ended will populate history through applyEvent.
+      discardBubble();
+      return "ok";
+    }
 
     if (isAbort) {
       if (firstChunkSeen) {
-        settlePartial("[已中断]");
+        settlePartial("interrupted", false);
+        // For "post" we DO leave PendingStream in place so a refresh
+        // resumes (server-side keeps generating). The clearPending() in
+        // settlePartial above already removed it; re-persist on abort
+        // for the post path. Resume-kind aborts (session switch with
+        // "abort+restart" choice) also re-persist so the next attach
+        // picks up where this one left off.
+        persistPending();
         return "ok";
       }
       // User cancelled before any text arrived: drop the empty bubble and
@@ -1479,9 +1943,23 @@ async function runStreamingSend(sid: string, message: string): Promise<"ok" | "f
     // to /chat which renders the appropriate inline error using existing
     // status-aware copy. Drop the empty bubble first.
     if (sce && sce.status >= 400 && sce.status < 600) {
-      discardBubble();
-      recordStreamFailure();
-      return "fallback";
+      if (kind === "post") {
+        discardBubble();
+        recordStreamFailure();
+        return "fallback";
+      }
+      // Resume / peer attach: surface the error inline so the user knows
+      // the recovery failed; long-poll will eventually backfill via
+      // message_added if the server persisted anything. Don't drop the
+      // bubble if we already painted the seeded partial — keep it visible
+      // so the user doesn't see content disappear, settle it as incomplete.
+      if (firstChunkSeen) {
+        settlePartial("incomplete", true);
+      } else {
+        discardBubble();
+      }
+      addMessageBubble("error", streamErrorCopy(sce.code));
+      return "ok";
     }
 
     // Mid-stream error frame from the server (`data: {"error": "..."}`).
@@ -1500,8 +1978,10 @@ async function runStreamingSend(sid: string, message: string): Promise<"ok" | "f
       // it as "the service is broken".
       const isTimeout = sce.code === "llm_timeout";
       if (firstChunkSeen) {
-        settlePartial(isTimeout ? "（回复未完整传输）" : "");
-        if (!isTimeout) {
+        if (isTimeout) {
+          settlePartial("incomplete", true);
+        } else {
+          settlePartial("error", false);
           addMessageBubble("error", streamErrorCopy(sce.code));
         }
         return "ok";
@@ -1519,24 +1999,84 @@ async function runStreamingSend(sid: string, message: string): Promise<"ok" | "f
     // generating; a second hit would either 429 concurrent_request or
     // double-charge quota). If we have nothing, fall back.
     if (firstChunkSeen) {
-      settlePartial("[网络中断]");
-      recordStreamFailure();
+      settlePartial("error", false);
+      // Leave PendingStream alive on net-drop so a future attach can
+      // recover; settlePartial cleared it, restore.
+      persistPending();
+      if (kind === "post") recordStreamFailure();
       return "ok";
     }
     discardBubble();
-    recordStreamFailure();
-    return "fallback";
+    if (kind === "post") {
+      recordStreamFailure();
+      return "fallback";
+    }
+    return "ok";
   } finally {
-    if (sync.streamAbort === ac) sync.streamAbort = null;
-    setSendMode("send");
+    if (kind === "post") {
+      if (sync.streamAbort === ac) sync.streamAbort = null;
+      setSendMode("send");
+    } else {
+      if (sync.activeResumeAborts[sid] === ac) delete sync.activeResumeAborts[sid];
+    }
   }
+}
+
+// Returns "ok" if the stream completed (success, mid-stream error rendered
+// inline, or user-cancel after at least one chunk) and the caller should
+// stop. Returns "fallback" if the streaming attempt failed before any
+// content reached the bubble and the caller should retry via /chat.
+async function runStreamingSend(sid: string, message: string): Promise<"ok" | "fallback"> {
+  return await attachStreamingBubble({ sid, kind: "post", message });
+}
+
+// Called when the chat page boots or when the user switches sessions. If
+// a PendingStream exists for the session we attach to it via resume; the
+// rendered partial pops up immediately and the resume socket continues
+// from last_seq. On 404 (past grace TTL) we drop the pending state and
+// settle the bubble with the incomplete notice; the long-poll will fill
+// in the actual completed message_added when (and if) it lands.
+async function attemptResumeOnLoad(sid: string): Promise<void> {
+  const pending = store.pendingStreams[sid];
+  if (!pending) return;
+  if (sync.activeResumeAborts[sid]) return;
+  await attachStreamingBubble({
+    sid,
+    kind: "resume",
+    streamId: pending.stream_id,
+    afterSeq: pending.last_seq,
+    initialText: pending.pending_text,
+  });
+}
+
+// Called on `stream_started` long-poll events for a session whose stream
+// the local device did NOT POST (different tab or different device on
+// the same token). When the session is currently open we attach with
+// after_seq=-1 so we receive every chunk live. When it's not open the
+// caller (applyEvent) just pins the stream_id into peerStreamsBySession
+// so a later session-open triggers this same path.
+async function attemptCrossDeviceLiveAttach(sid: string, streamId: string): Promise<void> {
+  if (sync.activeResumeAborts[sid]) return;
+  await attachStreamingBubble({
+    sid,
+    kind: "peer",
+    streamId,
+    afterSeq: -1,
+  });
+  // After the peer attach settles (success or failure), drop any stale
+  // sidebar typing indicator. The stream_ended event is the authoritative
+  // signal but covering this in the success-path keeps the indicator from
+  // sticking if we lose the long-poll connection mid-stream.
+  delete sync.peerStreamsBySession[sid];
+  sync.sidebarTypingFor.delete(sid);
+  renderSessionList();
 }
 
 function streamErrorCopy(code: string): string {
   // llm_timeout is flow-control, not a failure — the message reflects
   // that and gives the user actionable advice instead of "稍后再试"
   // (which implies a transient outage that will heal on its own).
-  if (code === "llm_timeout") return "上游回复速度过慢，本次未生成完成。可换种说法或缩短问题后重新提问。";
+  if (code === "llm_timeout") return "这次回复没有完整生成。可以重新发送；如果任务较大，请缩小范围或分步提问。";
   if (code === "llm_call_failed") return "上游模型调用失败，请稍后再试。";
   if (code === "stream_truncated") return "流式响应被截断。";
   return `请求失败: ${code}`;
@@ -1626,7 +2166,7 @@ $<HTMLButtonElement>("logout").onclick = () => {
   clearTimer("shortPollTimer");
   clearTimer("probeTimer");
   clearTimer("retryTimer");
-  for (const k of [LS_TOKEN, LS_USERNAME, LS_STORE, LS_LAST_PTS]) localStorage.removeItem(k);
+  for (const k of [LS_TOKEN, LS_USERNAME, LS_STORE, LS_LAST_PTS, LS_PENDING_STREAMS]) localStorage.removeItem(k);
   location.replace("/");
 };
 
@@ -1677,6 +2217,19 @@ void (async (): Promise<void> => {
     // long-poll loop — it will retry the events endpoint and surface failure
     // through the status badge.
     setSyncStatus("offline");
+  }
+  // Recovery resume on boot. If the active session has a PendingStream
+  // (from a prior session that was cut off mid-stream), reattach to it
+  // before the long-poll spins up — the long-poll's eventual
+  // message_added would otherwise race the resume to render the same
+  // partial reply twice. attemptResumeOnLoad handles 404 (past grace TTL)
+  // by settling the bubble with the incomplete notice; the message_added
+  // event still gets to fill in the rest via the existing dedup path.
+  if (!sync.stopped) {
+    const activeId = store.activeId;
+    if (activeId && store.pendingStreams[activeId]) {
+      void attemptResumeOnLoad(activeId);
+    }
   }
   if (!sync.stopped) void runLongPoll();
 })();

@@ -18,6 +18,19 @@ from aiohttp import web
 
 from astrbot.api import logger
 
+try:
+    from astrbot.core.agent.message import (
+        AssistantMessageSegment,
+        TextPart,
+        UserMessageSegment,
+    )
+except ImportError as _e:
+    raise ImportError(
+        "[WebChatGateway] Cannot import AssistantMessageSegment/TextPart/UserMessageSegment "
+        "from astrbot.core.agent.message. This plugin requires AstrBot >= 3.4. "
+        f"Original error: {_e}"
+    ) from _e
+
 from ..core.audit import AuditLogger
 from ..core.event_bus import EventBus
 from ..core.ip_guard import IpGuard
@@ -55,6 +68,8 @@ EVENT_SESSION_CREATED = "session_created"
 EVENT_SESSION_META_UPDATED = "session_meta_updated"
 EVENT_MESSAGE_ADDED = "message_added"
 EVENT_HISTORY_CLEARED = "history_cleared"
+EVENT_STREAM_STARTED = "stream_started"
+EVENT_STREAM_ENDED = "stream_ended"
 
 
 @dataclass
@@ -121,8 +136,8 @@ def _extract_text(content: Any) -> str:
 
     AstrBot stores messages as either OpenAI-style `{role, content}` with a
     string content, or `{role, content: [{type: "text", text: "..."}, ...]}`
-    when message segments are involved (see UserMessageSegment / TextPart in
-    llm_bridge.py). Anything else collapses to "".
+    when message segments are involved (UserMessageSegment / AssistantMessageSegment
+    wrapping TextPart). Anything else collapses to "".
     """
     if isinstance(content, str):
         return content
@@ -219,6 +234,166 @@ class ConversationService:
             parsed = history_raw or []
         return _normalize_history(parsed), cid
 
+    async def _cm_persist_pair(
+        self,
+        *,
+        token_name: str,
+        session_id: str,
+        user_text: str,
+        assistant_text: str,
+    ) -> None:
+        """Append the user/assistant pair to AstrBot CM history.
+
+        Resolves the conversation id via `get_curr_conversation_id` —
+        the bridge normally created the conversation before the LLM
+        call, so this returns a real cid. The fallback (cid is None)
+        creates a new conversation with `persona_id=None` and
+        `title=session_id`; this only fires on edge cases where the
+        bridge skipped its `new_conversation` step (e.g., the
+        non-stream path failed before calling _generate_reply_inner
+        but record_chat_pair was somehow invoked anyway).
+
+        Logs and swallows on failure so `record_chat_pair`'s "must
+        never raise" contract holds even if CM is temporarily broken.
+        """
+        umo = _umo(token_name, session_id)
+        try:
+            cid = await self._cm.get_curr_conversation_id(umo)
+            if not cid:
+                cid = await self._cm.new_conversation(
+                    umo,
+                    platform_id="webchat_gateway",
+                    title=session_id,
+                    persona_id=None,
+                )
+            await self._cm.add_message_pair(
+                cid=cid,
+                user_message=UserMessageSegment(
+                    content=[TextPart(text=user_text)]
+                ),
+                assistant_message=AssistantMessageSegment(
+                    content=[TextPart(text=assistant_text)]
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "[WebChatGateway] _cm_persist_pair failed token=%s session=%s",
+                token_name,
+                session_id,
+            )
+
+    async def _build_incomplete_map(
+        self, *, token_name: str, session_id: str
+    ) -> set[int]:
+        """Return 0-based indices of incomplete assistant messages in CM
+        history order for `(token_name, session_id)`.
+
+        Strategy: scan `webchat_updates` for this token in pts-ascending
+        order, filter to this session, drop everything at or before the
+        last `history_cleared` event (those events describe a wiped
+        history that no longer corresponds to CM), then walk the
+        remaining `message_added` events alongside the CM history with a
+        sliding pointer so duplicate `(role, content)` pairs match in
+        order. Assistant messages whose matched event carries
+        `incomplete: true` are recorded.
+
+        When retention pruning has dropped the relevant `message_added`
+        event, the corresponding CM index simply does not appear in the
+        result — by design (PLAN_chat_streaming_v2.md).
+        """
+        # Page through webchat_updates for this token. The cap is high
+        # enough that real users never hit it (retention pruning keeps
+        # the table bounded) but guards against pathological growth from
+        # a misconfigured retention policy.
+        scan_limit = 50
+        max_rows = 5000
+        seen = 0
+        since = 0
+        session_events: list[UpdateRow] = []
+        try:
+            while seen < max_rows:
+                batch = await self._storage.get_updates(
+                    token_name=token_name,
+                    since_pts=since,
+                    limit=scan_limit,
+                )
+                if not batch:
+                    break
+                for row in batch:
+                    if row.session_id == session_id:
+                        session_events.append(row)
+                seen += len(batch)
+                since = batch[-1].pts
+                if len(batch) < scan_limit:
+                    break
+        except Exception:
+            logger.exception(
+                "[WebChatGateway] _build_incomplete_map scan failed"
+            )
+            return set()
+
+        if not session_events:
+            return set()
+
+        # Find the last `history_cleared` event for this session and drop
+        # everything at or before it — those `message_added` rows refer
+        # to a wiped CM history.
+        last_clear_idx = -1
+        for i, row in enumerate(session_events):
+            if row.event_type == EVENT_HISTORY_CLEARED:
+                last_clear_idx = i
+        if last_clear_idx >= 0:
+            session_events = session_events[last_clear_idx + 1 :]
+
+        # Build the in-order list of (role, content, incomplete).
+        msg_events: list[tuple[str, str, bool]] = []
+        for row in session_events:
+            if row.event_type != EVENT_MESSAGE_ADDED:
+                continue
+            try:
+                payload = json.loads(row.payload) if row.payload else {}
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            role = payload.get("role")
+            content = payload.get("content")
+            if not isinstance(role, str) or not isinstance(content, str):
+                continue
+            if role not in ("user", "assistant"):
+                continue
+            incomplete = bool(payload.get("incomplete"))
+            msg_events.append((role, content, incomplete))
+
+        if not msg_events:
+            return set()
+
+        # Walk CM history alongside the event list. For each CM entry,
+        # advance the event pointer until we find a matching (role,
+        # content); if the event flagged it as incomplete and the role
+        # is assistant, record the CM index.
+        cm_messages, _cid = await self._cm_history(
+            token_name=token_name, session_id=session_id
+        )
+        result: set[int] = set()
+        ev_ptr = 0
+        for cm_idx, msg in enumerate(cm_messages):
+            target_role = msg["role"]
+            target_content = msg["content"]
+            # Advance ev_ptr to the first event matching this CM entry.
+            while ev_ptr < len(msg_events):
+                ev_role, ev_content, ev_incomplete = msg_events[ev_ptr]
+                ev_ptr += 1
+                if ev_role == target_role and ev_content == target_content:
+                    if ev_incomplete and target_role == "assistant":
+                        result.add(cm_idx)
+                    break
+            else:
+                # Event list exhausted; remaining CM entries have no
+                # surviving event record (pruned) → leave them unflagged.
+                break
+        return result
+
     async def list_conversations(
         self, *, token_name: str
     ) -> ConversationListResult:
@@ -278,6 +453,20 @@ class ConversationService:
                 preview=preview_src[:_PREVIEW_CHARS],
                 now=now,
             )
+        # Stamp `incomplete: true` on assistant messages whose chat-sync
+        # event marked them as such. The flag is reconstructed from the
+        # event log on every fetch — CM doesn't store it natively. Old
+        # messages whose events have been pruned simply lose the flag.
+        incomplete_indices = await self._build_incomplete_map(
+            token_name=token_name, session_id=session_id
+        )
+        if incomplete_indices:
+            messages = [
+                ({**msg, "incomplete": True}
+                 if i in incomplete_indices and msg["role"] == "assistant"
+                 else msg)
+                for i, msg in enumerate(messages)
+            ]
         return ConversationDetail(
             session_id=session_id,
             title=meta.title,
@@ -428,11 +617,31 @@ class ConversationService:
         session_id: str,
         user_text: str,
         assistant_text: str,
+        incomplete: bool = False,
     ) -> None:
         # Must never raise: the chat reply has already been delivered to the
         # client. A failure here is a sync hiccup, not a chat error. We
         # log + audit instead, and the next list_conversations call on the
         # affected device will catch up the missing state.
+        #
+        # Persistence ownership: this method writes the user/assistant pair
+        # to BOTH AstrBot CM (so prompt-context history surfaces it next
+        # turn) AND the chat-sync layer (event log + meta cache for the
+        # web UI). LlmBridge used to own the CM write, but the streaming
+        # incomplete path needs to persist partial replies too — moving
+        # the CM write here keeps a single source of truth for "the turn
+        # is done, persist whatever we have".
+        try:
+            await self._cm_persist_pair(
+                token_name=token_name,
+                session_id=session_id,
+                user_text=user_text,
+                assistant_text=assistant_text,
+            )
+        except Exception:
+            # _cm_persist_pair already logs; the chat-sync layer below is
+            # independent so we proceed regardless.
+            pass
         try:
             now = self._now()
             existing = await self._storage.get_session_meta(
@@ -508,13 +717,18 @@ class ConversationService:
                     ),
                 )
             )
+            assistant_payload: dict[str, Any] = {
+                "role": "assistant",
+                "content": assistant_text,
+            }
+            if incomplete:
+                assistant_payload["incomplete"] = True
             events.append(
                 NewEvent(
                     event_type=EVENT_MESSAGE_ADDED,
                     session_id=session_id,
                     payload=json.dumps(
-                        {"role": "assistant", "content": assistant_text},
-                        ensure_ascii=False,
+                        assistant_payload, ensure_ascii=False
                     ),
                 )
             )
@@ -534,12 +748,118 @@ class ConversationService:
                     name=token_name,
                     detail={
                         "session_id": session_id,
+                        "incomplete": incomplete,
                         "error": str(exc)[:200],
                     },
                 )
             except Exception:
                 # Audit logging itself failed — already logged via logger
                 # above. Swallow so chat reply is never blocked.
+                pass
+
+    async def emit_stream_started(
+        self,
+        *,
+        token_name: str,
+        session_id: str,
+        stream_id: str,
+    ) -> None:
+        """Append a single `stream_started` event and notify the event
+        bus. NO CM write, NO meta upsert. Must never raise — failures
+        are logged + audited like `record_chat_pair`.
+        """
+        try:
+            now = self._now()
+            started_at_ms = int(time.time() * 1000)
+            await self._storage.append_updates(
+                token_name=token_name,
+                events=[
+                    NewEvent(
+                        event_type=EVENT_STREAM_STARTED,
+                        session_id=session_id,
+                        payload=json.dumps(
+                            {
+                                "stream_id": stream_id,
+                                "started_at": started_at_ms,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
+                ],
+                now=now,
+            )
+            await self._event_bus.notify(token_name)
+        except Exception as exc:
+            logger.exception(
+                "[WebChatGateway] emit_stream_started failed token=%s session=%s",
+                token_name,
+                session_id,
+            )
+            try:
+                await self._audit.write(
+                    "sync_record_failed",
+                    name=token_name,
+                    detail={
+                        "session_id": session_id,
+                        "stream_id": stream_id,
+                        "event": EVENT_STREAM_STARTED,
+                        "error": str(exc)[:200],
+                    },
+                )
+            except Exception:
+                pass
+
+    async def emit_stream_ended(
+        self,
+        *,
+        token_name: str,
+        session_id: str,
+        stream_id: str,
+        status: str,
+    ) -> None:
+        """Append a single `stream_ended` event and notify the event
+        bus. `status` is one of `'ok' | 'incomplete' | 'failed'`.
+        NO CM write. Must never raise.
+        """
+        try:
+            now = self._now()
+            await self._storage.append_updates(
+                token_name=token_name,
+                events=[
+                    NewEvent(
+                        event_type=EVENT_STREAM_ENDED,
+                        session_id=session_id,
+                        payload=json.dumps(
+                            {
+                                "stream_id": stream_id,
+                                "status": status,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
+                ],
+                now=now,
+            )
+            await self._event_bus.notify(token_name)
+        except Exception as exc:
+            logger.exception(
+                "[WebChatGateway] emit_stream_ended failed token=%s session=%s",
+                token_name,
+                session_id,
+            )
+            try:
+                await self._audit.write(
+                    "sync_record_failed",
+                    name=token_name,
+                    detail={
+                        "session_id": session_id,
+                        "stream_id": stream_id,
+                        "event": EVENT_STREAM_ENDED,
+                        "status": status,
+                        "error": str(exc)[:200],
+                    },
+                )
+            except Exception:
                 pass
 
     async def get_events(

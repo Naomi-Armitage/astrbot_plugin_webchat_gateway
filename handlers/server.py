@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from pathlib import Path
+from typing import AsyncIterator
 
 from aiohttp import web
 
@@ -22,6 +23,7 @@ from .chat import (
     ChatDeps,
     make_chat_handler,
     make_chat_stream_handler,
+    make_chat_stream_resume_handler,
     make_me_handler,
     make_preflight_handler,
 )
@@ -96,6 +98,25 @@ def build_app(deps: ServerDeps) -> web.Application:
     body_cap = max(64 * 1024, cfg.max_message_length * 4)
     app = web.Application(client_max_size=body_cap)
 
+    # Stream buffer eviction sweeper — runs for the lifetime of the app.
+    # `cleanup_ctx` semantics: yield once, the framework calls it on
+    # startup, awaits the generator on shutdown. The buffer's start_sweeper
+    # is idempotent (no-op if already running) and stop_sweeper drains
+    # gracefully with a 10s timeout so a stuck sweeper can't block plugin
+    # shutdown. The buffer is owned by the registry; we reach through
+    # the registry's read-only `buffer` accessor rather than carrying a
+    # second ref on ServerDeps.
+    stream_buffer = deps.chat.registry.buffer
+
+    async def _stream_buffer_lifecycle(_app: web.Application) -> AsyncIterator[None]:
+        await stream_buffer.start_sweeper(_app)
+        try:
+            yield
+        finally:
+            await stream_buffer.stop_sweeper()
+
+    app.cleanup_ctx.append(_stream_buffer_lifecycle)
+
     chat_handler = make_chat_handler(deps.chat)
     chat_preflight = make_preflight_handler(
         cfg.allowed_origins,
@@ -108,6 +129,10 @@ def build_app(deps: ServerDeps) -> web.Application:
     chat_stream_handler = make_chat_stream_handler(deps.chat)
     app.router.add_post(cfg.chat_stream_path, chat_stream_handler)
     app.router.add_options(cfg.chat_stream_path, chat_preflight)
+
+    chat_stream_resume_handler = make_chat_stream_resume_handler(deps.chat)
+    app.router.add_get(cfg.chat_stream_resume_path, chat_stream_resume_handler)
+    app.router.add_options(cfg.chat_stream_resume_path, chat_preflight)
 
     me_handler = make_me_handler(deps.chat)
     app.router.add_get(cfg.me_path, me_handler)

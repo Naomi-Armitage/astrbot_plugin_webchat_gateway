@@ -259,6 +259,12 @@ class AbstractStorage(ABC):
     ) -> list[UpdateRow]:
         """Return rows where pts > since_pts, ordered by pts ASC, capped
         at `limit`. Caller paginates via the last returned pts.
+
+        Filters out internal `_pruned_marker` rows; clients only see real
+        events. Markers are written by `prune_chat_sync` to anchor
+        MAX(pts) for tokens whose entire event history has aged past the
+        retention window — they preserve the high-water mark without
+        leaking real chat content.
         """
 
     @abstractmethod
@@ -266,7 +272,10 @@ class AbstractStorage(ABC):
         """Return the largest pts for this token (0 if none).
 
         Used by the long-poll path to detect `tooFar` and to expose the
-        current high-water mark in list responses.
+        current high-water mark in list responses. INCLUDES
+        `_pruned_marker` rows by design: a marker IS the high-water
+        sentinel that `prune_chat_sync` left behind, so excluding it
+        would defeat the wrap-prevention contract.
         """
 
     @abstractmethod
@@ -282,4 +291,22 @@ class AbstractStorage(ABC):
 
         Idempotent and safe to run while the gateway is live; events older
         than the cutoff have no remaining waiters that could observe them.
+
+        Always retains the latest event per token regardless of age, to
+        keep MAX(pts) monotonic. A prune that empties a token's row
+        completely would otherwise reset MAX(pts) to 0; new events would
+        restart at pts=1 and a client whose `since` ran ahead of pts=1
+        but lagged behind the new MAX would silently miss the new
+        events (the `since > current_max` tooFar check only catches the
+        opposite case). Keeping one row floors MAX(pts) at the highest
+        seen value forever.
+
+        Replaces retained rows that are themselves past the cutoff with
+        a content-free `_pruned_marker` event so MAX(pts) stays
+        monotonic without keeping stale chat content past the retention
+        window. Markers carry `payload='{}'` and `event_type='_pruned_marker'`;
+        `get_updates` filters them out so clients never see them as
+        real events. Idempotent: rows already marked are skipped on
+        subsequent prune passes via an `event_type != '_pruned_marker'`
+        guard in the UPDATE.
         """

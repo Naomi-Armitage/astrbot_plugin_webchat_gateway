@@ -2,11 +2,12 @@ import { LS_TOKEN, $, loadSite, setupThemeToggle } from "../shared/site";
 
 const LS_USERNAME = "wcg.username";
 // Chat-page cache keys. We don't import these from chat_client (login
-// must not pull the chat bundle), but they MUST stay in sync. The login
-// page nukes them on any submit so a different token can't read the
-// previous user's session list / pts cursor.
+// must not pull the chat bundle), but they MUST stay in sync with the
+// LS_* constants in chat_client/main.ts. The login page nukes them on
+// any submit so a different token can't read the previous user's state.
 const LS_CHAT_STORE = "wcg.chat.sessions";
 const LS_CHAT_LAST_PTS = "wcg.chat.lastPts";
+const LS_CHAT_PENDING_STREAMS = "wcg.chat.pending_streams";
 
 const tokenInput = $<HTMLInputElement>("token");
 const usernameInput = $<HTMLInputElement>("username");
@@ -61,8 +62,13 @@ form.addEventListener("submit", async (e) => {
     // this would let the *previous* token's session list and last_pts
     // cursor leak into the new login (cross-token state pollution; a
     // particularly bad one because session titles are user-visible).
+    // pending_streams is per-token too — its stream_ids belong to the old
+    // token's server-side buffer; cross-token resume returns 404 on
+    // purpose, so leaving them on disk would just trigger a doomed
+    // resume attempt on the next chat-page bootstrap.
     try { localStorage.removeItem(LS_CHAT_STORE); } catch {}
     try { localStorage.removeItem(LS_CHAT_LAST_PTS); } catch {}
+    try { localStorage.removeItem(LS_CHAT_PENDING_STREAMS); } catch {}
     location.href = "/chat";
   } catch {
     errEl.textContent = "网络错误，请检查连接后重试。";

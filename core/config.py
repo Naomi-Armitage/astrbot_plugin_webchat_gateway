@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
 
 from astrbot.api import logger
 
@@ -99,6 +100,20 @@ class StorageConfig:
 
 
 @dataclass(frozen=True)
+class StreamingConfig:
+    """Streaming buffer/registry tunables.
+
+    `redis_dsn` empty string = use the in-memory buffer (default).
+    Non-empty must parse as `redis://` or `rediss://` (validated in `from_raw`).
+    """
+
+    redis_dsn: str
+    grace_seconds: int
+    max_per_token: int
+    max_global: int
+
+
+@dataclass(frozen=True)
 class ConfigView:
     host: str
     port: int
@@ -123,6 +138,7 @@ class ConfigView:
     privacy_url: str
     theme_family: str
     storage: StorageConfig
+    streaming: StreamingConfig
 
     @property
     def chat_path(self) -> str:
@@ -131,6 +147,10 @@ class ConfigView:
     @property
     def chat_stream_path(self) -> str:
         return f"{self.endpoint_prefix}/chat/stream"
+
+    @property
+    def chat_stream_resume_path(self) -> str:
+        return f"{self.endpoint_prefix}/chat/stream/{{stream_id}}/resume"
 
     @property
     def me_path(self) -> str:
@@ -249,6 +269,34 @@ class ConfigView:
         ).strip()
         mysql_dsn = str(_get(raw_storage, "mysql_dsn") or "").strip()
 
+        raw_streaming = _get(cfg, "streaming", {}) or {}
+        redis_dsn_raw = str(_get(raw_streaming, "redis_dsn") or "").strip()
+        if redis_dsn_raw:
+            try:
+                parsed_dsn = urlparse(redis_dsn_raw)
+            except Exception:
+                parsed_dsn = None
+            if (
+                parsed_dsn is None
+                or parsed_dsn.scheme not in ("redis", "rediss")
+                or not parsed_dsn.netloc
+            ):
+                logger.warning(
+                    "[WebChatGateway] streaming.redis_dsn=%r is not a valid"
+                    " redis://|rediss:// URL; falling back to in-memory buffer",
+                    redis_dsn_raw,
+                )
+                redis_dsn_raw = ""
+        grace_seconds = _clamp_int(
+            _get(raw_streaming, "grace_seconds"), default=30, lo=5, hi=300
+        )
+        max_per_token = _clamp_int(
+            _get(raw_streaming, "max_per_token"), default=3, lo=1, hi=10
+        )
+        max_global = _clamp_int(
+            _get(raw_streaming, "max_global"), default=200, lo=10, hi=10_000
+        )
+
         view = cls(
             host=host,
             port=port,
@@ -276,6 +324,12 @@ class ConfigView:
                 driver=driver,
                 sqlite_path=sqlite_path,
                 mysql_dsn=mysql_dsn,
+            ),
+            streaming=StreamingConfig(
+                redis_dsn=redis_dsn_raw,
+                grace_seconds=grace_seconds,
+                max_per_token=max_per_token,
+                max_global=max_global,
             ),
         )
         view._emit_warnings()

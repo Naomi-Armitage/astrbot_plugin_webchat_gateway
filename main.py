@@ -21,6 +21,8 @@ from .core.event_bus import EventBus
 from .core.ip_guard import IpGuard
 from .core.llm_bridge import LlmBridge
 from .core.ratelimit import PerTokenConcurrency
+from .core.stream_buffer import InMemoryBuffer, RedisBuffer, StreamBuffer
+from .core.stream_registry import StreamRegistry
 from .handlers.admin_stats import AdminDeps
 from .handlers.admin_tokens import ServiceError, TokenService
 from .handlers.chat import ChatDeps
@@ -114,6 +116,58 @@ class WebChatGatewayPlugin(Star):
                 cm=self.context.conversation_manager,
             )
 
+            # Streaming buffer + registry. Redis backend is opt-in via
+            # `streaming.redis_dsn`; empty string falls back to in-memory.
+            # The buffer's eviction-audit hook writes `chat_stream_evicted`
+            # rows so cap- and TTL-driven evictions stay visible in the
+            # audit log.
+            async def _on_evict(stream_id: str, reason: str) -> None:
+                try:
+                    await audit.write(
+                        "chat_stream_evicted",
+                        detail={"stream_id": stream_id, "reason": reason},
+                    )
+                except Exception:
+                    logger.exception(
+                        "[WebChatGateway] chat_stream_evicted audit failed"
+                    )
+
+            buffer: StreamBuffer
+            if cfg.streaming.redis_dsn:
+                try:
+                    buffer = RedisBuffer(
+                        dsn=cfg.streaming.redis_dsn,
+                        grace_seconds=cfg.streaming.grace_seconds,
+                        max_per_token=cfg.streaming.max_per_token,
+                        max_global=cfg.streaming.max_global,
+                        on_evict=_on_evict,
+                    )
+                except RuntimeError:
+                    # redis-py not installed or DSN unusable. Fall back to
+                    # in-memory so the rest of the plugin still starts.
+                    logger.exception(
+                        "[WebChatGateway] RedisBuffer init failed; falling back to in-memory"
+                    )
+                    buffer = InMemoryBuffer(
+                        grace_seconds=cfg.streaming.grace_seconds,
+                        max_per_token=cfg.streaming.max_per_token,
+                        max_global=cfg.streaming.max_global,
+                        on_evict=_on_evict,
+                    )
+            else:
+                buffer = InMemoryBuffer(
+                    grace_seconds=cfg.streaming.grace_seconds,
+                    max_per_token=cfg.streaming.max_per_token,
+                    max_global=cfg.streaming.max_global,
+                    on_evict=_on_evict,
+                )
+            registry = StreamRegistry(
+                buffer=buffer,
+                concurrency=concurrency,
+                audit=audit,
+                conv_service=conv_service,
+            )
+
             chat_deps = ChatDeps(
                 storage=storage,
                 audit=audit,
@@ -121,6 +175,7 @@ class WebChatGatewayPlugin(Star):
                 concurrency=concurrency,
                 llm_bridge=llm_bridge,
                 conv_service=conv_service,
+                registry=registry,
                 allowed_origins=cfg.allowed_origins,
                 max_message_length=cfg.max_message_length,
                 trust_forwarded_for=cfg.trust_forwarded_for,

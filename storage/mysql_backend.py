@@ -772,6 +772,7 @@ class MysqlStorage(AbstractStorage):
                     "SELECT token_name, pts, ts, event_type, session_id, payload "
                     "FROM webchat_updates "
                     "WHERE token_name = %s AND pts > %s "
+                    "  AND event_type != '_pruned_marker' "
                     "ORDER BY pts ASC LIMIT %s",
                     (token_name, since_pts, limit),
                 )
@@ -807,11 +808,48 @@ class MysqlStorage(AbstractStorage):
     ) -> tuple[int, int]:
         async with self._write_tx() as conn:
             async with conn.cursor() as cur:
+                # Always retain the latest row per token, even past the
+                # cutoff. Without this, a token with all events older
+                # than `events_before_ts` would have its MAX(pts)
+                # reset to 0 after the prune; new events would restart
+                # at pts=1 and clients polling with stale `since` would
+                # silently miss the new pts 1..N. The inner SELECT is
+                # wrapped in a derived table (`AS latest`) because MySQL
+                # forbids referencing the target of DELETE/UPDATE
+                # inside a subquery directly — wrapping in a derived
+                # table is the standard workaround.
                 await cur.execute(
-                    "DELETE FROM webchat_updates WHERE ts < %s",
+                    "DELETE FROM webchat_updates "
+                    "WHERE ts < %s "
+                    "  AND (token_name, pts) NOT IN ("
+                    "    SELECT token_name, max_pts FROM ("
+                    "      SELECT token_name, MAX(pts) AS max_pts "
+                    "      FROM webchat_updates "
+                    "      GROUP BY token_name"
+                    "    ) AS latest"
+                    "  )",
                     (events_before_ts,),
                 )
                 events_pruned = cur.rowcount or 0
+                # If the retained row is itself past the cutoff, replace
+                # its content with a `_pruned_marker` so MAX(pts) is
+                # preserved without leaking real chat text past the
+                # 14-day retention window. Idempotent via the
+                # `event_type != '_pruned_marker'` guard.
+                await cur.execute(
+                    "UPDATE webchat_updates "
+                    "SET payload = '{}', event_type = '_pruned_marker' "
+                    "WHERE ts < %s "
+                    "  AND event_type != '_pruned_marker' "
+                    "  AND (token_name, pts) IN ("
+                    "    SELECT token_name, max_pts FROM ("
+                    "      SELECT token_name, MAX(pts) AS max_pts "
+                    "      FROM webchat_updates "
+                    "      GROUP BY token_name"
+                    "    ) AS latest"
+                    "  )",
+                    (events_before_ts,),
+                )
                 await cur.execute(
                     "DELETE FROM webchat_session_meta "
                     "WHERE deleted_at IS NOT NULL AND deleted_at < %s",
