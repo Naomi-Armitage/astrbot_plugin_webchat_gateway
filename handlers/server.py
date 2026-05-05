@@ -18,7 +18,13 @@ from astrbot.api import logger
 from ..core.config import ConfigView
 from .admin_auth_routes import AuthRouteDeps, make_auth_handlers
 from .admin_stats import AdminDeps, make_admin_handlers
-from .chat import ChatDeps, make_chat_handler, make_me_handler, make_preflight_handler
+from .chat import (
+    ChatDeps,
+    make_chat_handler,
+    make_chat_stream_handler,
+    make_me_handler,
+    make_preflight_handler,
+)
 from .conversations import (
     ConversationDeps,
     ConversationService,
@@ -98,6 +104,10 @@ def build_app(deps: ServerDeps) -> web.Application:
 
     app.router.add_post(cfg.chat_path, chat_handler)
     app.router.add_options(cfg.chat_path, chat_preflight)
+
+    chat_stream_handler = make_chat_stream_handler(deps.chat)
+    app.router.add_post(cfg.chat_stream_path, chat_stream_handler)
+    app.router.add_options(cfg.chat_stream_path, chat_preflight)
 
     me_handler = make_me_handler(deps.chat)
     app.router.add_get(cfg.me_path, me_handler)

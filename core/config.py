@@ -129,6 +129,10 @@ class ConfigView:
         return f"{self.endpoint_prefix}/chat"
 
     @property
+    def chat_stream_path(self) -> str:
+        return f"{self.endpoint_prefix}/chat/stream"
+
+    @property
     def me_path(self) -> str:
         return f"{self.endpoint_prefix}/me"
 

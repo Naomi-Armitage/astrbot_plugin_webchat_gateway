@@ -7,7 +7,7 @@ the original plugin so behavior matches the simple version.
 from __future__ import annotations
 
 import asyncio
-from typing import Sequence
+from typing import AsyncIterator, Sequence
 
 from astrbot.api import logger
 
@@ -171,6 +171,109 @@ class LlmBridge:
             logger.exception("[WebChatGateway] persist conversation failed")
 
         return reply
+
+    async def generate_reply_stream(
+        self,
+        *,
+        token_name: str,
+        session_id: str,
+        username: str,
+        message: str,
+    ) -> AsyncIterator[str]:
+        # Wrap the whole stream in a single wall-clock deadline so a stalled
+        # provider can't pin the per-token concurrency lock indefinitely. Per-
+        # chunk timeouts are intentionally not enforced — that's the heartbeat's
+        # job at the HTTP layer.
+        async def _runner() -> AsyncIterator[str]:
+            unified_origin = f"webchat_gateway:{token_name}:{session_id}"
+            provider_id = await self._context.get_current_chat_provider_id(
+                umo=unified_origin
+            )
+            if not provider_id:
+                raise RuntimeError("chat_provider_not_configured")
+            provider = self._context.get_provider_by_id(provider_id)
+            if provider is None:
+                raise RuntimeError("chat_provider_not_configured")
+
+            persona_id, system_prompt = await self._resolve_persona()
+
+            cm = self._context.conversation_manager
+            cid = await cm.get_curr_conversation_id(unified_origin)
+            if not cid:
+                cid = await cm.new_conversation(
+                    unified_origin,
+                    platform_id="webchat_gateway",
+                    title=username,
+                    persona_id=persona_id,
+                )
+
+            history = await self._history_text(unified_origin, cid)
+            prompt = self._build_prompt(
+                message=message, system_prompt=system_prompt, history=history
+            )
+
+            collected: list[str] = []
+            async for chunk in provider.text_chat_stream(prompt=prompt):
+                # AstrBot providers yield two kinds of LLMResponse:
+                #   is_chunk=True  → per-token delta; chunk.completion_text is
+                #                    the new text since the last yield (Anthropic
+                #                    sets it directly; OpenAI/Gemini set it via
+                #                    result_chain — the property reads through
+                #                    transparently).
+                #   is_chunk=False → final assembled response; emitted once at
+                #                    the end. Skip it (we already accumulated).
+                if not getattr(chunk, "is_chunk", False):
+                    continue
+                text = chunk.completion_text or ""
+                if not text:
+                    continue
+                collected.append(text)
+                yield text
+
+            full = "".join(collected).strip()
+            if not full:
+                raise RuntimeError("empty_reply")
+
+            try:
+                await cm.add_message_pair(
+                    cid=cid,
+                    user_message=UserMessageSegment(content=[TextPart(text=message)]),
+                    assistant_message=AssistantMessageSegment(
+                        content=[TextPart(text=full)]
+                    ),
+                )
+            except Exception:
+                logger.exception("[WebChatGateway] persist conversation failed")
+
+        # `asyncio.wait_for` doesn't compose with async generators, so guard
+        # each `__anext__` with the remaining budget — same wall-clock shape
+        # as generate_reply, just spread across yields.
+        agen = _runner()
+        deadline = (
+            asyncio.get_event_loop().time() + self._timeout
+            if self._timeout
+            else None
+        )
+        try:
+            while True:
+                try:
+                    if deadline is not None:
+                        remaining = deadline - asyncio.get_event_loop().time()
+                        if remaining <= 0:
+                            raise RuntimeError("llm_timeout")
+                        try:
+                            text = await asyncio.wait_for(
+                                agen.__anext__(), timeout=remaining
+                            )
+                        except asyncio.TimeoutError as exc:
+                            raise RuntimeError("llm_timeout") from exc
+                    else:
+                        text = await agen.__anext__()
+                except StopAsyncIteration:
+                    return
+                yield text
+        finally:
+            await agen.aclose()
 
     # ----- Title generation -----
 

@@ -15,6 +15,7 @@ concurrency slot):
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from dataclasses import dataclass
@@ -35,10 +36,14 @@ from .common import (
     build_cors_headers,
     client_ip,
     extract_origin,
+    gate_request,
     is_origin_allowed,
     json_response,
     preflight_response,
 )
+
+
+_HEARTBEAT_INTERVAL = 20.0
 
 
 def _is_expired(token: TokenRow, now: int) -> bool:
@@ -85,6 +90,50 @@ def _parse_payload(payload: Any) -> _ParsedRequest | None:
         username=username,
         message=message,
     )
+
+
+async def _parse_chat_body(
+    request: web.Request,
+    max_message_length: int,
+    *,
+    origin: str | None,
+    allowed: set[str],
+    same_host: str,
+) -> _ParsedRequest | web.Response:
+    """Parse the JSON body for /chat-style requests, applying the same
+    error-shape contract both /chat and /chat/stream advertise. Returns
+    either the parsed payload or an already-serialized error Response."""
+    try:
+        payload = await request.json()
+    except web.HTTPRequestEntityTooLarge:
+        return json_response(
+            {"error": "payload_too_large"}, status=413,
+            origin=origin, allowed_origins=allowed, same_origin_host=same_host,
+        )
+    except json.JSONDecodeError:
+        return json_response(
+            {"error": "invalid_json"}, status=400,
+            origin=origin, allowed_origins=allowed, same_origin_host=same_host,
+        )
+    except Exception:
+        logger.exception("[WebChatGateway] unexpected JSON parse error")
+        return json_response(
+            {"error": "invalid_json"}, status=400,
+            origin=origin, allowed_origins=allowed, same_origin_host=same_host,
+        )
+    data = _parse_payload(payload)
+    if data is None:
+        return json_response(
+            {"error": "invalid_payload"}, status=400,
+            origin=origin, allowed_origins=allowed, same_origin_host=same_host,
+        )
+    if len(data.message) > max_message_length:
+        return json_response(
+            {"error": "message_too_long", "max_length": max_message_length},
+            status=400,
+            origin=origin, allowed_origins=allowed, same_origin_host=same_host,
+        )
+    return data
 
 
 def make_chat_handler(deps: ChatDeps):
@@ -350,6 +399,276 @@ def make_chat_handler(deps: ChatDeps):
     return handle
 
 
+def make_chat_stream_handler(deps: ChatDeps):
+    # SSE variant of /chat. Quota and CM persist run only on successful end;
+    # client disconnect mid-stream audits chat_stream_aborted and skips both
+    # (matches PLAN_chat_streaming.md "Locked decisions").
+
+    async def handle(request: web.Request) -> web.StreamResponse:
+        # Steps 1-3: origin / IP / auth (incl. revoked + expired). Reuse the
+        # gate_request helper so /chat and /chat/stream don't drift on the
+        # auth-side wire contract; the helper returns either a typed
+        # GatePass or an already-CORS'd error Response.
+        gated = await gate_request(request, deps)
+        if isinstance(gated, web.Response):
+            return gated
+        token = gated.token
+        ip = gated.ip
+        origin = gated.origin
+        allowed = gated.allowed
+        same_host = gated.same_host
+
+        # Step 4: parse JSON body + length cap before taking the per-token
+        # lock so a slow/large body cannot pin a streaming slot.
+        parsed = await _parse_chat_body(
+            request, deps.max_message_length,
+            origin=origin, allowed=allowed, same_host=same_host,
+        )
+        if isinstance(parsed, web.Response):
+            return parsed
+        data = parsed
+
+        # 5. Concurrency lock
+        async with deps.concurrency.acquire(token.name) as acquired:
+            if not acquired:
+                # Lock contention is a precondition failure, not a stream
+                # error: the client never gets a 200 SSE response. Returning
+                # JSON keeps parity with /chat so the frontend's existing 429
+                # handler covers both endpoints.
+                await deps.audit.write(
+                    "concurrent_block", name=token.name, ip=ip, detail=None
+                )
+                return json_response(
+                    {"error": "concurrent_request"},
+                    status=429,
+                    origin=origin,
+                    allowed_origins=allowed,
+                    same_origin_host=same_host,
+                )
+
+            # 6. Quota check
+            today = date.today()
+            today_count = await deps.storage.get_today_usage(token.name, day=today)
+            if today_count >= token.daily_quota:
+                await deps.audit.write(
+                    "quota_exceeded",
+                    name=token.name,
+                    ip=ip,
+                    detail={"today_count": today_count, "quota": token.daily_quota},
+                )
+                return json_response(
+                    {
+                        "error": "quota_exceeded",
+                        "remaining": 0,
+                        "daily_quota": token.daily_quota,
+                    },
+                    status=429,
+                    origin=origin,
+                    allowed_origins=allowed,
+                    same_origin_host=same_host,
+                )
+
+            # 7. Open SSE response
+            cors = build_cors_headers(origin, allowed, same_origin_host=same_host)
+            response = web.StreamResponse(
+                status=200,
+                headers={
+                    **cors,
+                    "Content-Type": "text/event-stream; charset=utf-8",
+                    "Cache-Control": "no-store",
+                    # nginx: disable response buffering. Apache mod_proxy obeys
+                    # this same header. Without it, intermediate proxies hold
+                    # chunks until a buffer fills, defeating streaming.
+                    "X-Accel-Buffering": "no",
+                },
+            )
+            await response.prepare(request)
+            # Comment frame so the browser sees bytes immediately and any
+            # transparent proxy flushes its buffer.
+            await response.write(b": ready\n\n")
+
+            collected: list[str] = []
+            aborted = False
+
+            async def _write_frame(frame: bytes) -> bool:
+                # Write returns when the chunk has been handed to the transport.
+                # ConnectionResetError is the canonical "peer dropped" signal
+                # from aiohttp; transport.is_closing() catches the half-closed
+                # window where the FIN has arrived but the next write hasn't
+                # tripped a reset yet.
+                if request.transport is None or request.transport.is_closing():
+                    return False
+                try:
+                    await response.write(frame)
+                except (ConnectionResetError, ConnectionError):
+                    return False
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("[WebChatGateway] SSE write failed")
+                    return False
+                return True
+
+            stream = deps.llm_bridge.generate_reply_stream(
+                token_name=token.name,
+                session_id=data.session_id,
+                username=data.username,
+                message=data.message,
+            )
+            stream_iter = stream.__aiter__()
+
+            try:
+                while True:
+                    try:
+                        # `asyncio.shield` is required: wrapping `__anext__`
+                        # directly with `wait_for` lets the timeout cancel
+                        # the awaitable, which on an async generator
+                        # corrupts the generator state (PEP 533 / cpython
+                        # issue 82624) — subsequent calls raise
+                        # "asynchronous generator is already running".
+                        # `shield` keeps the inner await alive across
+                        # heartbeats; only an outer cancel propagates.
+                        chunk = await asyncio.wait_for(
+                            asyncio.shield(stream_iter.__anext__()),
+                            timeout=_HEARTBEAT_INTERVAL,
+                        )
+                    except asyncio.TimeoutError:
+                        # No chunk arrived in 20s — emit a comment frame to
+                        # keep the connection alive through idle proxies and
+                        # to surface a peer disconnect on the next write.
+                        if not await _write_frame(b": keepalive\n\n"):
+                            aborted = True
+                            break
+                        continue
+                    except StopAsyncIteration:
+                        break
+
+                    collected.append(chunk)
+                    frame = (
+                        "data: "
+                        + json.dumps({"chunk": chunk}, ensure_ascii=False)
+                        + "\n\n"
+                    ).encode("utf-8")
+                    if not await _write_frame(frame):
+                        aborted = True
+                        break
+            except RuntimeError as exc:
+                code = str(exc)
+                if code == "llm_timeout":
+                    await deps.audit.write(
+                        "llm_timeout",
+                        name=token.name,
+                        ip=ip,
+                        detail={"msg_len": len(data.message), "streamed": True},
+                    )
+                    error_code = "llm_timeout"
+                else:
+                    logger.exception("[WebChatGateway] LLM stream failed")
+                    await deps.audit.write(
+                        "chat_error",
+                        name=token.name,
+                        ip=ip,
+                        detail={"error": code[:200], "streamed": True},
+                    )
+                    error_code = "llm_call_failed"
+                # Best-effort error frame; if the peer is already gone the
+                # write fails silently — the audit row above is the source of
+                # truth either way.
+                await _write_frame(
+                    (
+                        "data: "
+                        + json.dumps({"error": error_code}, ensure_ascii=False)
+                        + "\n\n"
+                    ).encode("utf-8")
+                )
+                # Close out the upstream generator so its `finally` runs and
+                # the provider connection is released.
+                await stream_iter.aclose()
+                return response
+            except asyncio.CancelledError:
+                # Server-initiated shutdown. Abort cleanly; no quota, no CM.
+                await stream_iter.aclose()
+                await deps.audit.write(
+                    "chat_stream_aborted",
+                    name=token.name,
+                    ip=ip,
+                    detail={"reason": "cancelled", "msg_len": len(data.message)},
+                )
+                raise
+            except Exception as exc:
+                logger.exception("[WebChatGateway] LLM stream failed")
+                await deps.audit.write(
+                    "chat_error",
+                    name=token.name,
+                    ip=ip,
+                    detail={"error": str(exc)[:200], "streamed": True},
+                )
+                await _write_frame(
+                    (
+                        "data: "
+                        + json.dumps({"error": "internal_error"}, ensure_ascii=False)
+                        + "\n\n"
+                    ).encode("utf-8")
+                )
+                await stream_iter.aclose()
+                return response
+
+            if aborted:
+                # Client disconnect or transport reset. Skip quota + CM.
+                # generate_reply_stream's `finally` aclose'd its inner async
+                # for, so the provider connection is already released.
+                await stream_iter.aclose()
+                await deps.audit.write(
+                    "chat_stream_aborted",
+                    name=token.name,
+                    ip=ip,
+                    detail={
+                        "reason": "client_disconnect",
+                        "msg_len": len(data.message),
+                        "partial_len": sum(len(c) for c in collected),
+                    },
+                )
+                return response
+
+            # 8. Successful stream end → quota + CM + audit + done frame.
+            full_reply = "".join(collected)
+            new_count = await deps.storage.increment_daily_usage(token.name, day=today)
+            remaining = max(0, token.daily_quota - new_count)
+            await deps.conv_service.record_chat_pair(
+                token_name=token.name,
+                session_id=data.session_id,
+                user_text=data.message,
+                assistant_text=full_reply,
+            )
+            await deps.audit.write(
+                "chat_ok",
+                name=token.name,
+                ip=ip,
+                detail={
+                    "msg_len": len(data.message),
+                    "reply_len": len(full_reply),
+                    "remaining": remaining,
+                    "streamed": True,
+                },
+            )
+            done_frame = (
+                "data: "
+                + json.dumps(
+                    {
+                        "done": True,
+                        "remaining": remaining,
+                        "daily_quota": token.daily_quota,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n\n"
+            ).encode("utf-8")
+            await _write_frame(done_frame)
+            return response
+
+    return handle
+
+
 def make_preflight_handler(
     allowed: set[str],
     *,
@@ -451,6 +770,7 @@ def make_me_handler(deps: ChatDeps):
 __all__ = [
     "ChatDeps",
     "make_chat_handler",
+    "make_chat_stream_handler",
     "make_me_handler",
     "make_preflight_handler",
     "build_cors_headers",

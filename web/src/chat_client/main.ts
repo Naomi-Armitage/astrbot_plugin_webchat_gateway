@@ -20,6 +20,7 @@ const LS_LAST_PTS = "wcg.chat.lastPts";
 
 const API = "/api/webchat";
 const CHAT_URL = `${API}/chat`;
+const CHAT_STREAM_URL = `${API}/chat/stream`;
 const ME_URL = `${API}/me`;
 const SITE_URL = `${API}/site`;
 const TITLE_URL = `${API}/title`;
@@ -54,6 +55,15 @@ const FETCH_TIMEOUT_CHAT_MS = 90_000;       // covers llm_timeout (60s default) 
 // enough to actually match.
 const DEDUP_TS_WINDOW_S = 600;
 const DEDUP_CONTENT_LEN = 200;
+
+// Stream-failure circuit breaker: if the /chat/stream endpoint trips
+// repeatedly within a short window (server has it disabled, an upstream
+// proxy is buffering and timing out, etc.), stop trying it for the next
+// few sends and go straight to /chat. Reset naturally as the window slides.
+const STREAM_FAIL_WINDOW_MS = 60_000;
+const STREAM_FAIL_THRESHOLD = 3;
+const STREAM_SKIP_AFTER_TRIP = 5;
+const STREAM_RENDER_DEBOUNCE_MS = 30;
 
 const token = (localStorage.getItem(LS_TOKEN) || "").trim();
 if (!token) { location.replace("/login"); throw new Error("redirecting to /login"); }
@@ -347,6 +357,9 @@ interface SyncState {
   consecutiveBackoffSteps: number;   // index into BACKOFF_LADDER_MS while in offline-ish state
   stopped: boolean;                  // logout sets this; loops bail out
   loopRunning: boolean;              // re-entrancy guard for runLongPoll/runShortPoll
+  streamAbort: AbortController | null;  // active /chat/stream fetch+reader; null when not streaming
+  streamFailedAt: number[];          // ms timestamps of recent /chat/stream failures
+  streamSkipRemaining: number;       // sends to bypass /chat/stream after a trip
 }
 
 const sync: SyncState = {
@@ -360,6 +373,9 @@ const sync: SyncState = {
   consecutiveBackoffSteps: 0,
   stopped: false,
   loopRunning: false,
+  streamAbort: null,
+  streamFailedAt: [],
+  streamSkipRemaining: 0,
 };
 setSyncStatus("live");
 
@@ -657,6 +673,7 @@ function sleep(ms: number, signal: AbortSignal | null): Promise<void> {
 function handle401(): void {
   sync.stopped = true;
   abortInflightLongPoll();
+  if (sync.streamAbort) { sync.streamAbort.abort(); sync.streamAbort = null; }
   clearTimer("shortPollTimer");
   clearTimer("probeTimer");
   clearTimer("retryTimer");
@@ -1101,9 +1118,180 @@ async function requestAutoTitle(sid: string, firstUserMsg: string): Promise<void
   try { await patchSession(sid, { title: newTitle, title_manual: false }); } catch {}
 }
 
+// ---------- Streaming chat ----------
+
+// Typed error shape thrown by streamChat for the caller's status-aware
+// fallback. `status` mirrors HTTP status (or 0 for in-stream errors that
+// arrived as `data: {error: "..."}`); `code` is the application-level
+// error string when one was returned, or "" otherwise.
+class StreamChatError extends Error {
+  status: number;
+  code: string;
+  payload: Record<string, unknown>;
+  constructor(message: string, status: number, code: string, payload: Record<string, unknown> = {}) {
+    super(message);
+    this.name = "StreamChatError";
+    this.status = status;
+    this.code = code;
+    this.payload = payload;
+  }
+}
+
+interface StreamDoneInfo { remaining: number; daily_quota: number; }
+
+// Streaming requires Response.body (a ReadableStream). All evergreen
+// browsers ship it, but Safari versions before 15.1 / older mobile WebViews
+// may not. If absent, callers treat the stream attempt as unsupported and
+// fall back to non-stream /chat without burning a circuit-breaker slot.
+function streamingSupported(): boolean {
+  return typeof TextDecoder !== "undefined" && typeof ReadableStream !== "undefined";
+}
+
+// Hand-rolled SSE parser per WHATWG/HTML5 spec rules we actually need:
+//   - Frames are separated by "\n\n" (we accept both LF and CRLF; the
+//     decoded text is normalized at frame boundaries).
+//   - Lines beginning with ":" are comments and ignored (used here for
+//     `: ready` and `: keepalive`).
+//   - Multiple `data:` lines per frame concatenate with "\n" and are then
+//     parsed as a single JSON object per the backend contract.
+//   - Anything else (event:, id:, retry:) is not used by this contract,
+//     so we silently skip those lines.
+async function streamChat(
+  sid: string,
+  message: string,
+  onChunk: (text: string) => void,
+  signal: AbortSignal,
+): Promise<StreamDoneInfo> {
+  const resp = await fetchWithTimeout(
+    CHAT_STREAM_URL,
+    {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json", ...bearer() },
+      body: JSON.stringify({ session_id: sid, username, message }),
+    },
+    FETCH_TIMEOUT_CHAT_MS,
+    signal,
+  );
+
+  if (!resp.ok) {
+    let payload: Record<string, unknown> = {};
+    try { payload = await resp.json() as Record<string, unknown>; } catch {}
+    const code = typeof payload.error === "string" ? payload.error : `http_${resp.status}`;
+    throw new StreamChatError(code, resp.status, code, payload);
+  }
+
+  const ct = resp.headers.get("Content-Type") || "";
+  if (!ct.toLowerCase().includes("text/event-stream") || !resp.body) {
+    // Server returned 200 but not SSE — treat as unsupported endpoint so
+    // the caller falls back without keeping the bubble in streaming state.
+    throw new StreamChatError("not_event_stream", resp.status, "not_event_stream");
+  }
+
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: false });
+  let buffer = "";
+  let doneInfo: StreamDoneInfo | null = null;
+
+  const handleFrame = (frame: string): void => {
+    if (!frame) return;
+    const jsonLines: string[] = [];
+    for (const rawLine of frame.split("\n")) {
+      const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+      if (!line || line.startsWith(":")) continue;
+      if (line.startsWith("data:")) {
+        // Per spec, exactly one space after the colon is stripped if present.
+        const v = line.slice(5);
+        jsonLines.push(v.startsWith(" ") ? v.slice(1) : v);
+      }
+      // event:/id:/retry: → unused under this contract
+    }
+    if (!jsonLines.length) return;
+    let obj: Record<string, unknown>;
+    try {
+      obj = JSON.parse(jsonLines.join("\n")) as Record<string, unknown>;
+    } catch {
+      // Malformed JSON in a data frame is unusual — skip it rather than
+      // killing the whole stream; the keepalive/ready frames are comments
+      // and never reach this path.
+      return;
+    }
+    if (typeof obj.chunk === "string") {
+      onChunk(obj.chunk);
+      return;
+    }
+    if (obj.done === true) {
+      const remaining = typeof obj.remaining === "number" ? obj.remaining : 0;
+      const daily = typeof obj.daily_quota === "number" ? obj.daily_quota : 0;
+      doneInfo = { remaining, daily_quota: daily };
+      return;
+    }
+    if (typeof obj.error === "string") {
+      throw new StreamChatError(obj.error, 0, obj.error, obj);
+    }
+  };
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let idx: number;
+      while ((idx = buffer.indexOf("\n\n")) !== -1) {
+        const frame = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        handleFrame(frame);
+        if (doneInfo) return doneInfo;
+      }
+    }
+    // Stream closed without sending a `done` frame. Flush the decoder and
+    // try one last frame in case the server forgot the trailing blank
+    // line, then surface a truncation error if still no done.
+    buffer += decoder.decode();
+    if (buffer.trim()) {
+      handleFrame(buffer);
+      if (doneInfo) return doneInfo;
+    }
+    throw new StreamChatError("stream_truncated", 0, "stream_truncated");
+  } finally {
+    // Cancel-on-exit guarantees the underlying fetch is released even when
+    // we throw mid-loop or break early; calling cancel() on a finished
+    // reader is a no-op, so this is always safe.
+    try { await reader.cancel(); } catch {}
+  }
+}
+
+function setSendMode(mode: "send" | "stop"): void {
+  sendBtn.dataset.mode = mode;
+  sendBtn.setAttribute("aria-label", mode === "stop" ? "停止" : "发送");
+}
+
+function isStreamCircuitOpen(): boolean {
+  if (sync.streamSkipRemaining > 0) {
+    sync.streamSkipRemaining -= 1;
+    return true;
+  }
+  return false;
+}
+
+function recordStreamFailure(): void {
+  const now = Date.now();
+  const cutoff = now - STREAM_FAIL_WINDOW_MS;
+  sync.streamFailedAt = sync.streamFailedAt.filter((t) => t >= cutoff);
+  sync.streamFailedAt.push(now);
+  if (sync.streamFailedAt.length >= STREAM_FAIL_THRESHOLD) {
+    sync.streamSkipRemaining = STREAM_SKIP_AFTER_TRIP;
+    sync.streamFailedAt = [];
+  }
+}
+
 async function send(): Promise<void> {
   const message = inputEl.value.trim();
   if (!message) return;
+  // Re-entry guard: while a stream is in flight the same button is the
+  // stop button, so only the streaming click path should reach abort, not
+  // a second send().
+  if (sync.streamAbort) return;
   sendBtn.disabled = true;
   const sessBefore = currentSession();
   const sid = sessBefore.id;
@@ -1122,12 +1310,218 @@ async function send(): Promise<void> {
   renderSessionList();
 
   inputEl.value = "";
-  showTyping();
 
   if (eligibleForAutoTitle) {
     requestAutoTitle(sid, message).catch(() => {});
   }
 
+  const tryStream = streamingSupported() && !isStreamCircuitOpen();
+
+  try {
+    if (tryStream) {
+      const outcome = await runStreamingSend(sid, message);
+      if (outcome === "fallback") {
+        showTyping();
+        await runNonStreamingSend(sid, message);
+      }
+    } else {
+      showTyping();
+      await runNonStreamingSend(sid, message);
+    }
+  } finally {
+    hideTyping();
+    sendBtn.disabled = false;
+    setSendMode("send");
+  }
+}
+
+// Returns "ok" if the stream completed (success, mid-stream error rendered
+// inline, or user-cancel after at least one chunk) and the caller should
+// stop. Returns "fallback" if the streaming attempt failed before any
+// content reached the bubble and the caller should retry via /chat.
+async function runStreamingSend(sid: string, message: string): Promise<"ok" | "fallback"> {
+  const ac = new AbortController();
+  sync.streamAbort = ac;
+  setSendMode("stop");
+  // Stop button must remain clickable while the rest of the composer is
+  // disabled-ish; sendBtn.disabled was set true at the top of send(), so
+  // re-enable it here for the duration of the stream.
+  sendBtn.disabled = false;
+
+  // Empty bot bubble that chunks render into. The streaming class drives
+  // the blinking caret; on completion we strip it so the bubble settles.
+  hideTyping();
+  const bubble = document.createElement("div");
+  bubble.className = "msg bot md streaming";
+  msgs.appendChild(bubble);
+  scrollToEnd();
+
+  let pending = "";
+  let renderTimer: number | null = null;
+  let firstChunkSeen = false;
+
+  const flushRender = (): void => {
+    bubble.innerHTML = renderMarkdown(pending);
+    scrollToEnd();
+  };
+  const scheduleRender = (): void => {
+    if (renderTimer !== null) return;
+    renderTimer = window.setTimeout(() => {
+      renderTimer = null;
+      flushRender();
+    }, STREAM_RENDER_DEBOUNCE_MS);
+  };
+  const cancelRender = (): void => {
+    if (renderTimer !== null) {
+      clearTimeout(renderTimer);
+      renderTimer = null;
+    }
+  };
+
+  const onChunk = (text: string): void => {
+    firstChunkSeen = true;
+    pending += text;
+    scheduleRender();
+  };
+
+  const finalizeOk = (info: StreamDoneInfo): void => {
+    cancelRender();
+    flushRender();
+    bubble.classList.remove("streaming");
+    setBadge(info.remaining, info.daily_quota);
+    const sess = store.sessions[sid];
+    if (sess) {
+      // Race-guard, mirror of the non-stream fix in commit 59d5da3:
+      // server fires record_chat_pair + EventBus.notify before the SSE
+      // `done` frame finishes draining. The two responses (events GET +
+      // chat/stream POST) race on separate connections. If long-poll
+      // delivered the matching `message_added` first, `applyEvent`
+      // already pushed history + rendered a sibling bot bubble; pushing
+      // again here would duplicate both. Detect via a content-equality
+      // probe on the last 2 history entries and a 30s freshness window
+      // — matches → drop the streaming bubble + skip push + skip
+      // recordOptimistic (no future event will match).
+      const tail = sess.history.slice(-2);
+      const echoedByEvent = tail.some(
+        (h) => h.role === "bot" && h.text === pending && (Date.now() - h.ts) < 30_000,
+      );
+      if (echoedByEvent) {
+        bubble.remove();
+        return;
+      }
+      sess.history.push({ role: "bot", text: pending, ts: Date.now() });
+      sess.lastActiveAt = Date.now();
+      saveStore();
+      renderSessionList();
+    }
+    recordOptimistic(sid, "assistant", pending);
+  };
+
+  // Drop the empty/partial bubble. Used when the stream attempt fails
+  // pre-first-chunk and we're falling back to /chat.
+  const discardBubble = (): void => {
+    cancelRender();
+    bubble.remove();
+  };
+
+  // Settle the partial bubble when something cut the stream off after at
+  // least one chunk arrived. We keep what was rendered, append a small
+  // notice, and persist to history + dedup so a future `message_added`
+  // event for the (potentially identical) full reply doesn't double-render.
+  const settlePartial = (noticeText: string): void => {
+    cancelRender();
+    flushRender();
+    bubble.classList.remove("streaming");
+    if (noticeText) {
+      const note = document.createElement("div");
+      note.className = "stream-notice";
+      note.textContent = noticeText;
+      bubble.appendChild(note);
+    }
+    const sess = store.sessions[sid];
+    if (sess) {
+      sess.history.push({ role: "bot", text: pending, ts: Date.now() });
+      sess.lastActiveAt = Date.now();
+      saveStore();
+      renderSessionList();
+    }
+    recordOptimistic(sid, "assistant", pending);
+  };
+
+  try {
+    const info = await streamChat(sid, message, onChunk, ac.signal);
+    finalizeOk(info);
+    return "ok";
+  } catch (e) {
+    const err = e as { name?: string; message?: string };
+    const isAbort = err.name === "AbortError";
+    const sce = e instanceof StreamChatError ? e : null;
+
+    if (isAbort) {
+      if (firstChunkSeen) {
+        settlePartial("[已中断]");
+        return "ok";
+      }
+      // User cancelled before any text arrived: drop the empty bubble and
+      // do not fall back — the user explicitly stopped the request.
+      discardBubble();
+      return "ok";
+    }
+
+    // 4xx and similar pre-stream HTTP failures: caller should fall back
+    // to /chat which renders the appropriate inline error using existing
+    // status-aware copy. Drop the empty bubble first.
+    if (sce && sce.status >= 400 && sce.status < 600) {
+      discardBubble();
+      recordStreamFailure();
+      return "fallback";
+    }
+
+    // Mid-stream error frame from the server (`data: {"error": "..."}`).
+    // status is 0 in this branch. Surface the error inline; if we already
+    // rendered partial text, keep it visible above the error banner.
+    // Note: do NOT call recordStreamFailure() here — the SSE transport
+    // worked end-to-end; the LLM (or upstream provider) is the one that
+    // errored. Tripping the circuit breaker would force the next sends
+    // through /chat where they'd hit the same LLM and fail identically,
+    // and disable streaming for unrelated future sends.
+    if (sce && sce.status === 0) {
+      if (firstChunkSeen) {
+        settlePartial("");
+        addMessageBubble("error", streamErrorCopy(sce.code));
+        return "ok";
+      }
+      discardBubble();
+      addMessageBubble("error", streamErrorCopy(sce.code));
+      return "ok";
+    }
+
+    // Network/timeout/abort-from-timeout. If we have partial content,
+    // keep it and don't re-fire /chat (the server already started
+    // generating; a second hit would either 429 concurrent_request or
+    // double-charge quota). If we have nothing, fall back.
+    if (firstChunkSeen) {
+      settlePartial("[网络中断]");
+      recordStreamFailure();
+      return "ok";
+    }
+    discardBubble();
+    recordStreamFailure();
+    return "fallback";
+  } finally {
+    if (sync.streamAbort === ac) sync.streamAbort = null;
+    setSendMode("send");
+  }
+}
+
+function streamErrorCopy(code: string): string {
+  if (code === "llm_timeout") return "回复生成超时，请稍后再试。";
+  if (code === "llm_call_failed") return "上游模型调用失败，请稍后再试。";
+  if (code === "stream_truncated") return "流式响应被截断。";
+  return `请求失败: ${code}`;
+}
+
+async function runNonStreamingSend(sid: string, message: string): Promise<void> {
   try {
     const resp = await fetchWithTimeout(
       CHAT_URL,
@@ -1198,9 +1592,6 @@ async function send(): Promise<void> {
     else addMessageBubble("error", `请求失败: ${err} ${payload.detail || ""}`);
   } catch (error) {
     addMessageBubble("error", `网络错误: ${String(error)}`);
-  } finally {
-    hideTyping();
-    sendBtn.disabled = false;
   }
 }
 
@@ -1210,6 +1601,7 @@ $<HTMLButtonElement>("logout").onclick = () => {
   if (!confirm("登出会清除本机保存的 token 与对话历史。继续？")) return;
   sync.stopped = true;
   abortInflightLongPoll();
+  if (sync.streamAbort) { sync.streamAbort.abort(); sync.streamAbort = null; }
   clearTimer("shortPollTimer");
   clearTimer("probeTimer");
   clearTimer("retryTimer");
@@ -1235,7 +1627,16 @@ inputEl.addEventListener("keydown", (e) => {
     void send();
   }
 });
-sendBtn.onclick = (): void => { void send(); };
+sendBtn.onclick = (): void => {
+  // Same button doubles as stop while a stream is in flight. Click during
+  // stream cancels the AbortController; the streaming path catches the
+  // resulting AbortError and either keeps the partial bubble or drops it.
+  if (sync.streamAbort) {
+    sync.streamAbort.abort();
+    return;
+  }
+  void send();
+};
 
 document.addEventListener("visibilitychange", onVisibilityChange);
 
