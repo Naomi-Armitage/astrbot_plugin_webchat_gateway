@@ -944,7 +944,22 @@ def make_chat_stream_handler(deps: ChatDeps):
             # registry.close_*, the lock would stay held indefinitely.
             # close_failed is idempotent — the registry no-ops on an
             # already-closed handle (see core/stream_registry.py).
+            #
+            # Reaching this branch means a code path returned without
+            # setting terminal_emitted — almost always a refactor bug.
+            # Log it loudly (with a stack via logger.exception) so the
+            # operator can find it; otherwise the buffer transitions to
+            # closed_failed("internal_error") silently and any peer
+            # device that resumes onto it sees a generic error frame
+            # with no server-side trace.
             if not terminal_emitted:
+                logger.warning(
+                    "[WebChatGateway] stream handler missed terminal close "
+                    "(stream_id=%s, collected=%d) — forcing close_failed",
+                    handle_obj.stream_id,
+                    len("".join(collected)),
+                    stack_info=True,
+                )
                 try:
                     await deps.registry.close_failed(
                         handle_obj, error_code="internal_error"

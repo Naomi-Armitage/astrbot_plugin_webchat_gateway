@@ -2105,6 +2105,21 @@ async function attemptResumeOnLoad(sid: string): Promise<void> {
   const pending = store.pendingStreams[sid];
   if (!pending) return;
   if (sync.activeResumeAborts[sid]) return;
+  // Drop stale PendingStream entries before attempting resume. Server-
+  // side buffer grace TTL is 30s after stream close; LLM per-chunk
+  // timeout (default 60s) bounds in-flight duration. After ~5 minutes
+  // the buffer is definitely gone, so resuming would just hit
+  // stream_not_found (best case) or surface a stale closed_failed
+  // entry as "请求失败: internal_error" (worst case). Either way the
+  // PendingStream is dead — clear it without a doomed network round-
+  // trip + scary error toast.
+  const STALE_AFTER_MS = 5 * 60 * 1000;
+  const startedAt = typeof pending.started_at === "number" ? pending.started_at : 0;
+  if (!startedAt || Date.now() - startedAt > STALE_AFTER_MS) {
+    delete store.pendingStreams[sid];
+    savePendingStreams();
+    return;
+  }
   await attachStreamingBubble({
     sid,
     kind: "resume",
