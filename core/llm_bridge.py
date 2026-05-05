@@ -245,25 +245,22 @@ class LlmBridge:
             except Exception:
                 logger.exception("[WebChatGateway] persist conversation failed")
 
-        # `asyncio.wait_for` doesn't compose with async generators, so guard
-        # each `__anext__` with the remaining budget — same wall-clock shape
-        # as generate_reply, just spread across yields.
+        # Per-chunk idle timeout, NOT a total wall-clock budget. Streaming
+        # responses are explicitly unbounded in length (a search-augmented
+        # reply with 30 chunks of 5s each is fine, even though the total
+        # time exceeds `llm_timeout_seconds`); the only failure mode worth
+        # firing on is "no progress in too long". `self._timeout` is the
+        # max gap between consecutive chunks (and the max time before the
+        # first chunk). Non-streaming `generate_reply` retains its total
+        # wall-clock semantics — see asyncio.wait_for in that method.
         agen = _runner()
-        deadline = (
-            asyncio.get_event_loop().time() + self._timeout
-            if self._timeout
-            else None
-        )
         try:
             while True:
                 try:
-                    if deadline is not None:
-                        remaining = deadline - asyncio.get_event_loop().time()
-                        if remaining <= 0:
-                            raise RuntimeError("llm_timeout")
+                    if self._timeout:
                         try:
                             text = await asyncio.wait_for(
-                                agen.__anext__(), timeout=remaining
+                                agen.__anext__(), timeout=self._timeout
                             )
                         except asyncio.TimeoutError as exc:
                             raise RuntimeError("llm_timeout") from exc
