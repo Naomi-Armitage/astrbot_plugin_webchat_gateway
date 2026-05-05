@@ -1733,9 +1733,24 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
 
   // Empty bot bubble that chunks render into. The streaming class drives
   // the blinking caret; on completion we strip it so the bubble settles.
+  // Internal layout: a Text node for streamed content + a real <span> for
+  // the caret. Reasons:
+  //   - Text node + nodeValue writes are cheaper than `textContent` (no
+  //     subtree rebuild per frame). Important on Edge / older Chromium
+  //     where every textContent write creates and destroys text nodes.
+  //   - Caret as a real element, NOT ::after, so text-node updates don't
+  //     reposition / repaint the caret. ::after pseudo-elements share
+  //     layout with their host's contents and can stutter visibly on
+  //     fast text growth.
   hideTyping();
   const bubble = document.createElement("div") as HTMLDivElement;
   bubble.className = "msg bot md streaming";
+  const streamTextNode = document.createTextNode("");
+  const caretSpan = document.createElement("span");
+  caretSpan.className = "stream-caret";
+  caretSpan.setAttribute("aria-hidden", "true");
+  bubble.appendChild(streamTextNode);
+  bubble.appendChild(caretSpan);
   msgs.appendChild(bubble);
   scrollToEnd();
 
@@ -1751,7 +1766,7 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
   let rafToken = 0;
   if (kind === "resume" && typeof opts.initialText === "string" && opts.initialText.length) {
     pending = opts.initialText;
-    bubble.textContent = pending;
+    streamTextNode.data = pending;
     displayedLength = pending.length;
     firstChunkSeen = true;
     scrollToEnd();
@@ -1782,9 +1797,14 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
   // swaps to innerHTML with the full markdown render. The CSS rule on
   // `.msg.bot.md.streaming` keeps newlines + spaces visible during the
   // textContent phase so paragraph structure stays readable.
+  // Throttle scrollToEnd to ~12fps. Reading scrollHeight forces layout
+  // and writing scrollTop forces paint; doing both per frame eats into
+  // the budget on slower devices. Text grows fast enough that a 4-frame
+  // gap (~67ms) between scroll updates is imperceptible.
+  let renderFrameCounter = 0;
   const renderTo = (n: number): void => {
-    bubble.textContent = pending.slice(0, n);
-    scrollToEnd();
+    streamTextNode.data = pending.slice(0, n);
+    if (++renderFrameCounter % 5 === 0) scrollToEnd();
   };
   const tick = (): void => {
     rafToken = 0;

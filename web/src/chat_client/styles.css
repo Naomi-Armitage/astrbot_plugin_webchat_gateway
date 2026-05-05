@@ -711,30 +711,35 @@ footer button:disabled { opacity: .5; cursor: not-allowed; }
 }
 
 /* Streaming caret on the bot bubble while chunks are still arriving.
-   Inline so the cursor sits flush with the last rendered character even
-   inside a final <p> / <li>; uses --accent so it picks up theme colors. */
+   Inline real <span> (not ::after) so text-node updates don't repaint
+   the caret on every frame; uses --accent so it picks up theme colors. */
 .msg.bot.md.streaming {
-  /* During streaming we render plain text via textContent (no markdown
-     parse per frame — too expensive for the rAF typewriter loop). pre-wrap
-     keeps newlines + multiple spaces visible so the user can still tell
-     paragraphs apart; on terminal the bubble swaps to .innerHTML with the
-     full markdown render and `white-space` reverts to normal via the
-     class removal. */
+  /* During streaming we render plain text via a Text node (no markdown
+     parse per frame — too expensive for the rAF typewriter loop).
+     pre-wrap keeps newlines + multiple spaces visible so paragraph
+     structure stays readable; on terminal the bubble swaps to .innerHTML
+     with the full markdown render and `white-space` reverts to normal
+     via the class removal. */
   white-space: pre-wrap;
 }
-.msg.bot.md.streaming::after {
-  content: "";
+.stream-caret {
   display: inline-block;
   width: 2px;
   height: 1em;
   margin-left: 2px;
   vertical-align: -2px;
   background: var(--accent);
-  animation: streamCaret 1s steps(2, start) infinite;
+  /* Smooth fade beats the previous steps(2) hard blink — discrete
+     on/off reads as "卡" especially on Edge where compositor ticks
+     don't always align with the ~1Hz timing. ease-in-out gives a
+     natural pulse that looks consistent regardless of frame timing. */
+  animation: streamCaret 1.1s ease-in-out infinite;
+  will-change: opacity;
 }
+.msg.bot.md:not(.streaming) .stream-caret { display: none; }
 @keyframes streamCaret {
   0%, 100% { opacity: 1; }
-  50%      { opacity: 0; }
+  50%      { opacity: 0.15; }
 }
 .msg.bot .stream-notice {
   margin-top: 6px;
