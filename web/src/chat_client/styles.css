@@ -655,10 +655,18 @@ footer textarea {
      exceeds it the textarea scrolls internally. */
   resize: none;
   overflow-y: auto;
+  /* Hide the native scrollbar entirely (Telegram-style). Scrolling
+     still works via wheel / touch / keyboard; we just don't render
+     the bar + arrow buttons, which were visually intrusive and
+     particularly ugly on Windows (chunky arrows above/below the
+     thumb). All three rules cover the major engines. */
+  scrollbar-width: none;            /* Firefox */
+  -ms-overflow-style: none;         /* legacy Edge / IE */
   font: inherit;
   line-height: 1.5;
   transition: border-color .15s ease, box-shadow .15s ease;
 }
+footer textarea::-webkit-scrollbar { display: none; }  /* Chromium / WebKit */
 footer textarea::placeholder { color: var(--ink-soft); }
 footer textarea:focus {
   outline: none;
