@@ -32,6 +32,23 @@ const SITE_URL = `${API}/site`;
 const TITLE_URL = `${API}/title`;
 const CONV_URL = `${API}/conversations`;
 const EVENTS_URL = `${API}/events`;
+const UPLOAD_URL = `${API}/upload`;
+const FILES_URL = `${API}/files`;
+
+// Upload defaults — overridable from /api/webchat/site at boot so an
+// operator who raises max_attachments_per_message on the server side
+// gets a UI that respects the new cap without a frontend rebuild.
+// `let` (not `const`) so loadChatSite() can swap them in.
+let MAX_ATTACHMENTS_PER_MESSAGE = 4;
+let MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024;
+let ALLOWED_MIME: readonly string[] = ["image/jpeg", "image/png", "image/webp", "image/gif"];
+let UPLOADS_ENABLED = true;
+const RESIZE_TARGET_LONG_EDGE = 2048;
+const RESIZE_JPEG_QUALITY = 0.85;
+// Files already comfortably below the long-edge cap AND under this size get
+// uploaded as-is (no re-encode). Saves a Canvas decode/encode pass for tiny
+// screenshots / icons / thumbnails where the resize would be a no-op.
+const RESIZE_SKIP_MAX_BYTES = 2 * 1024 * 1024;
 
 const TITLE_MAX = 25;
 const RENAME_MAX = 40;
@@ -104,7 +121,32 @@ function fetchWithTimeout(
 
 type Role = "user" | "bot" | "error" | "notice";
 type ServerRole = "user" | "assistant";
-interface HistoryItem { role: Role; text: string; ts: number; incomplete?: boolean; }
+// Server-issued reference to an uploaded file. `mime` is required after upload
+// commit; width/height are reserved for future per-image grid hints.
+interface AttachmentRef {
+  file_id: string;
+  mime: string;
+  width?: number;
+  height?: number;
+}
+// Per-composer pending attachment. Lives only in the in-memory queue between
+// the user adding the file and the message being sent.
+interface PendingAttachment {
+  local_id: string;
+  file_id?: string;
+  mime: string;
+  size: number;
+  preview_url: string;
+  state: "uploading" | "ready" | "error";
+  error_message?: string;
+}
+interface HistoryItem {
+  role: Role;
+  text: string;
+  ts: number;
+  incomplete?: boolean;
+  attachments?: AttachmentRef[];
+}
 interface SessionMeta {
   id: string;
   title: string;
@@ -149,7 +191,13 @@ interface ServerConversationsResponse {
   last_pts: number;
   conversations: ServerSessionListItem[];
 }
-interface ServerMessage { role: ServerRole; content: string; ts?: number; incomplete?: boolean; }
+interface ServerMessage {
+  role: ServerRole;
+  content: string;
+  ts?: number;
+  incomplete?: boolean;
+  attachments?: AttachmentRef[];
+}
 interface ServerConversationDetail {
   session_id: string;
   title: string;
@@ -189,6 +237,11 @@ const sidebarEl = $("sidebar");
 const sidebarToggleBtn = $<HTMLButtonElement>("sidebarToggle");
 const sidebarBackdrop = $("sidebarBackdrop");
 const sessionListEl = $<HTMLUListElement>("sessionList");
+const attachBtn = $<HTMLButtonElement>("attachBtn");
+const fileInputEl = $<HTMLInputElement>("fileInput");
+const composerAttachmentsEl = $("composer-attachments");
+const dropOverlayEl = $("dropOverlay");
+const footerEl = document.querySelector("footer") as HTMLElement;
 
 const username = (localStorage.getItem(LS_USERNAME) || "Friend").trim() || "Friend";
 const strong = document.createElement("strong");
@@ -201,10 +254,23 @@ const blankSession = (id?: string): SessionMeta =>
   ({ id: id ?? newId(), title: "新会话", lastActiveAt: Date.now(), history: [] });
 const nowSec = (): number => Math.floor(Date.now() / 1000);
 
+function isAttachmentRef(it: unknown): it is AttachmentRef {
+  if (!it || typeof it !== "object") return false;
+  const o = it as Record<string, unknown>;
+  if (typeof o.file_id !== "string" || !o.file_id) return false;
+  if (typeof o.mime !== "string") return false;
+  if (o.width !== undefined && typeof o.width !== "number") return false;
+  if (o.height !== undefined && typeof o.height !== "number") return false;
+  return true;
+}
 function isHistoryItem(it: unknown): it is HistoryItem {
   if (!it || typeof it !== "object") return false;
   const o = it as Record<string, unknown>;
   if (o.incomplete !== undefined && typeof o.incomplete !== "boolean") return false;
+  if (o.attachments !== undefined) {
+    if (!Array.isArray(o.attachments)) return false;
+    if (!o.attachments.every(isAttachmentRef)) return false;
+  }
   return typeof o.text === "string" && typeof o.ts === "number" &&
     (o.role === "user" || o.role === "bot" || o.role === "error" || o.role === "notice");
 }
@@ -305,7 +371,7 @@ const serverRoleToLocal = (r: ServerRole): Role => r === "assistant" ? "bot" : "
 function replayActive(): void {
   clearMsgList();
   for (const item of currentSession().history) {
-    addMessageBubble(item.role, item.text);
+    addMessageBubble(item.role, item.text, item.attachments);
     if (item.role === "bot" && item.incomplete) appendIncompleteNoticeToLastBubble();
   }
   scrollToEnd();
@@ -368,16 +434,45 @@ function renderMarkdown(text: string): string {
 // Append a chat bubble. `text` is the raw content as stored in history;
 // for the bot role we render markdown (sanitized), everything else stays
 // plain text (textContent) — user input must never be HTML-rendered
-// because it's untrusted input echoed back to the same DOM.
-function addMessageBubble(role: Role, text: string): void {
+// because it's untrusted input echoed back to the same DOM. User bubbles
+// may also include an image grid (1..4 attachments) rendered above the
+// text; clicking any thumbnail opens a lightbox with carousel.
+function addMessageBubble(role: Role, text: string, attachments?: AttachmentRef[]): void {
   hideTyping();
   const div = document.createElement("div");
   div.className = "msg " + role;
+  const hasImages = role === "user" && Array.isArray(attachments) && attachments.length > 0;
+  if (hasImages) {
+    const list = attachments as AttachmentRef[];
+    const count = Math.min(list.length, MAX_ATTACHMENTS_PER_MESSAGE);
+    const grid = document.createElement("div");
+    grid.className = "msg-attachments cnt-" + count;
+    for (let i = 0; i < count; i++) {
+      const a = list[i]!;
+      const img = document.createElement("img");
+      img.className = "msg-image";
+      img.loading = "lazy";
+      img.alt = "";
+      img.src = fileServeUrl(a.file_id);
+      attachImgErrorRetry(img);
+      const captureIdx = i;
+      img.addEventListener("click", () => openLightbox(list, captureIdx));
+      grid.appendChild(img);
+    }
+    div.appendChild(grid);
+  }
   if (role === "bot") {
     div.classList.add("md");
-    div.innerHTML = renderMarkdown(text);
-  } else {
-    div.textContent = text;
+    if (text) div.innerHTML = renderMarkdown(text);
+  } else if (text) {
+    if (hasImages) {
+      const span = document.createElement("div");
+      span.className = "msg-text";
+      span.textContent = text;
+      div.appendChild(span);
+    } else {
+      div.textContent = text;
+    }
   }
   msgs.appendChild(div);
   scrollToEnd();
@@ -514,6 +609,7 @@ interface PendingLocal {
   sessionId: string;
   role: ServerRole;
   contentKey: string;
+  attachmentsKey: string;            // sorted "|"-joined file_ids ("" for text-only)
   recordedAtSec: number;            // local clock when we rendered it; matches against event ts
   expiresAt: number;                 // ms
 }
@@ -524,26 +620,40 @@ function trimContent(s: string): string {
   return s.trim().slice(0, DEDUP_CONTENT_LEN);
 }
 
-function recordOptimistic(sessionId: string, role: ServerRole, content: string): void {
+function attachmentsKeyFromRefs(refs?: AttachmentRef[] | readonly AttachmentRef[] | null): string {
+  if (!refs || !refs.length) return "";
+  return refs.map((a) => a.file_id).sort().join("|");
+}
+
+function recordOptimistic(sessionId: string, role: ServerRole, content: string, attachments?: AttachmentRef[]): void {
   pendingLocals.push({
     sessionId,
     role,
     contentKey: trimContent(content),
+    attachmentsKey: attachmentsKeyFromRefs(attachments),
     recordedAtSec: nowSec(),
     expiresAt: Date.now() + PENDING_TTL_MS,
   });
 }
 
-function consumeIfDuplicate(sessionId: string, role: ServerRole, content: string, eventTs: number): boolean {
+function consumeIfDuplicate(
+  sessionId: string,
+  role: ServerRole,
+  content: string,
+  eventTs: number,
+  attachments?: AttachmentRef[],
+): boolean {
   const now = Date.now();
   // Drop expired entries first so we don't hold stale matches forever.
   for (let i = pendingLocals.length - 1; i >= 0; i--) {
     if (pendingLocals[i]!.expiresAt < now) pendingLocals.splice(i, 1);
   }
   const key = trimContent(content);
+  const aKey = attachmentsKeyFromRefs(attachments);
   for (let i = 0; i < pendingLocals.length; i++) {
     const p = pendingLocals[i]!;
     if (p.sessionId !== sessionId || p.role !== role || p.contentKey !== key) continue;
+    if (p.attachmentsKey !== aKey) continue;
     if (Math.abs(eventTs - p.recordedAtSec) > DEDUP_TS_WINDOW_S) continue;
     pendingLocals.splice(i, 1);
     return true;
@@ -610,8 +720,28 @@ function applyEvent(ev: ServerEvent): void {
       const content = payload["content"];
       const incomplete = payload["incomplete"] === true;
       if ((role !== "user" && role !== "assistant") || typeof content !== "string") break;
+      let attachments: AttachmentRef[] | undefined;
+      const rawAttachments = payload["attachments"];
+      if (Array.isArray(rawAttachments) && rawAttachments.length) {
+        const parsed: AttachmentRef[] = [];
+        for (const entry of rawAttachments) {
+          if (entry && typeof entry === "object") {
+            const o = entry as Record<string, unknown>;
+            if (typeof o.file_id === "string" && o.file_id) {
+              const ref: AttachmentRef = {
+                file_id: o.file_id,
+                mime: typeof o.mime === "string" ? o.mime : "image/jpeg",
+              };
+              if (typeof o.width === "number") ref.width = o.width;
+              if (typeof o.height === "number") ref.height = o.height;
+              parsed.push(ref);
+            }
+          }
+        }
+        if (parsed.length) attachments = parsed;
+      }
       // Dedup: if we already rendered this locally on this device, drop the event.
-      if (consumeIfDuplicate(sid, role, content, ev.ts)) {
+      if (consumeIfDuplicate(sid, role, content, ev.ts, attachments)) {
         // Still bump lastActiveAt so the sidebar order matches the server.
         const s = store.sessions[sid];
         if (s) s.lastActiveAt = Math.max(s.lastActiveAt, ev.ts * 1000);
@@ -624,6 +754,17 @@ function applyEvent(ev: ServerEvent): void {
           const last = s?.history[s.history.length - 1];
           if (last && last.role === "bot" && last.text === content) last.incomplete = true;
         }
+        // Backfill attachments onto the locally-recorded entry so a later
+        // replay (e.g. session-switch) shows the image grid.
+        if (attachments && role === "user" && s) {
+          for (let i = s.history.length - 1; i >= 0; i--) {
+            const h = s.history[i]!;
+            if (h.role === "user" && h.text === content && !h.attachments) {
+              h.attachments = attachments;
+              break;
+            }
+          }
+        }
         break;
       }
       let sess = store.sessions[sid];
@@ -634,13 +775,14 @@ function applyEvent(ev: ServerEvent): void {
       const localRole: Role = serverRoleToLocal(role as ServerRole);
       const item: HistoryItem = { role: localRole, text: content, ts: ev.ts * 1000 };
       if (incomplete && role === "assistant") item.incomplete = true;
+      if (attachments && localRole === "user") item.attachments = attachments;
       sess.history.push(item);
       sess.lastActiveAt = ev.ts * 1000;
       if (role === "user" && (sess.title === "新会话" || !sess.title)) {
         sess.title = deriveTitle(sess.history);
       }
       if (sid === store.activeId) {
-        addMessageBubble(localRole, content);
+        addMessageBubble(localRole, content, item.attachments);
         if (item.incomplete) appendIncompleteNoticeToLastBubble();
       }
       break;
@@ -773,6 +915,10 @@ function ingestConversationDetail(detail: ServerConversationDetail): void {
       ts: (m.ts ?? detail.updated_at) * 1000,
     };
     if (m.role === "assistant" && m.incomplete === true) item.incomplete = true;
+    if (m.role === "user" && Array.isArray(m.attachments) && m.attachments.length) {
+      // Cheap, server-side already validated shape — copy through.
+      item.attachments = m.attachments.filter(isAttachmentRef);
+    }
     return item;
   });
 }
@@ -1082,6 +1228,12 @@ function renderSessionList(): void {
 function switchSession(id: string): void {
   if (!store.sessions[id]) return;
   if (id !== store.activeId) {
+    // Composer attachments are bound to the upload-time session_id at
+    // the server. Switching sessions invalidates the queued file_ids
+    // (they'd be rejected as `invalid_attachment` if the user clicked
+    // send under the new session). Revoke the object URLs and clear
+    // the queue so the user starts the new session fresh.
+    clearComposerAttachments();
     store.activeId = id;
     saveStore();
     replayActive();
@@ -1267,7 +1419,44 @@ async function loadChatSite(): Promise<void> {
       FETCH_TIMEOUT_FAST_MS,
     );
     if (!resp.ok) return;
-    const data = (await resp.json()) as SiteConfig;
+    const data = (await resp.json()) as SiteConfig & {
+      uploads?: {
+        enabled?: boolean;
+        max_file_size_mb?: number;
+        max_attachments_per_message?: number;
+        allowed_mime?: string[];
+      };
+    };
+    // Apply server-driven upload caps (overrides hardcoded defaults).
+    // An operator who edits config to raise max_attachments_per_message
+    // from 4 to 8 expects the UI to follow without a code change.
+    const u = data.uploads;
+    if (u) {
+      if (typeof u.enabled === "boolean") UPLOADS_ENABLED = u.enabled;
+      if (typeof u.max_file_size_mb === "number" && u.max_file_size_mb > 0) {
+        MAX_FILE_SIZE_BYTES = u.max_file_size_mb * 1024 * 1024;
+      }
+      if (
+        typeof u.max_attachments_per_message === "number"
+        && u.max_attachments_per_message > 0
+      ) {
+        MAX_ATTACHMENTS_PER_MESSAGE = u.max_attachments_per_message;
+      }
+      if (Array.isArray(u.allowed_mime) && u.allowed_mime.length > 0) {
+        const filtered = u.allowed_mime.filter(
+          (m) => typeof m === "string" && m.length > 0,
+        );
+        if (filtered.length > 0) {
+          ALLOWED_MIME = filtered;
+          ALLOWED_MIME_SET = new Set(filtered);
+        }
+      }
+    }
+    if (!UPLOADS_ENABLED) {
+      // Server says uploads are off — hide the paperclip + don't accept
+      // drops/paste.
+      try { attachBtn.hidden = true; } catch {}
+    }
     const name = (data.site_name || "").trim() || "WebChat Gateway";
     document.title = `${name} · Chat`;
     $("brandName").textContent = name;
@@ -1498,6 +1687,7 @@ async function consumeSseStream(
 async function streamChat(
   sid: string,
   message: string,
+  attachments: AttachmentRef[],
   onChunk: StreamChunkHandler,
   signal: AbortSignal,
   onStreamId?: (id: string) => void,
@@ -1509,11 +1699,13 @@ async function streamChat(
   // replies even when chunks are still flowing — the bug this fix is
   // targeting. Cancellation is via the AbortController in `signal`
   // (stop button, page unload, session-level lifecycle).
+  const body: Record<string, unknown> = { session_id: sid, username, message };
+  if (attachments.length) body.attachments = attachments.map((a) => ({ file_id: a.file_id }));
   const resp = await fetch(CHAT_STREAM_URL, {
     method: "POST",
     credentials: "same-origin",
     headers: { "Content-Type": "application/json", ...bearer() },
-    body: JSON.stringify({ session_id: sid, username, message }),
+    body: JSON.stringify(body),
     signal,
   });
 
@@ -1588,6 +1780,445 @@ function setSendMode(mode: "send" | "stop"): void {
   sendBtn.setAttribute("aria-label", mode === "stop" ? "停止" : "发送");
 }
 
+// ---------- Composer attachments ----------
+
+let composerAttachments: PendingAttachment[] = [];
+// Latch so the "exceeded 4 chips" notice only fires once per add batch even
+// if the user dropped 7 files in one go.
+let attachmentsCapNoticeShown = false;
+
+let ALLOWED_MIME_SET: ReadonlySet<string> = new Set(ALLOWED_MIME);
+
+function genLocalId(): string {
+  return crypto.randomUUID?.() ?? `a-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+// Build a URL the browser can fetch for an already-uploaded server file.
+// Build the public URL for an attachment's serve endpoint. `<img src>`
+// can't set Authorization headers, so the serve endpoint authenticates
+// via a path-scoped, HttpOnly, SameSite=Lax cookie that the gateway
+// emits on every /me probe (see `core/file_cookie.py` on the server
+// side, `probeQuota` below which triggers the cookie issue on boot).
+// The bearer token is NEVER in the URL — that would leak it into
+// browser history, server access logs, monitoring, and Referer.
+function fileServeUrl(file_id: string): string {
+  return `${FILES_URL}/${encodeURIComponent(file_id)}`;
+}
+
+// Attach a one-shot retry handler to a chat image. The serve endpoint
+// authenticates via the wcg_file cookie which is issued by /me. Two
+// situations can leave an image temporarily un-authed:
+//   1. First paint after boot, before probeQuota has completed the
+//      initial /me roundtrip → cookie not yet present → 401.
+//   2. Plugin restart in a long-lived session — the HMAC secret
+//      rotates, old cookie value no longer verifies → 401.
+// Both heal by hitting /me again. We do that lazily, only on actual
+// error. Retry-state is tracked per file_id (the URL's base path) with
+// a 60s cooldown — defends against an auth-loop with a permanently
+// bad token, while still recovering from transient failures.
+const _imgRetriedAt = new Map<string, number>();
+function attachImgErrorRetry(img: HTMLImageElement): void {
+  img.addEventListener("error", () => {
+    const base = img.src.split("?")[0] || img.src;
+    const last = _imgRetriedAt.get(base);
+    if (last !== undefined && Date.now() - last < 60_000) return;
+    _imgRetriedAt.set(base, Date.now());
+    void probeQuota().then(() => {
+      // Cache-bust so the browser re-fetches even though the URL is
+      // structurally identical. The new fetch carries the freshly
+      // issued cookie via the same-origin path.
+      img.src = "";
+      img.src = base + "?_r=" + Date.now();
+    }).catch(() => {});
+  });
+}
+
+// Decode an image via createImageBitmap (preferred — runs off-thread on
+// modern browsers) with a graceful fallback to <img> + Image.decode for
+// older Safari / mobile WebKit where createImageBitmap doesn't accept Blob.
+async function decodeImage(blob: Blob): Promise<{ width: number; height: number; bitmap?: ImageBitmap; img?: HTMLImageElement }> {
+  if (typeof createImageBitmap === "function") {
+    try {
+      const bitmap = await createImageBitmap(blob);
+      return { width: bitmap.width, height: bitmap.height, bitmap };
+    } catch {
+      // Fall through to Image element path.
+    }
+  }
+  const url = URL.createObjectURL(blob);
+  try {
+    const img = new Image();
+    img.src = url;
+    await img.decode();
+    return { width: img.naturalWidth, height: img.naturalHeight, img };
+  } finally {
+    // Don't revoke yet — caller might still need to draw from it. Caller
+    // passes the same blob to the canvas in fallback path; the URL is
+    // short-lived anyway and gets GC'd when the function returns.
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+  }
+}
+
+// Returns the original blob if the input is GIF (preserve animation), small
+// enough to skip, or canvas-encoding fails. Otherwise returns a resized
+// JPEG blob with long edge ≤ RESIZE_TARGET_LONG_EDGE.
+async function resizeIfNeeded(file: File): Promise<Blob> {
+  if (file.type === "image/gif") return file;
+  if (file.size <= RESIZE_SKIP_MAX_BYTES) {
+    // Small file — peek dimensions to decide, but skip the encode pass if
+    // the long edge is already under the cap. The decode itself is cheap
+    // compared to a full canvas re-encode.
+    try {
+      const decoded = await decodeImage(file);
+      const longEdge = Math.max(decoded.width, decoded.height);
+      if (decoded.bitmap) decoded.bitmap.close();
+      if (longEdge <= RESIZE_TARGET_LONG_EDGE) return file;
+    } catch {
+      return file;
+    }
+  }
+  let decoded: { width: number; height: number; bitmap?: ImageBitmap; img?: HTMLImageElement };
+  try {
+    decoded = await decodeImage(file);
+  } catch {
+    return file;
+  }
+  const { width, height, bitmap, img } = decoded;
+  const longEdge = Math.max(width, height);
+  if (longEdge <= RESIZE_TARGET_LONG_EDGE) {
+    if (bitmap) bitmap.close();
+    return file;
+  }
+  const scale = RESIZE_TARGET_LONG_EDGE / longEdge;
+  const targetW = Math.round(width * scale);
+  const targetH = Math.round(height * scale);
+  const canvas = document.createElement("canvas");
+  canvas.width = targetW;
+  canvas.height = targetH;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) {
+    if (bitmap) bitmap.close();
+    return file;
+  }
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  if (bitmap) {
+    ctx.drawImage(bitmap, 0, 0, targetW, targetH);
+    bitmap.close();
+  } else if (img) {
+    ctx.drawImage(img, 0, 0, targetW, targetH);
+  }
+  const out = await new Promise<Blob | null>((resolve) => {
+    canvas.toBlob((b) => resolve(b), "image/jpeg", RESIZE_JPEG_QUALITY);
+  });
+  if (!out) return file;
+  // Pick whichever is smaller — for low-detail photos the resized JPEG
+  // can be larger than a small original PNG. Resize is a hint, not a
+  // bandwidth contract.
+  if (out.size >= file.size) return file;
+  return out;
+}
+
+async function uploadAttachment(blob: Blob, sid: string, attachment: PendingAttachment): Promise<void> {
+  const fd = new FormData();
+  // Browser-side FormData filenames are mostly cosmetic on the server
+  // (we re-derive the extension from the validated MIME), but a stable
+  // synthetic name keeps the multipart header tidy.
+  const ext = attachment.mime === "image/png" ? "png"
+    : attachment.mime === "image/webp" ? "webp"
+    : attachment.mime === "image/gif" ? "gif"
+    : "jpg";
+  fd.append("file", blob, `upload.${ext}`);
+  fd.append("session_id", sid);
+  try {
+    const resp = await fetchWithTimeout(
+      UPLOAD_URL,
+      {
+        method: "POST",
+        credentials: "same-origin",
+        headers: bearer(),
+        body: fd,
+      },
+      FETCH_TIMEOUT_CHAT_MS,
+    );
+    if (resp.status === 401) {
+      attachment.state = "error";
+      attachment.error_message = "未授权";
+      renderComposerAttachments();
+      handle401();
+      return;
+    }
+    let payload: Record<string, unknown> = {};
+    try { payload = await resp.json() as Record<string, unknown>; } catch {}
+    if (!resp.ok) {
+      const code = typeof payload.error === "string" ? payload.error : `http_${resp.status}`;
+      attachment.state = "error";
+      attachment.error_message = uploadErrorCopy(code, payload);
+      renderComposerAttachments();
+      updateSendButtonState();
+      return;
+    }
+    const fid = typeof payload.file_id === "string" ? payload.file_id : "";
+    const mime = typeof payload.mime === "string" ? payload.mime : attachment.mime;
+    const size = typeof payload.size === "number" ? payload.size : blob.size;
+    if (!fid) {
+      attachment.state = "error";
+      attachment.error_message = "上传失败";
+      renderComposerAttachments();
+      updateSendButtonState();
+      return;
+    }
+    attachment.file_id = fid;
+    attachment.mime = mime;
+    attachment.size = size;
+    attachment.state = "ready";
+    renderComposerAttachments();
+    updateSendButtonState();
+  } catch (e) {
+    const err = e as { name?: string };
+    attachment.state = "error";
+    attachment.error_message = err.name === "AbortError" ? "上传已取消" : "网络错误";
+    renderComposerAttachments();
+    updateSendButtonState();
+  }
+}
+
+function uploadErrorCopy(code: string, payload: Record<string, unknown>): string {
+  if (code === "payload_too_large") return "文件过大";
+  if (code === "unsupported_mime") return "不支持的图片格式";
+  if (code === "invalid_image") return "无效的图片文件";
+  if (code === "storage_quota_exceeded") return "存储配额已满";
+  if (code === "invalid_session_id") return "会话无效";
+  if (code === "invalid_payload") return "上传内容无效";
+  if (code === "forbidden_origin") return "来源未授权";
+  return typeof payload.detail === "string" ? `${code}: ${payload.detail}` : code;
+}
+
+function addAttachmentFiles(rawFiles: FileList | File[]): void {
+  const files = Array.from(rawFiles);
+  if (!files.length) return;
+  const remaining = MAX_ATTACHMENTS_PER_MESSAGE - composerAttachments.length;
+  if (remaining <= 0) {
+    if (!attachmentsCapNoticeShown) {
+      attachmentsCapNoticeShown = true;
+      addMessageBubble("notice", `最多 ${MAX_ATTACHMENTS_PER_MESSAGE} 张`);
+    }
+    return;
+  }
+  let acceptedCount = 0;
+  let droppedForCap = 0;
+  for (const file of files) {
+    if (acceptedCount >= remaining) {
+      droppedForCap += 1;
+      continue;
+    }
+    if (!ALLOWED_MIME_SET.has(file.type)) {
+      addMessageBubble("notice", `不支持的图片格式: ${file.name || file.type || "?"}`);
+      continue;
+    }
+    if (file.size > MAX_FILE_SIZE_BYTES) {
+      // Cap is server-driven via /site — compute the human MB on the
+      // fly so the message tracks what the server is actually
+      // enforcing (operator may have set 5MB or 50MB).
+      const limitMb = Math.max(1, Math.round(MAX_FILE_SIZE_BYTES / (1024 * 1024)));
+      addMessageBubble("notice", `文件过大: ${file.name || "图片"}（上限 ${limitMb}MB）`);
+      continue;
+    }
+    acceptedCount += 1;
+    const attachment: PendingAttachment = {
+      local_id: genLocalId(),
+      mime: file.type,
+      size: file.size,
+      preview_url: URL.createObjectURL(file),
+      state: "uploading",
+    };
+    composerAttachments.push(attachment);
+    const sid = currentSession().id;
+    // Resize off-thread; chip already in DOM with the unresized preview URL
+    // so the user sees a thumbnail immediately. We then upload the (possibly
+    // smaller) blob and don't repaint the preview because the original
+    // dimensions of the user's source are what they expect to see.
+    void (async (): Promise<void> => {
+      let blob: Blob;
+      try {
+        blob = await resizeIfNeeded(file);
+      } catch {
+        blob = file;
+      }
+      attachment.size = blob.size;
+      // Resize converts non-GIF to JPEG; keep mime in sync so the server
+      // accepts the canonical MIME and we render the right extension hint.
+      if (blob.type && blob.type !== file.type) {
+        attachment.mime = blob.type;
+      }
+      await uploadAttachment(blob, sid, attachment);
+    })();
+  }
+  if (droppedForCap > 0 && !attachmentsCapNoticeShown) {
+    attachmentsCapNoticeShown = true;
+    addMessageBubble("notice", `最多 ${MAX_ATTACHMENTS_PER_MESSAGE} 张`);
+  }
+  renderComposerAttachments();
+  updateSendButtonState();
+}
+
+function removeAttachment(local_id: string): void {
+  const idx = composerAttachments.findIndex((a) => a.local_id === local_id);
+  if (idx < 0) return;
+  const att = composerAttachments[idx]!;
+  try { URL.revokeObjectURL(att.preview_url); } catch {}
+  composerAttachments.splice(idx, 1);
+  renderComposerAttachments();
+  updateSendButtonState();
+}
+
+function clearComposerAttachments(): void {
+  for (const a of composerAttachments) {
+    try { URL.revokeObjectURL(a.preview_url); } catch {}
+  }
+  composerAttachments = [];
+  attachmentsCapNoticeShown = false;
+  renderComposerAttachments();
+  updateSendButtonState();
+}
+
+function renderComposerAttachments(): void {
+  composerAttachmentsEl.replaceChildren();
+  for (const a of composerAttachments) {
+    const chip = document.createElement("div");
+    chip.className = "composer-chip";
+    chip.dataset.state = a.state;
+    chip.dataset.localId = a.local_id;
+    if (a.state === "error" && a.error_message) chip.title = a.error_message;
+
+    const img = document.createElement("img");
+    img.src = a.preview_url;
+    img.alt = "";
+    chip.appendChild(img);
+
+    if (a.state === "uploading") {
+      const spin = document.createElement("span");
+      spin.className = "chip-spinner";
+      chip.appendChild(spin);
+    }
+
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "composer-chip-remove";
+    close.setAttribute("aria-label", "移除");
+    close.textContent = "×";
+    close.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      removeAttachment(a.local_id);
+    });
+    chip.appendChild(close);
+
+    composerAttachmentsEl.appendChild(chip);
+  }
+}
+
+function updateSendButtonState(): void {
+  // Stop button stays enabled while a stream is in flight regardless of
+  // composer state — the user might want to abort and try again.
+  if (sync.streamAbort) {
+    sendBtn.disabled = false;
+    return;
+  }
+  const hasUploading = composerAttachments.some((a) => a.state === "uploading");
+  const hasReady = composerAttachments.some((a) => a.state === "ready");
+  const hasText = inputEl.value.trim().length > 0;
+  sendBtn.disabled = hasUploading || (!hasText && !hasReady);
+  attachBtn.disabled = composerAttachments.length >= MAX_ATTACHMENTS_PER_MESSAGE;
+}
+
+// ---------- Lightbox ----------
+
+let lightboxKeydown: ((e: KeyboardEvent) => void) | null = null;
+function openLightbox(attachments: AttachmentRef[], startIndex: number): void {
+  if (!attachments.length) return;
+  let idx = Math.max(0, Math.min(startIndex, attachments.length - 1));
+  const overlay = document.createElement("div");
+  overlay.className = "lightbox";
+  overlay.setAttribute("role", "dialog");
+  overlay.setAttribute("aria-modal", "true");
+  overlay.setAttribute("aria-label", "图片查看");
+
+  const img = document.createElement("img");
+  img.className = "lightbox-img";
+  img.alt = "";
+  attachImgErrorRetry(img);
+
+  const close = document.createElement("button");
+  close.type = "button";
+  close.className = "lightbox-close";
+  close.setAttribute("aria-label", "关闭");
+  close.textContent = "×";
+
+  const prev = document.createElement("button");
+  prev.type = "button";
+  prev.className = "lightbox-nav lightbox-nav-prev";
+  prev.setAttribute("aria-label", "上一张");
+  prev.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="15 18 9 12 15 6"/></svg>';
+
+  const next = document.createElement("button");
+  next.type = "button";
+  next.className = "lightbox-nav lightbox-nav-next";
+  next.setAttribute("aria-label", "下一张");
+  next.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>';
+
+  const counter = document.createElement("div");
+  counter.className = "lightbox-counter";
+
+  const showSingle = attachments.length === 1;
+  if (showSingle) {
+    prev.style.display = "none";
+    next.style.display = "none";
+    counter.style.display = "none";
+  }
+
+  const paint = (): void => {
+    const a = attachments[idx]!;
+    img.src = fileServeUrl(a.file_id);
+    counter.textContent = `${idx + 1} / ${attachments.length}`;
+  };
+  paint();
+
+  const closeOverlay = (): void => {
+    if (lightboxKeydown) {
+      document.removeEventListener("keydown", lightboxKeydown);
+      lightboxKeydown = null;
+    }
+    overlay.remove();
+    document.body.classList.remove("lightbox-open");
+  };
+  const goPrev = (): void => {
+    idx = (idx - 1 + attachments.length) % attachments.length;
+    paint();
+  };
+  const goNext = (): void => {
+    idx = (idx + 1) % attachments.length;
+    paint();
+  };
+
+  close.addEventListener("click", (e) => { e.stopPropagation(); closeOverlay(); });
+  prev.addEventListener("click", (e) => { e.stopPropagation(); goPrev(); });
+  next.addEventListener("click", (e) => { e.stopPropagation(); goNext(); });
+  img.addEventListener("click", (e) => e.stopPropagation());
+  overlay.addEventListener("click", closeOverlay);
+
+  lightboxKeydown = (e: KeyboardEvent): void => {
+    if (e.key === "Escape") { e.preventDefault(); closeOverlay(); }
+    else if (e.key === "ArrowLeft" && !showSingle) { e.preventDefault(); goPrev(); }
+    else if (e.key === "ArrowRight" && !showSingle) { e.preventDefault(); goNext(); }
+  };
+  document.addEventListener("keydown", lightboxKeydown);
+
+  overlay.append(img, close, prev, next, counter);
+  document.body.appendChild(overlay);
+  document.body.classList.add("lightbox-open");
+}
+
 function isStreamCircuitOpen(): boolean {
   if (sync.streamSkipRemaining > 0) {
     sync.streamSkipRemaining -= 1;
@@ -1609,7 +2240,13 @@ function recordStreamFailure(): void {
 
 async function send(): Promise<void> {
   const message = inputEl.value.trim();
-  if (!message) return;
+  const readyAttachments: AttachmentRef[] = composerAttachments
+    .filter((a) => a.state === "ready" && a.file_id)
+    .map((a) => ({ file_id: a.file_id!, mime: a.mime }));
+  if (!message && !readyAttachments.length) return;
+  // Don't fire while uploads are still in flight — server would reject
+  // unknown file_ids and the user would lose their text.
+  if (composerAttachments.some((a) => a.state === "uploading")) return;
   // Re-entry guard: while a stream is in flight the same button is the
   // stop button, so only the streaming click path should reach abort, not
   // a second send().
@@ -1627,21 +2264,27 @@ async function send(): Promise<void> {
   }
   sendBtn.disabled = true;
   const isFirstUserMsg = !sessBefore.history.some((h) => h.role === "user");
-  const eligibleForAutoTitle = isFirstUserMsg && sessBefore.titleManual !== true;
+  const eligibleForAutoTitle = isFirstUserMsg && sessBefore.titleManual !== true && message.length > 0;
 
   // Optimistic user echo: render immediately, push to local history, register
   // dedup entry so the eventual `message_added` from long-poll is dropped
-  // (matched on session_id+role+content+ts, see consumeIfDuplicate).
-  addMessageBubble("user", message);
-  sessBefore.history.push({ role: "user", text: message, ts: Date.now() });
+  // (matched on session_id+role+content+attachments+ts, see consumeIfDuplicate).
+  addMessageBubble("user", message, readyAttachments.length ? readyAttachments : undefined);
+  const userItem: HistoryItem = { role: "user", text: message, ts: Date.now() };
+  if (readyAttachments.length) userItem.attachments = readyAttachments;
+  sessBefore.history.push(userItem);
   sessBefore.lastActiveAt = Date.now();
   if (sessBefore.title === "新会话" || !sessBefore.title) sessBefore.title = deriveTitle(sessBefore.history);
-  recordOptimistic(sid, "user", message);
+  recordOptimistic(sid, "user", message, readyAttachments.length ? readyAttachments : undefined);
   saveStore();
   renderSessionList();
 
   inputEl.value = "";
   autosizeInput();
+  // Clear chips post-render — the optimistic bubble already references the
+  // file_ids, so revoking the local preview URLs is safe and we want the
+  // composer empty for the next turn.
+  clearComposerAttachments();
 
   if (eligibleForAutoTitle) {
     requestAutoTitle(sid, message).catch(() => {});
@@ -1651,7 +2294,7 @@ async function send(): Promise<void> {
 
   try {
     if (tryStream) {
-      const outcome = await runStreamingSend(sid, message);
+      const outcome = await runStreamingSend(sid, message, readyAttachments);
       if (outcome === "fallback") {
         // runStreamingSend's finally re-enabled the button so the stop
         // button stayed clickable during the streaming attempt; we're
@@ -1661,16 +2304,17 @@ async function send(): Promise<void> {
         // concurrent_request).
         sendBtn.disabled = true;
         showTyping();
-        await runNonStreamingSend(sid, message);
+        await runNonStreamingSend(sid, message, readyAttachments);
       }
     } else {
       showTyping();
-      await runNonStreamingSend(sid, message);
+      await runNonStreamingSend(sid, message, readyAttachments);
     }
   } finally {
     hideTyping();
     sendBtn.disabled = false;
     setSendMode("send");
+    updateSendButtonState();
   }
 }
 
@@ -1704,6 +2348,8 @@ interface StreamingAttachOpts {
   kind: "post" | "resume" | "peer";
   // For "post": the message body to send. Unused otherwise.
   message?: string;
+  // For "post": optional image attachments sent in the same body.
+  attachments?: AttachmentRef[];
   // For "resume": the stream_id and last_seq to attach with. Unused for "post".
   streamId?: string;
   afterSeq?: number;
@@ -1956,7 +2602,7 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
   try {
     let info: StreamDoneInfo;
     if (kind === "post") {
-      info = await streamChat(sid, opts.message ?? "", onChunk, ac.signal, onStreamId);
+      info = await streamChat(sid, opts.message ?? "", opts.attachments ?? [], onChunk, ac.signal, onStreamId);
     } else {
       info = await resumeStream(streamId, lastSeq, onChunk, ac.signal);
     }
@@ -2100,8 +2746,8 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
 // inline, or user-cancel after at least one chunk) and the caller should
 // stop. Returns "fallback" if the streaming attempt failed before any
 // content reached the bubble and the caller should retry via /chat.
-async function runStreamingSend(sid: string, message: string): Promise<"ok" | "fallback"> {
-  return await attachStreamingBubble({ sid, kind: "post", message });
+async function runStreamingSend(sid: string, message: string, attachments: AttachmentRef[]): Promise<"ok" | "fallback"> {
+  return await attachStreamingBubble({ sid, kind: "post", message, attachments });
 }
 
 // Called when the chat page boots or when the user switches sessions. If
@@ -2172,15 +2818,17 @@ function streamErrorCopy(code: string): string {
   return `请求失败: ${code}`;
 }
 
-async function runNonStreamingSend(sid: string, message: string): Promise<void> {
+async function runNonStreamingSend(sid: string, message: string, attachments: AttachmentRef[]): Promise<void> {
   try {
+    const body: Record<string, unknown> = { session_id: sid, username, message };
+    if (attachments.length) body.attachments = attachments.map((a) => ({ file_id: a.file_id }));
     const resp = await fetchWithTimeout(
       CHAT_URL,
       {
         method: "POST",
         credentials: "same-origin",
         headers: { "Content-Type": "application/json", ...bearer() },
-        body: JSON.stringify({ session_id: sid, username, message }),
+        body: JSON.stringify(body),
       },
       FETCH_TIMEOUT_CHAT_MS,
     );
@@ -2258,6 +2906,32 @@ $<HTMLButtonElement>("logout").onclick = () => {
   clearTimer("shortPollTimer");
   clearTimer("probeTimer");
   clearTimer("retryTimer");
+  // Server-clear the wcg_file cookie + record server-side logout. The
+  // cookie is HttpOnly so JS can't touch it directly; the response's
+  // Set-Cookie header is what the browser commits. We POST under the
+  // cookie's Path scope (`/api/webchat/files`) so sendBeacon — which
+  // can't set custom headers — still carries the cookie, letting the
+  // server identify the token and add it to the invalidation tracker.
+  // Without that, logout would only clear the browser cookie but the
+  // server would still honour HMAC-valid cookies until natural expiry.
+  // `navigator.sendBeacon` is documented to survive navigation; we
+  // fall back to keepalive-tagged fetch where it's unavailable.
+  const logoutUrl = `${API}/files/logout`;
+  let beaconQueued = false;
+  try {
+    if (typeof navigator.sendBeacon === "function") {
+      beaconQueued = navigator.sendBeacon(logoutUrl);
+    }
+  } catch { /* fall through */ }
+  if (!beaconQueued) {
+    try {
+      void fetch(logoutUrl, {
+        method: "POST",
+        credentials: "same-origin",
+        keepalive: true,        // survive navigation
+      }).catch(() => {});
+    } catch { /* fall through */ }
+  }
   for (const k of [LS_TOKEN, LS_USERNAME, LS_STORE, LS_LAST_PTS, LS_PENDING_STREAMS]) localStorage.removeItem(k);
   location.replace("/");
 };
@@ -2281,6 +2955,70 @@ inputEl.addEventListener("keydown", (e) => {
   }
 });
 
+// Paperclip → file picker. Reset .value after each open so the change
+// handler fires even when the user re-selects the same file (the browser
+// suppresses change events on identical selections otherwise).
+attachBtn.addEventListener("click", () => {
+  if (attachBtn.disabled) return;
+  fileInputEl.value = "";
+  fileInputEl.click();
+});
+fileInputEl.addEventListener("change", () => {
+  if (fileInputEl.files && fileInputEl.files.length) {
+    addAttachmentFiles(fileInputEl.files);
+  }
+  fileInputEl.value = "";
+});
+
+// Drag-and-drop on the composer footer. Track enter/leave depth so child
+// transitions don't flicker the overlay off. We only show the overlay if
+// the drag contains files (matches `Files` in dataTransfer.types).
+let dragDepth = 0;
+function dragHasFiles(e: DragEvent): boolean {
+  const dt = e.dataTransfer;
+  if (!dt) return false;
+  for (const t of dt.types) if (t === "Files") return true;
+  return false;
+}
+footerEl.addEventListener("dragenter", (e) => {
+  if (!dragHasFiles(e)) return;
+  e.preventDefault();
+  dragDepth += 1;
+  dropOverlayEl.hidden = false;
+});
+footerEl.addEventListener("dragover", (e) => {
+  if (!dragHasFiles(e)) return;
+  e.preventDefault();
+  if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+});
+footerEl.addEventListener("dragleave", (e) => {
+  if (!dragHasFiles(e)) return;
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (dragDepth === 0) dropOverlayEl.hidden = true;
+});
+footerEl.addEventListener("drop", (e) => {
+  if (!dragHasFiles(e)) return;
+  e.preventDefault();
+  dragDepth = 0;
+  dropOverlayEl.hidden = true;
+  const files = e.dataTransfer?.files;
+  if (files && files.length) addAttachmentFiles(files);
+});
+
+// Paste image from clipboard. clipboardData.files is populated for raw
+// image paste on every modern browser; we filter to images defensively.
+inputEl.addEventListener("paste", (e) => {
+  const cd = e.clipboardData;
+  if (!cd || !cd.files || !cd.files.length) return;
+  const images: File[] = [];
+  for (const f of cd.files) {
+    if (f.type && f.type.startsWith("image/")) images.push(f);
+  }
+  if (!images.length) return;
+  e.preventDefault();
+  addAttachmentFiles(images);
+});
+
 // Telegram-style auto-grow: the textarea expands as the user types and
 // shrinks back when text is deleted. CSS min-height / max-height cap both
 // ends; once scrollHeight exceeds max-height the browser falls back to
@@ -2291,9 +3029,13 @@ function autosizeInput(): void {
   inputEl.style.height = "auto";
   inputEl.style.height = inputEl.scrollHeight + "px";
 }
-inputEl.addEventListener("input", autosizeInput);
+inputEl.addEventListener("input", () => {
+  autosizeInput();
+  updateSendButtonState();
+});
 // Reset to one line on initial render and any external value clear.
 autosizeInput();
+updateSendButtonState();
 sendBtn.onclick = (): void => {
   // Same button doubles as stop while a stream is in flight. Click during
   // stream cancels the AbortController; the streaming path catches the
@@ -2308,12 +3050,17 @@ sendBtn.onclick = (): void => {
 document.addEventListener("visibilitychange", onVisibilityChange);
 
 // Cold boot: paint cache, then refetch authoritative state, then start sync.
+// probeQuota() is fired EARLY (sync-kicked, before replayActive) so the
+// wcg_file cookie lands as close as possible to the first <img src>
+// requests. attachImgErrorRetry handles the remaining race where the
+// /me response hasn't returned by the time the browser starts fetching
+// images, OR a long-lived session straddles a server restart.
+void probeQuota();
 saveStore();
 renderSessionList();
 replayActive();
 loadChatSite();
 setupThemeToggle();
-void probeQuota();
 
 void (async (): Promise<void> => {
   try {

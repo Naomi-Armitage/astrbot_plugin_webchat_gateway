@@ -28,11 +28,20 @@ from astrbot.api import logger
 
 from ..core.audit import AuditLogger
 from ..core.auth import extract_bearer, hash_token
+from ..core.cookie_logout import CookieLogoutTracker
+from ..core.file_cookie import (
+    FILE_AUTH_COOKIE_NAME,
+    build_clear_cookie_value,
+    build_set_cookie_value,
+    verify as verify_file_cookie,
+)
+from ..core.file_lifecycle import release_files_safely
+from ..core.file_store import FileStore
 from ..core.ip_guard import IpGuard
 from ..core.llm_bridge import LlmBridge
 from ..core.ratelimit import PerTokenConcurrency
 from ..core.stream_registry import STREAM_ID_PATTERN, StreamRegistry
-from ..storage.base import AbstractStorage, TokenRow
+from ..storage.base import AbstractStorage, FileRow, TokenRow
 from .common import (
     build_cors_headers,
     client_ip,
@@ -60,9 +69,30 @@ class ChatDeps:
     llm_bridge: LlmBridge
     conv_service: Any  # handlers.conversations.ConversationService — avoid import cycle
     registry: StreamRegistry
+    file_store: FileStore
     allowed_origins: set[str]
     max_message_length: int
+    max_attachments_per_message: int
     trust_forwarded_for: bool
+    # HMAC secret for issuing the /files/{id} access cookie. The chat
+    # client renders attachments as plain `<img src>` which can't set
+    # Authorization headers — instead we set an HttpOnly + SameSite=Lax
+    # cookie on /me responses, scoped to the configured files prefix.
+    # See `core/file_cookie.py` for the protocol. Always set by main.py;
+    # default factory keeps a bare ChatDeps test-construct usable.
+    file_cookie_secret: bytes = b""
+    file_cookie_ttl_seconds: int = 86400
+    # Path attribute on the Set-Cookie. MUST match the actual /files
+    # route prefix (`endpoint_prefix + "/files"`) so the browser scopes
+    # the cookie correctly. Hardcoding would break operators who change
+    # `endpoint_prefix` from the default.
+    file_cookie_path: str = "/api/webchat/files"
+    # In-memory tracker for server-side cookie invalidation on logout.
+    # `make_logout_handler` records into this; `make_serve_handler` (in
+    # handlers/files.py via UploadDeps) reads from a separate copy of
+    # the same tracker instance so both endpoints stay consistent.
+    # See `core/cookie_logout.py` for the exact semantic.
+    cookie_logout_tracker: CookieLogoutTracker | None = None
     trust_referer_as_origin: bool = False
     allow_missing_origin: bool = False
 
@@ -73,13 +103,48 @@ class _ParsedRequest:
     user_id: str
     username: str
     message: str
+    attachments: list[str]  # list of file_ids
 
 
-def _parse_payload(payload: Any) -> _ParsedRequest | None:
+class _ParseError(Exception):
+    """Raised by `_parse_payload` to short-circuit with a specific code."""
+
+    def __init__(self, code: str, status: int = 400):
+        super().__init__(code)
+        self.code = code
+        self.status = status
+
+
+def _parse_payload(payload: Any, *, max_attachments: int) -> _ParsedRequest | None:
     if not isinstance(payload, dict):
         return None
     message = str(payload.get("message") or "").strip()
-    if not message:
+    raw_attachments = payload.get("attachments")
+    attachments: list[str] = []
+    if raw_attachments is not None:
+        if not isinstance(raw_attachments, list):
+            raise _ParseError("invalid_payload")
+        if len(raw_attachments) > max_attachments:
+            raise _ParseError("too_many_attachments")
+        seen: set[str] = set()
+        for entry in raw_attachments:
+            if not isinstance(entry, dict):
+                raise _ParseError("invalid_payload")
+            fid = entry.get("file_id")
+            if not isinstance(fid, str) or not fid:
+                raise _ParseError("invalid_payload")
+            fid = fid.strip()
+            if not fid:
+                raise _ParseError("invalid_payload")
+            if fid in seen:
+                # Silent dedup — repeated file_ids in one message are
+                # not a security issue but they'd over-count toward the
+                # `mark_files_committed` set; collapse here so the
+                # downstream code only deals with unique ids.
+                continue
+            seen.add(fid)
+            attachments.append(fid)
+    if not message and not attachments:
         return None
     session_id = str(
         payload.get("sessionId") or payload.get("session_id") or "webchat"
@@ -91,6 +156,7 @@ def _parse_payload(payload: Any) -> _ParsedRequest | None:
         user_id=user_id[:128],
         username=username,
         message=message,
+        attachments=attachments,
     )
 
 
@@ -98,6 +164,7 @@ async def _parse_chat_body(
     request: web.Request,
     max_message_length: int,
     *,
+    max_attachments: int,
     origin: str | None,
     allowed: set[str],
     same_host: str,
@@ -123,7 +190,13 @@ async def _parse_chat_body(
             {"error": "invalid_json"}, status=400,
             origin=origin, allowed_origins=allowed, same_origin_host=same_host,
         )
-    data = _parse_payload(payload)
+    try:
+        data = _parse_payload(payload, max_attachments=max_attachments)
+    except _ParseError as exc:
+        return json_response(
+            {"error": exc.code}, status=exc.status,
+            origin=origin, allowed_origins=allowed, same_origin_host=same_host,
+        )
     if data is None:
         return json_response(
             {"error": "invalid_payload"}, status=400,
@@ -247,7 +320,18 @@ def make_chat_handler(deps: ChatDeps):
                 allowed_origins=allowed,
                 same_origin_host=same_host,
             )
-        data = _parse_payload(payload)
+        try:
+            data = _parse_payload(
+                payload, max_attachments=deps.max_attachments_per_message
+            )
+        except _ParseError as exc:
+            return json_response(
+                {"error": exc.code},
+                status=exc.status,
+                origin=origin,
+                allowed_origins=allowed,
+                same_origin_host=same_host,
+            )
         if data is None:
             return json_response(
                 {"error": "invalid_payload"},
@@ -267,6 +351,42 @@ def make_chat_handler(deps: ChatDeps):
                 allowed_origins=allowed,
                 same_origin_host=same_host,
             )
+
+        # Validate attachment ownership before taking the per-token lock
+        # so a stale or cross-token file_id can't pin the slot during the
+        # storage round trip. Each attachment must belong to THIS token
+        # AND THIS session — cross-session attachment reuse is rejected
+        # to prevent a token from leaking a file_id into another's
+        # session via the wire.
+        attachment_rows: list[FileRow] = []
+        if data.attachments:
+            for fid in data.attachments:
+                try:
+                    row = await deps.storage.get_file(fid)
+                except Exception:
+                    logger.exception(
+                        "[WebChatGateway] get_file failed file_id=%s", fid
+                    )
+                    return json_response(
+                        {"error": "internal_error"},
+                        status=500,
+                        origin=origin,
+                        allowed_origins=allowed,
+                        same_origin_host=same_host,
+                    )
+                if (
+                    row is None
+                    or row.token_name != token.name
+                    or row.session_id != data.session_id
+                ):
+                    return json_response(
+                        {"error": "invalid_attachment"},
+                        status=400,
+                        origin=origin,
+                        allowed_origins=allowed,
+                        same_origin_host=same_host,
+                    )
+                attachment_rows.append(row)
 
         # 5. Concurrency lock
         async with deps.concurrency.acquire(token.name) as acquired:
@@ -306,78 +426,171 @@ def make_chat_handler(deps: ChatDeps):
                 )
 
             # 7. LLM call
+            image_urls: list[str] = []
+            attachment_committed = False
+            if attachment_rows:
+                # Commit before the LLM call so an in-flight failure doesn't
+                # leave the file in `committed=0` limbo (the orphan GC would
+                # eventually clean it up, but the user has clearly attached
+                # this to a send — we'd rather keep the bytes around with
+                # the same retention as the chat history). On LLM failure
+                # below we release the files explicitly via try/finally
+                # so a transient timeout doesn't permanently consume the
+                # user's storage quota for a turn that produced no CM
+                # record (the orphan GC only sweeps committed=0 rows).
+                now_commit = int(time.time())
+                try:
+                    await deps.storage.mark_files_committed(
+                        [r.file_id for r in attachment_rows], now=now_commit
+                    )
+                    attachment_committed = True
+                except Exception:
+                    # FATAL: commit failure used to be silently swallowed,
+                    # which let the LLM call proceed and record_chat_pair
+                    # eventually write a CM ImageURLPart pointing at a
+                    # committed=0 file → the orphan GC would later delete
+                    # the file and the next history fetch would render a
+                    # broken thumbnail. Better to surface 500 here so
+                    # the user retries vs. silently corrupt CM state.
+                    logger.exception(
+                        "[WebChatGateway] mark_files_committed failed (non-stream)"
+                    )
+                    # Release any files that may have partially-committed
+                    # so the user's quota isn't pinned by a turn that
+                    # never reached the LLM.
+                    try:
+                        await release_files_safely(
+                            storage=deps.storage,
+                            file_store=deps.file_store,
+                            rows=attachment_rows,
+                            log_label="non_stream_chat_commit_fail",
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[WebChatGateway] release on commit-fail raised"
+                        )
+                    return json_response(
+                        {"error": "internal_error"},
+                        status=500,
+                        origin=origin,
+                        allowed_origins=allowed,
+                        same_origin_host=same_host,
+                    )
+                for row in attachment_rows:
+                    try:
+                        local_path = await deps.file_store.open_local_path(
+                            storage_key=row.storage_key
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[WebChatGateway] open_local_path failed key=%s",
+                            row.storage_key,
+                        )
+                        local_path = None
+                    if local_path:
+                        image_urls.append(local_path)
+                    else:
+                        logger.warning(
+                            "[WebChatGateway] attachment unresolved file_id=%s",
+                            row.file_id,
+                        )
+            llm_succeeded = False
             try:
-                reply = await deps.llm_bridge.generate_reply(
-                    token_name=token.name,
-                    session_id=data.session_id,
-                    username=data.username,
-                    message=data.message,
-                )
-            except RuntimeError as exc:
-                if str(exc) == "llm_timeout":
+                try:
+                    reply = await deps.llm_bridge.generate_reply(
+                        token_name=token.name,
+                        session_id=data.session_id,
+                        username=data.username,
+                        message=data.message,
+                        image_urls=image_urls or None,
+                    )
+                    llm_succeeded = True
+                except RuntimeError as exc:
+                    if str(exc) == "llm_timeout":
+                        await deps.audit.write(
+                            "llm_timeout",
+                            name=token.name,
+                            ip=ip,
+                            detail={"msg_len": len(data.message)},
+                        )
+                        return json_response(
+                            {"error": "llm_timeout"},
+                            status=504,
+                            origin=origin,
+                            allowed_origins=allowed,
+                            same_origin_host=same_host,
+                        )
+                    if str(exc) == "empty_reply":
+                        # Upstream returned finish_reason=stop with zero tokens.
+                        # Surface the specific code so the frontend can render
+                        # actionable copy ("model produced nothing — try again or
+                        # rephrase") rather than the generic llm_call_failed.
+                        await deps.audit.write(
+                            "chat_empty_reply",
+                            name=token.name,
+                            ip=ip,
+                            detail={"msg_len": len(data.message)},
+                        )
+                        return json_response(
+                            {"error": "empty_reply"},
+                            status=502,
+                            origin=origin,
+                            allowed_origins=allowed,
+                            same_origin_host=same_host,
+                        )
+                    # Internal exception text may leak provider names, paths, or
+                    # context near credentials — keep it in audit/log only and
+                    # return a stable error code to the caller.
+                    logger.exception("[WebChatGateway] LLM call failed")
                     await deps.audit.write(
-                        "llm_timeout",
+                        "chat_error",
                         name=token.name,
                         ip=ip,
-                        detail={"msg_len": len(data.message)},
+                        detail={"error": str(exc)[:200]},
                     )
                     return json_response(
-                        {"error": "llm_timeout"},
-                        status=504,
+                        {"error": "llm_call_failed"},
+                        status=500,
                         origin=origin,
                         allowed_origins=allowed,
                         same_origin_host=same_host,
                     )
-                if str(exc) == "empty_reply":
-                    # Upstream returned finish_reason=stop with zero tokens.
-                    # Surface the specific code so the frontend can render
-                    # actionable copy ("model produced nothing — try again or
-                    # rephrase") rather than the generic llm_call_failed.
+                except Exception as exc:
+                    logger.exception("[WebChatGateway] LLM call failed")
                     await deps.audit.write(
-                        "chat_empty_reply",
+                        "chat_error",
                         name=token.name,
                         ip=ip,
-                        detail={"msg_len": len(data.message)},
+                        detail={"error": str(exc)[:200]},
                     )
                     return json_response(
-                        {"error": "empty_reply"},
-                        status=502,
+                        {"error": "llm_call_failed"},
+                        status=500,
                         origin=origin,
                         allowed_origins=allowed,
                         same_origin_host=same_host,
                     )
-                # Internal exception text may leak provider names, paths, or
-                # context near credentials — keep it in audit/log only and
-                # return a stable error code to the caller.
-                logger.exception("[WebChatGateway] LLM call failed")
-                await deps.audit.write(
-                    "chat_error",
-                    name=token.name,
-                    ip=ip,
-                    detail={"error": str(exc)[:200]},
-                )
-                return json_response(
-                    {"error": "llm_call_failed"},
-                    status=500,
-                    origin=origin,
-                    allowed_origins=allowed,
-                    same_origin_host=same_host,
-                )
-            except Exception as exc:
-                logger.exception("[WebChatGateway] LLM call failed")
-                await deps.audit.write(
-                    "chat_error",
-                    name=token.name,
-                    ip=ip,
-                    detail={"error": str(exc)[:200]},
-                )
-                return json_response(
-                    {"error": "llm_call_failed"},
-                    status=500,
-                    origin=origin,
-                    allowed_origins=allowed,
-                    same_origin_host=same_host,
-                )
+            finally:
+                # If the LLM call didn't return a reply (timeout / error
+                # / empty), release the committed files so the user's
+                # storage quota isn't permanently consumed by a turn
+                # that has no CM record. The orphan GC only sweeps
+                # `committed=0` rows; without this explicit release we'd
+                # have permanently leaked the bytes for every failed
+                # retry. Stream handler does the equivalent via
+                # `StreamHandle.attachment_file_ids` + `close_failed`.
+                if attachment_committed and not llm_succeeded:
+                    try:
+                        await release_files_safely(
+                            storage=deps.storage,
+                            file_store=deps.file_store,
+                            rows=attachment_rows,
+                            log_label="non_stream_chat_llm_fail",
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[WebChatGateway] release on llm-fail raised"
+                        )
 
             # 8. Increment usage (atomic)
             new_count = await deps.storage.increment_daily_usage(token.name, day=today)
@@ -387,11 +600,17 @@ def make_chat_handler(deps: ChatDeps):
             # peer devices on the same token long-poll their way to the new
             # state. record_chat_pair swallows its own errors — a failure
             # here must NOT block the chat reply that's already complete.
+            user_attachments_payload: list[dict] = (
+                [{"file_id": r.file_id, "mime": r.mime} for r in attachment_rows]
+                if attachment_rows
+                else []
+            )
             await deps.conv_service.record_chat_pair(
                 token_name=token.name,
                 session_id=data.session_id,
                 user_text=data.message,
                 assistant_text=reply,
+                user_attachments=user_attachments_payload,
             )
 
             # 9. Audit + respond
@@ -456,11 +675,50 @@ def make_chat_stream_handler(deps: ChatDeps):
         # lock so a slow/large body cannot pin a streaming slot.
         parsed = await _parse_chat_body(
             request, deps.max_message_length,
+            max_attachments=deps.max_attachments_per_message,
             origin=origin, allowed=allowed, same_host=same_host,
         )
         if isinstance(parsed, web.Response):
             return parsed
         data = parsed
+
+        # Validate attachment ownership before taking the registry lock
+        # so a stale or cross-token file_id can't pin a streaming slot
+        # during the storage round trip. Mirror the non-stream handler.
+        attachment_rows: list[FileRow] = []
+        if data.attachments:
+            for fid in data.attachments:
+                try:
+                    row = await deps.storage.get_file(fid)
+                except Exception:
+                    logger.exception(
+                        "[WebChatGateway] get_file failed file_id=%s", fid
+                    )
+                    return json_response(
+                        {"error": "internal_error"},
+                        status=500,
+                        origin=origin,
+                        allowed_origins=allowed,
+                        same_origin_host=same_host,
+                    )
+                if (
+                    row is None
+                    or row.token_name != token.name
+                    or row.session_id != data.session_id
+                ):
+                    return json_response(
+                        {"error": "invalid_attachment"},
+                        status=400,
+                        origin=origin,
+                        allowed_origins=allowed,
+                        same_origin_host=same_host,
+                    )
+                attachment_rows.append(row)
+        user_attachments_payload: list[dict] = (
+            [{"file_id": r.file_id, "mime": r.mime} for r in attachment_rows]
+            if attachment_rows
+            else []
+        )
 
         # Step 5: open stream via the registry (acquires per-token lock,
         # creates buffer entry and audits). chat-sync `stream_started` is
@@ -469,6 +727,8 @@ def make_chat_stream_handler(deps: ChatDeps):
         handle_obj = await deps.registry.open(
             token_name=token.name,
             session_id=data.session_id,
+            attachments=user_attachments_payload,
+            attachment_file_ids=[r.file_id for r in attachment_rows],
         )
         if handle_obj is None:
             # Lock contention is a precondition failure, not a stream
@@ -553,6 +813,23 @@ def make_chat_stream_handler(deps: ChatDeps):
                     + "\n\n"
                 ).encode("utf-8")
             )
+            # Mark attachments committed BEFORE emitting stream_started so
+            # that peer devices that immediately fetch /conversations/{id}
+            # see the committed=1 state. mark_files_committed is idempotent;
+            # re-commits no-op on the storage side.
+            #
+            # Failure here is FATAL — we used to silently swallow it,
+            # which let the stream proceed and record_chat_pair eventually
+            # write a CM ImageURLPart pointing at a committed=0 file → the
+            # orphan GC would later delete the file and the next history
+            # fetch would render a broken thumbnail. Propagate the
+            # exception into the outer handler so close_failed runs (and
+            # releases the files since user_message_emitted is still False).
+            if attachment_rows:
+                await deps.storage.mark_files_committed(
+                    [r.file_id for r in attachment_rows],
+                    now=int(time.time()),
+                )
             # Now that the origin SSE is actually open and the client has
             # received the stream_id, announce the stream to peer devices.
             # This also emits the user's message_added event, so peers can
@@ -562,7 +839,21 @@ def make_chat_stream_handler(deps: ChatDeps):
                 session_id=data.session_id,
                 user_text=data.message,
                 stream_id=handle_obj.stream_id,
+                attachments=user_attachments_payload,
             )
+            # Once emit_stream_started has been awaited, the
+            # message_added(user) event has been written to
+            # webchat_updates AND peer devices have been notified —
+            # they may have rendered the user bubble (including the
+            # attachment file_ids) already. A subsequent close_failed
+            # MUST NOT release those files: deleting them now would
+            # 404 every `<img src>` on the peer side, leaving ghost
+            # bubbles with broken thumbnails. The flag is checked in
+            # `_release_attached_files`; trade-off documented on
+            # `StreamHandle.user_message_emitted`. emit_stream_started
+            # is documented "never raise", so this assignment runs
+            # unconditionally once we get here.
+            handle_obj.user_message_emitted = True
         except asyncio.CancelledError:
             logger.warning(
                 "[WebChatGateway] SSE handshake cancelled sid=%s",
@@ -620,11 +911,39 @@ def make_chat_stream_handler(deps: ChatDeps):
                 return False
             return True
 
+        # Resolve attachments to provider-visible URLs (local paths or
+        # file:// URLs). open_local_path lazily fetches the bytes for R2
+        # before returning a path; for LocalFileStore it's a no-op. We
+        # accept a partial set on failure (e.g. one of three images can't
+        # be resolved) — the provider gets the others, the user sees the
+        # bubble with all three thumbnails (rendered from `attachments`,
+        # not image_urls), and the failure is logged for the operator.
+        image_urls: list[str] = []
+        for row in attachment_rows:
+            try:
+                local_path = await deps.file_store.open_local_path(
+                    storage_key=row.storage_key
+                )
+            except Exception:
+                logger.exception(
+                    "[WebChatGateway] open_local_path failed key=%s",
+                    row.storage_key,
+                )
+                local_path = None
+            if local_path:
+                image_urls.append(local_path)
+            else:
+                logger.warning(
+                    "[WebChatGateway] attachment unresolved file_id=%s",
+                    row.file_id,
+                )
+
         stream = deps.llm_bridge.generate_reply_stream(
             token_name=token.name,
             session_id=data.session_id,
             username=data.username,
             message=data.message,
+            image_urls=image_urls or None,
         )
         stream_iter = stream.__aiter__()
         # Persistent pull task across heartbeats. Reusing the same
@@ -722,6 +1041,7 @@ def make_chat_stream_handler(deps: ChatDeps):
                             remaining=remaining,
                             daily_quota=token.daily_quota,
                             reason="llm_timeout",
+                            user_attachments=user_attachments_payload,
                         )
                         terminal_emitted = True
                         if not client_gone:
@@ -798,6 +1118,7 @@ def make_chat_stream_handler(deps: ChatDeps):
                             remaining=remaining,
                             daily_quota=token.daily_quota,
                             reason="llm_call_failed",
+                            user_attachments=user_attachments_payload,
                         )
                         terminal_emitted = True
                         if not client_gone:
@@ -865,6 +1186,7 @@ def make_chat_stream_handler(deps: ChatDeps):
                             remaining=remaining,
                             daily_quota=token.daily_quota,
                             reason="cancelled",
+                            user_attachments=user_attachments_payload,
                         )
                     else:
                         await deps.registry.close_failed(
@@ -887,6 +1209,7 @@ def make_chat_stream_handler(deps: ChatDeps):
                         remaining=remaining,
                         daily_quota=token.daily_quota,
                         reason="internal_error",
+                        user_attachments=user_attachments_payload,
                     )
                     terminal_emitted = True
                     if not client_gone:
@@ -974,6 +1297,7 @@ def make_chat_stream_handler(deps: ChatDeps):
                 full_text=full_reply,
                 remaining=remaining,
                 daily_quota=token.daily_quota,
+                user_attachments=user_attachments_payload,
             )
             terminal_emitted = True
             if not client_gone:
@@ -1426,6 +1750,29 @@ def make_me_handler(deps: ChatDeps):
         today = date.today()
         today_count = await deps.storage.get_today_usage(token.name, day=today)
         remaining = max(0, token.daily_quota - today_count)
+        extra: dict[str, str] = {"Cache-Control": "no-store"}
+        # Issue / refresh the file-auth cookie. `<img src>` cannot set
+        # Authorization, so file-serve relies on this cookie instead
+        # of leaking the bearer into URLs (which would land in browser
+        # history + access logs + monitoring). Secret rotates on plugin
+        # restart, invalidating old cookies. SameSite=Lax + HttpOnly +
+        # Path-scoped to /api/webchat/files.
+        if deps.file_cookie_secret:
+            scheme = (
+                request.headers.get("X-Forwarded-Proto")
+                or request.scheme
+                or "http"
+            ).lower()
+            secure = scheme == "https"
+            _, set_cookie_value = build_set_cookie_value(
+                deps.file_cookie_secret,
+                token_name=token.name,
+                token_hash=token.token_hash,
+                ttl_seconds=deps.file_cookie_ttl_seconds,
+                secure=secure,
+                cookie_path=deps.file_cookie_path,
+            )
+            extra["Set-Cookie"] = set_cookie_value
         return json_response(
             {
                 "name": token.name,
@@ -1435,8 +1782,131 @@ def make_me_handler(deps: ChatDeps):
             origin=origin,
             allowed_origins=allowed,
             same_origin_host=same_host,
-            extra_headers={"Cache-Control": "no-store"},
+            extra_headers=extra,
         )
+
+    return handle
+
+
+def make_logout_handler(deps: ChatDeps):
+    """POST {prefix}/files/logout — logout + server-side cookie invalidation.
+
+    Wire contract:
+      * Path is intentionally under `/files/` so the browser auto-attaches
+        the `wcg_file` cookie on `navigator.sendBeacon` (the page-unload-
+        safe channel the frontend prefers). Without that the handler
+        could not identify which token's cookies to invalidate when the
+        bearer header is missing (sendBeacon can't set custom headers).
+      * Bearer header is ALSO accepted as a fallback for CLI / non-
+        browser callers and for browsers where sendBeacon is unavailable
+        and the keepalive-fetch path is used instead.
+      * Auth-less requests get 401 — clearing a cookie still happens (so
+        a returning browser session gets a fresh /me probe) but no
+        server-side invalidation can occur without a token name.
+
+    Server-side invalidation: records `token_name → now` into the
+    process-wide `CookieLogoutTracker`. The serve endpoint
+    (handlers/files.py) consults this tracker AFTER the HMAC verify
+    succeeds: any cookie whose `exp_ts <= recorded_logout_time +
+    ttl_seconds` is rejected. New cookies issued post-logout (by the
+    next `/me` call) have a fresh exp_ts above the threshold and
+    verify normally. Trade-off documented on `CookieLogoutTracker`.
+
+    Returns 204 with a `Set-Cookie: wcg_file=; Max-Age=0` directive in
+    every path (auth ok, auth fail, no auth) so the browser-side cookie
+    is always cleared even when server-side state can't be touched.
+    """
+
+    async def handle(request: web.Request) -> web.Response:
+        origin = extract_origin(
+            request, trust_referer_as_origin=deps.trust_referer_as_origin
+        )
+        allowed = deps.allowed_origins
+        same_host = request.host
+        if not is_origin_allowed(
+            origin,
+            allowed,
+            same_origin_host=same_host,
+            allow_missing=deps.allow_missing_origin,
+        ):
+            return json_response(
+                {"error": "forbidden_origin"},
+                status=403,
+                origin=origin,
+                allowed_origins=allowed,
+                same_origin_host=same_host,
+            )
+        # Identify the token: prefer bearer (CLI / fetch keepalive),
+        # fall back to cookie (sendBeacon). The cookie's HMAC is
+        # verified against the CURRENT token_hash so a stolen cookie
+        # for a regenerated token still gets rejected at the verify
+        # step — we ignore is_invalidated here since we're about to
+        # add to the invalidation set, not enforce it.
+        token_name: str | None = None
+        presented = extract_bearer(request)
+        if presented:
+            tok = await deps.storage.get_token_by_hash(hash_token(presented))
+            if tok is not None:
+                token_name = tok.name
+        if token_name is None and deps.file_cookie_secret:
+            cookie_value = request.cookies.get(FILE_AUTH_COOKIE_NAME)
+            if cookie_value:
+                peek_parts = cookie_value.rsplit(".", 2)
+                peek_name = (
+                    peek_parts[0] if len(peek_parts) == 3 else ""
+                )
+                row = (
+                    await deps.storage.get_token_by_name(peek_name)
+                    if peek_name
+                    else None
+                )
+                if row is not None:
+                    verified = verify_file_cookie(
+                        deps.file_cookie_secret,
+                        cookie_value,
+                        current_token_hash=row.token_hash,
+                    )
+                    if verified is not None:
+                        token_name = row.name
+        # Always emit a cookie-clear directive; record server-side
+        # invalidation only when we identified the token.
+        headers = build_cors_headers(
+            origin, allowed, same_origin_host=same_host
+        )
+        headers["Set-Cookie"] = build_clear_cookie_value(
+            cookie_path=deps.file_cookie_path
+        )
+        headers["Cache-Control"] = "no-store"
+        if token_name is None:
+            # No auth — still 204 (clears browser cookie) but log that
+            # server-side invalidation didn't fire so operators can
+            # spot misconfigured frontends.
+            try:
+                await deps.audit.write(
+                    "logout_no_auth",
+                    ip=client_ip(request, trust_forwarded_for=deps.trust_forwarded_for),
+                    detail={},
+                )
+            except Exception:
+                pass
+            return web.Response(status=204, headers=headers)
+        if deps.cookie_logout_tracker is not None:
+            try:
+                deps.cookie_logout_tracker.record(token_name)
+            except Exception:
+                logger.exception(
+                    "[WebChatGateway] cookie_logout_tracker.record failed"
+                )
+        try:
+            await deps.audit.write(
+                "logout",
+                name=token_name,
+                ip=client_ip(request, trust_forwarded_for=deps.trust_forwarded_for),
+                detail={},
+            )
+        except Exception:
+            pass
+        return web.Response(status=204, headers=headers)
 
     return handle
 
@@ -1446,6 +1916,7 @@ __all__ = [
     "make_chat_handler",
     "make_chat_stream_handler",
     "make_chat_stream_resume_handler",
+    "make_logout_handler",
     "make_me_handler",
     "make_preflight_handler",
     "build_cors_headers",

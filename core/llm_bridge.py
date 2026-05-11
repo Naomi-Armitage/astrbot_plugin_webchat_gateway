@@ -98,6 +98,7 @@ class LlmBridge:
         session_id: str,
         username: str,
         message: str,
+        image_urls: list[str] | None = None,
     ) -> str:
         # Wrap the entire flow in a single timeout. Without this, slow
         # provider lookup / persona resolution / conversation_manager calls
@@ -110,6 +111,7 @@ class LlmBridge:
                     session_id=session_id,
                     username=username,
                     message=message,
+                    image_urls=image_urls,
                 ),
                 timeout=self._timeout,
             )
@@ -123,6 +125,7 @@ class LlmBridge:
         session_id: str,
         username: str,
         message: str,
+        image_urls: list[str] | None = None,
     ) -> str:
         # Namespace by token so two callers passing the same sessionId never
         # share conversation history across tokens.
@@ -150,12 +153,36 @@ class LlmBridge:
             message=message, system_prompt=system_prompt, history=history
         )
 
+        # AstrBot's `llm_generate` accepts image_urls on newer builds.
+        # Older builds reject the kwarg with TypeError — in that case
+        # fall back to grabbing the provider directly and calling
+        # `provider.text_chat(image_urls=...)`, which is the surface the
+        # streaming path uses (provider.text_chat_stream). Splitting on
+        # TypeError keeps real LLM-side failures (provider config, auth
+        # errors) on the original exception path.
         try:
-            resp = await self._context.llm_generate(
-                chat_provider_id=provider_id,
-                prompt=prompt,
-                persona_id=persona_id,
-            )
+            if image_urls:
+                try:
+                    resp = await self._context.llm_generate(
+                        chat_provider_id=provider_id,
+                        prompt=prompt,
+                        persona_id=persona_id,
+                        image_urls=image_urls,
+                    )
+                except TypeError:
+                    provider = self._context.get_provider_by_id(provider_id)
+                    if provider is None:
+                        raise RuntimeError("chat_provider_not_configured")
+                    resp = await provider.text_chat(
+                        prompt=prompt,
+                        image_urls=image_urls,
+                    )
+            else:
+                resp = await self._context.llm_generate(
+                    chat_provider_id=provider_id,
+                    prompt=prompt,
+                    persona_id=persona_id,
+                )
         except EmptyModelOutputError as exc:
             raise RuntimeError("empty_reply") from exc
         # `llm_generate` may raise EmptyModelOutputError directly (some provider
@@ -179,6 +206,7 @@ class LlmBridge:
         session_id: str,
         username: str,
         message: str,
+        image_urls: list[str] | None = None,
     ) -> AsyncIterator[str]:
         # Wrap the whole stream in a single wall-clock deadline so a stalled
         # provider can't pin the per-token concurrency lock indefinitely. Per-
@@ -213,8 +241,15 @@ class LlmBridge:
             )
 
             collected: list[str] = []
+            # Build the streaming kwargs lazily so older AstrBot builds
+            # without `image_urls` on text_chat_stream still work for
+            # text-only messages — the kwarg is only included when
+            # there's something to send.
+            stream_kwargs: dict[str, object] = {"prompt": prompt}
+            if image_urls:
+                stream_kwargs["image_urls"] = image_urls
             try:
-                async for chunk in provider.text_chat_stream(prompt=prompt):
+                async for chunk in provider.text_chat_stream(**stream_kwargs):
                     # AstrBot providers yield two kinds of LLMResponse:
                     #   is_chunk=True  → per-token delta; chunk.completion_text is
                     #                    the new text since the last yield (Anthropic

@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from aiohttp import web
@@ -21,19 +22,23 @@ from astrbot.api import logger
 try:
     from astrbot.core.agent.message import (
         AssistantMessageSegment,
+        ImageURLPart,
         TextPart,
         UserMessageSegment,
     )
 except ImportError as _e:
     raise ImportError(
-        "[WebChatGateway] Cannot import AssistantMessageSegment/TextPart/UserMessageSegment "
-        "from astrbot.core.agent.message. This plugin requires AstrBot >= 3.4. "
-        f"Original error: {_e}"
+        "[WebChatGateway] Cannot import AssistantMessageSegment/TextPart/ImageURLPart/"
+        "UserMessageSegment from astrbot.core.agent.message. This plugin requires "
+        f"AstrBot >= 3.4 with multimodal support. Original error: {_e}"
     ) from _e
 
 from ..core.audit import AuditLogger
 from ..core.event_bus import EventBus
+from ..core.file_lifecycle import release_files_safely
+from ..core.file_store import FileStore
 from ..core.ip_guard import IpGuard
+from ..core.ratelimit import PerTokenConcurrency
 from ..storage.base import (
     _UNSET,
     AbstractStorage,
@@ -78,11 +83,19 @@ class ConversationDeps:
     audit: AuditLogger
     event_bus: EventBus
     cm: Any  # AstrBot ConversationManager — loose-typed to avoid the import
+    file_store: FileStore  # used by ConversationService to resolve attachments
     allowed_origins: set[str]
     trust_forwarded_for: bool
     trust_referer_as_origin: bool = False
     allow_missing_origin: bool = False
     ip_guard: IpGuard | None = None  # required by gate_request
+    # Optional — when supplied, `clear_history` takes the per-token
+    # concurrency lock so it cannot run while a `/chat/stream` is in
+    # flight for the same token. Without this, a clear can race the
+    # stream's record_chat_pair: it lists+deletes attachments, then
+    # the stream writes a CM ImageURLPart pointing at the now-gone
+    # file_id, and the next history fetch renders broken thumbnails.
+    concurrency: PerTokenConcurrency | None = None
 
 
 # ----- service result shapes -----
@@ -152,10 +165,60 @@ def _extract_text(content: Any) -> str:
     return ""
 
 
+def _extract_attachment_file_ids(content: Any) -> list[str]:
+    """Pull `file_id`s out of CM ImageURLPart segments.
+
+    Each `ImageURLPart` is stored as `{"type": "image_url",
+    "image_url": {"url": "...", "id": "<file_id>"}}`. We surface the
+    `id` (the only piece we own) so attachments persist across the
+    chat-sync 14-day event retention — CM is the long-term store,
+    `webchat_updates` is just the realtime cross-device push channel.
+    Without this, `get_conversation` would lose image references on
+    cold refresh once the originating event aged past retention.
+
+    Mime is NOT in the segment payload; the caller re-fetches it from
+    `webchat_files` (batched once per get_conversation) so the browser
+    knows what to do with the bytes.
+    """
+    if not isinstance(content, list):
+        return []
+    file_ids: list[str] = []
+    for seg in content:
+        if not isinstance(seg, dict):
+            continue
+        if seg.get("type") != "image_url":
+            continue
+        iu = seg.get("image_url")
+        if not isinstance(iu, dict):
+            continue
+        fid = iu.get("id")
+        if isinstance(fid, str) and fid:
+            file_ids.append(fid)
+    return file_ids
+
+
 def _normalize_history(raw: Any) -> list[dict]:
-    """CM history is JSON; render it as `[{role, content}, ...]` with
-    text-only content. Tool calls, system messages, anything we can't
-    flatten to text are dropped — the chat UI doesn't render them."""
+    """CM history is JSON; render it as `[{role, content, attachments?}, ...]`.
+    Tool calls, system messages, anything we can't flatten to text are
+    dropped — the chat UI doesn't render them.
+
+    Empty-text USER messages are preserved (with `content=""`) — these
+    are image-only "look at this" turns. The chat-sync overlay layer
+    pairs them with their attachments via `_build_history_overlay`. If
+    we dropped them here the overlay would have nothing to match against
+    and the user's image-only bubble would silently vanish on cold
+    refresh.
+
+    Empty-text ASSISTANT messages are dropped — an assistant turn with
+    no text and no attachments (we don't generate images) is just noise.
+
+    Attachments: each user message that has ImageURLPart segments in
+    CM gets `attachments=[{"file_id": ...}, ...]` populated here.
+    Caller is responsible for enriching with `mime` via a batch
+    `get_file` lookup (cheap — one query per get_conversation).
+    Surfacing attachments from CM (rather than from `webchat_updates`)
+    means image references survive the 14-day chat-sync prune.
+    """
     if not isinstance(raw, list):
         return []
     out: list[dict] = []
@@ -166,9 +229,20 @@ def _normalize_history(raw: Any) -> list[dict]:
         if role not in ("user", "assistant"):
             continue
         text = _extract_text(item.get("content"))
-        if not text:
+        file_ids = (
+            _extract_attachment_file_ids(item.get("content"))
+            if role == "user"
+            else []
+        )
+        if not text and role != "user" and not file_ids:
             continue
-        out.append({"role": role, "content": text})
+        entry: dict[str, Any] = {"role": role, "content": text}
+        if file_ids:
+            # Mime is filled in by the caller via a batched lookup.
+            # We carry the file_id list shape that matches the wire
+            # format on `message_added` events for consistency.
+            entry["attachments"] = [{"file_id": fid} for fid in file_ids]
+        out.append(entry)
     return out
 
 
@@ -192,11 +266,18 @@ class ConversationService:
         audit: AuditLogger,
         event_bus: EventBus,
         cm: Any,
+        file_store: FileStore,
+        concurrency: PerTokenConcurrency | None = None,
     ) -> None:
         self._storage = storage
         self._audit = audit
         self._event_bus = event_bus
         self._cm = cm
+        self._file_store = file_store
+        # When set, clear_history blocks on this lock so it cannot run
+        # while a /chat/stream is in flight for the same token. See
+        # ConversationDeps.concurrency for the race rationale.
+        self._concurrency = concurrency
 
     @staticmethod
     def _now() -> int:
@@ -241,6 +322,7 @@ class ConversationService:
         session_id: str,
         user_text: str,
         assistant_text: str,
+        user_attachments: list[dict] | None = None,
     ) -> None:
         """Append the user/assistant pair to AstrBot CM history.
 
@@ -253,10 +335,21 @@ class ConversationService:
         non-stream path failed before calling _generate_reply_inner
         but record_chat_pair was somehow invoked anyway).
 
+        When `user_attachments` is non-empty, the user segment is built
+        with both a `TextPart(text=user_text)` AND one `ImageURLPart`
+        per attachment so the LLM sees the images on subsequent turns
+        too. Each ImageURLPart wraps the absolute on-disk path returned
+        by `file_store.open_local_path` — for LocalFileStore that's the
+        real path; for R2FileStore it's the LRU-cached fetch under
+        AstrBot's temp dir. Attachments without a resolvable path are
+        skipped with a warning (the message still persists with text
+        and any other resolved images).
+
         Logs and swallows on failure so `record_chat_pair`'s "must
         never raise" contract holds even if CM is temporarily broken.
         """
         umo = _umo(token_name, session_id)
+        attachments = user_attachments or []
         try:
             cid = await self._cm.get_curr_conversation_id(umo)
             if not cid:
@@ -266,11 +359,75 @@ class ConversationService:
                     title=session_id,
                     persona_id=None,
                 )
+            user_parts: list[Any] = [TextPart(text=user_text)] if user_text else []
+            for att in attachments:
+                file_id = att.get("file_id") if isinstance(att, dict) else None
+                if not isinstance(file_id, str) or not file_id:
+                    continue
+                try:
+                    row = await self._storage.get_file(file_id)
+                except Exception:
+                    logger.exception(
+                        "[WebChatGateway] _cm_persist_pair get_file failed file_id=%s",
+                        file_id,
+                    )
+                    continue
+                if row is None or row.token_name != token_name:
+                    logger.warning(
+                        "[WebChatGateway] _cm_persist_pair attachment missing "
+                        "or cross-token file_id=%s",
+                        file_id,
+                    )
+                    continue
+                try:
+                    local_path = await self._file_store.open_local_path(
+                        storage_key=row.storage_key
+                    )
+                except Exception:
+                    logger.exception(
+                        "[WebChatGateway] _cm_persist_pair open_local_path "
+                        "failed key=%s",
+                        row.storage_key,
+                    )
+                    local_path = None
+                if not local_path:
+                    logger.warning(
+                        "[WebChatGateway] _cm_persist_pair could not resolve "
+                        "local path for file_id=%s",
+                        file_id,
+                    )
+                    continue
+                # AstrBot's ImageURLPart accepts any URL; passing a
+                # `file://` URL keeps providers happy across backends
+                # (local fs, R2 cache) without juggling base64 inline.
+                # Use Path.as_uri() so Windows paths like
+                # `C:\Users\...\file.jpg` come out as the spec'd
+                # `file:///C:/Users/.../file.jpg` (triple-slash + forward-
+                # slashes) instead of the malformed `file://C:\Users\...`
+                # we'd get from string concatenation.
+                if local_path.startswith(("http://", "https://", "file://")):
+                    file_url = local_path
+                else:
+                    try:
+                        file_url = Path(local_path).resolve().as_uri()
+                    except ValueError:
+                        # Relative path → as_uri() refuses; fall back to
+                        # a best-effort POSIX-style file:// URI.
+                        file_url = (
+                            "file:///"
+                            + local_path.replace("\\", "/").lstrip("/")
+                        )
+                user_parts.append(
+                    ImageURLPart(
+                        image_url=ImageURLPart.ImageURL(url=file_url, id=file_id)
+                    )
+                )
+            if not user_parts:
+                # Defensive: at least one part is required by Message.
+                user_parts = [TextPart(text=user_text or "")]
             await self._cm.add_message_pair(
                 cid=cid,
-                user_message=UserMessageSegment(
-                    content=[TextPart(text=user_text)]
-                ),
+                user_message=UserMessageSegment(content=user_parts),
                 assistant_message=AssistantMessageSegment(
                     content=[TextPart(text=assistant_text)]
                 ),
@@ -282,24 +439,25 @@ class ConversationService:
                 session_id,
             )
 
-    async def _build_incomplete_map(
+    async def _build_history_overlay(
         self, *, token_name: str, session_id: str
-    ) -> set[int]:
-        """Return 0-based indices of incomplete assistant messages in CM
-        history order for `(token_name, session_id)`.
+    ) -> tuple[set[int], dict[int, list[dict]]]:
+        """Walk `webchat_updates` + CM history once and return overlays.
 
-        Strategy: scan `webchat_updates` for this token in pts-ascending
-        order, filter to this session, drop everything at or before the
-        last `history_cleared` event (those events describe a wiped
-        history that no longer corresponds to CM), then walk the
-        remaining `message_added` events alongside the CM history with a
-        sliding pointer so duplicate `(role, content)` pairs match in
-        order. Assistant messages whose matched event carries
-        `incomplete: true` are recorded.
+        Returns:
+            (incomplete_indices, attachments_map)
 
-        When retention pruning has dropped the relevant `message_added`
-        event, the corresponding CM index simply does not appear in the
-        result — by design (PLAN_chat_streaming_v2.md).
+        - `incomplete_indices`: 0-based CM history indices of assistant
+          messages whose chat-sync `message_added` event flagged
+          `incomplete: true`.
+        - `attachments_map`: CM history index → list of `{file_id, mime}`
+          dicts pulled off the matching user `message_added` event payload.
+
+        Both overlays are derived from the same event scan + history
+        walk so the caller only pays for one storage round trip per
+        get_conversation call. Events pruned past the retention window
+        simply don't appear in either overlay — by design (PLAN_chat_streaming_v2.md
+        for incomplete; PLAN_image_upload.md §"Wire protocol" for attachments).
         """
         # Page through webchat_updates for this token. The cap is high
         # enough that real users never hit it (retention pruning keeps
@@ -328,12 +486,12 @@ class ConversationService:
                     break
         except Exception:
             logger.exception(
-                "[WebChatGateway] _build_incomplete_map scan failed"
+                "[WebChatGateway] _build_history_overlay scan failed"
             )
-            return set()
+            return set(), {}
 
         if not session_events:
-            return set()
+            return set(), {}
 
         # Find the last `history_cleared` event for this session and drop
         # everything at or before it — those `message_added` rows refer
@@ -345,8 +503,8 @@ class ConversationService:
         if last_clear_idx >= 0:
             session_events = session_events[last_clear_idx + 1 :]
 
-        # Build the in-order list of (role, content, incomplete).
-        msg_events: list[tuple[str, str, bool]] = []
+        # Build the in-order list of (role, content, incomplete, attachments).
+        msg_events: list[tuple[str, str, bool, list[dict]]] = []
         for row in session_events:
             if row.event_type != EVENT_MESSAGE_ADDED:
                 continue
@@ -358,41 +516,76 @@ class ConversationService:
                 continue
             role = payload.get("role")
             content = payload.get("content")
-            if not isinstance(role, str) or not isinstance(content, str):
+            if not isinstance(role, str):
                 continue
+            if not isinstance(content, str):
+                content = ""
             if role not in ("user", "assistant"):
                 continue
             incomplete = bool(payload.get("incomplete"))
-            msg_events.append((role, content, incomplete))
+            raw_attachments = payload.get("attachments")
+            attachments: list[dict] = []
+            if isinstance(raw_attachments, list):
+                for att in raw_attachments:
+                    if not isinstance(att, dict):
+                        continue
+                    fid = att.get("file_id")
+                    mime = att.get("mime")
+                    if not isinstance(fid, str) or not fid:
+                        continue
+                    entry: dict[str, Any] = {"file_id": fid}
+                    if isinstance(mime, str) and mime:
+                        entry["mime"] = mime
+                    attachments.append(entry)
+            msg_events.append((role, content, incomplete, attachments))
 
         if not msg_events:
-            return set()
+            return set(), {}
 
         # Walk CM history alongside the event list. For each CM entry,
         # advance the event pointer until we find a matching (role,
-        # content); if the event flagged it as incomplete and the role
-        # is assistant, record the CM index.
+        # content); record incomplete flag for assistant messages and
+        # attachments for user messages.
         cm_messages, _cid = await self._cm_history(
             token_name=token_name, session_id=session_id
         )
-        result: set[int] = set()
+        incomplete_indices: set[int] = set()
+        attachments_map: dict[int, list[dict]] = {}
         ev_ptr = 0
         for cm_idx, msg in enumerate(cm_messages):
             target_role = msg["role"]
             target_content = msg["content"]
             # Advance ev_ptr to the first event matching this CM entry.
             while ev_ptr < len(msg_events):
-                ev_role, ev_content, ev_incomplete = msg_events[ev_ptr]
+                ev_role, ev_content, ev_incomplete, ev_attachments = msg_events[
+                    ev_ptr
+                ]
                 ev_ptr += 1
                 if ev_role == target_role and ev_content == target_content:
                     if ev_incomplete and target_role == "assistant":
-                        result.add(cm_idx)
+                        incomplete_indices.add(cm_idx)
+                    if ev_attachments and target_role == "user":
+                        attachments_map[cm_idx] = ev_attachments
                     break
             else:
                 # Event list exhausted; remaining CM entries have no
                 # surviving event record (pruned) → leave them unflagged.
                 break
-        return result
+        return incomplete_indices, attachments_map
+
+    async def _build_incomplete_map(
+        self, *, token_name: str, session_id: str
+    ) -> set[int]:
+        """Backwards-compatible thin wrapper around `_build_history_overlay`.
+
+        Kept for any caller that only cares about the incomplete flag —
+        the new code path uses the dual-overlay helper directly so the
+        attachments backfill comes free.
+        """
+        incomplete, _ = await self._build_history_overlay(
+            token_name=token_name, session_id=session_id
+        )
+        return incomplete
 
     async def list_conversations(
         self, *, token_name: str
@@ -453,20 +646,90 @@ class ConversationService:
                 preview=preview_src[:_PREVIEW_CHARS],
                 now=now,
             )
-        # Stamp `incomplete: true` on assistant messages whose chat-sync
-        # event marked them as such. The flag is reconstructed from the
-        # event log on every fetch — CM doesn't store it natively. Old
-        # messages whose events have been pruned simply lose the flag.
-        incomplete_indices = await self._build_incomplete_map(
-            token_name=token_name, session_id=session_id
+        # Stamp `incomplete: true` on assistant messages from the event
+        # overlay AND enrich `attachments` with mime via storage lookup.
+        #
+        # Attachments source-of-truth: CM history's ImageURLPart segments.
+        # `_normalize_history` already populates `entry["attachments"]`
+        # with `[{"file_id": ...}]` for any user message that has them.
+        # We then batch-look-up `mime` from `webchat_files` once per
+        # `get_conversation` call (a single SELECT IN (...)) and stitch
+        # it onto each attachment dict. This makes CM the long-term
+        # store of attachments — `webchat_updates` is just the realtime
+        # cross-device push channel and can be pruned (default 14 days)
+        # without dropping image references from history.
+        #
+        # The event overlay is now only used for `incomplete` (which
+        # CM doesn't natively model). Event-derived attachments override
+        # CM-derived ones, but in practice they agree — both originated
+        # from the same `record_chat_pair` write.
+        incomplete_indices, attachments_map_from_events = (
+            await self._build_history_overlay(
+                token_name=token_name, session_id=session_id
+            )
         )
-        if incomplete_indices:
-            messages = [
-                ({**msg, "incomplete": True}
-                 if i in incomplete_indices and msg["role"] == "assistant"
-                 else msg)
-                for i, msg in enumerate(messages)
-            ]
+        # Batch-fetch mimes for every file_id we'll surface (CM + events
+        # merged). One query for the whole history.
+        all_file_ids: set[str] = set()
+        for i, msg in enumerate(messages):
+            for att in msg.get("attachments") or []:
+                fid = att.get("file_id")
+                if isinstance(fid, str):
+                    all_file_ids.add(fid)
+            for att in attachments_map_from_events.get(i, []):
+                fid = att.get("file_id") if isinstance(att, dict) else None
+                if isinstance(fid, str):
+                    all_file_ids.add(fid)
+        mime_by_file_id: dict[str, str] = {}
+        for fid in all_file_ids:
+            try:
+                row = await self._storage.get_file(fid)
+            except Exception:
+                logger.exception(
+                    "[WebChatGateway] get_file during conversation enrich failed sid=%s",
+                    session_id,
+                )
+                row = None
+            # Cross-token row leaks are impossible here: the file_id
+            # came out of THIS session's CM segments, which were
+            # written under THIS token via _cm_persist_pair.
+            if row is not None:
+                mime_by_file_id[fid] = row.mime
+        if incomplete_indices or attachments_map_from_events or all_file_ids:
+            decorated: list[dict] = []
+            for i, msg in enumerate(messages):
+                out = dict(msg)
+                if (
+                    msg["role"] == "assistant"
+                    and i in incomplete_indices
+                ):
+                    out["incomplete"] = True
+                # Prefer CM-derived attachments (long-term store);
+                # fall back to events if CM didn't have them (e.g.
+                # close_incomplete partial-write race).
+                attachments_for_msg = msg.get("attachments") or list(
+                    attachments_map_from_events.get(i, [])
+                )
+                if attachments_for_msg and msg["role"] == "user":
+                    enriched: list[dict] = []
+                    for att in attachments_for_msg:
+                        fid = att.get("file_id") if isinstance(att, dict) else None
+                        if not isinstance(fid, str):
+                            continue
+                        item = {"file_id": fid}
+                        if fid in mime_by_file_id:
+                            item["mime"] = mime_by_file_id[fid]
+                        elif isinstance(att, dict) and isinstance(
+                            att.get("mime"), str
+                        ):
+                            item["mime"] = att["mime"]
+                        enriched.append(item)
+                    if enriched:
+                        out["attachments"] = enriched
+                    else:
+                        out.pop("attachments", None)
+                decorated.append(out)
+            messages = decorated
         return ConversationDetail(
             session_id=session_id,
             title=meta.title,
@@ -557,7 +820,50 @@ class ConversationService:
         session_id: str,
         ip: str | None = None,
     ) -> SessionMetaRow:
+        # Serialize with /chat and /chat/stream on the same token. If a
+        # stream is currently active, its record_chat_pair / CM persist
+        # has not yet run; clearing right now would list the attachment
+        # rows BEFORE the stream's CM write but delete them AFTER, so
+        # CM would land an ImageURLPart pointing at a now-missing file
+        # and the next history fetch renders a broken thumbnail. The
+        # non-blocking `acquire` returns False on contention — surface
+        # that as 429 concurrent_request so the user retries once the
+        # stream finishes, consistent with /chat's own contention
+        # behavior on the same token.
+        if self._concurrency is not None:
+            async with self._concurrency.acquire(token_name) as acquired:
+                if not acquired:
+                    raise ServiceError("concurrent_request", status=429)
+                return await self._clear_history_inner(
+                    token_name=token_name, session_id=session_id, ip=ip
+                )
+        return await self._clear_history_inner(
+            token_name=token_name, session_id=session_id, ip=ip
+        )
+
+    async def _clear_history_inner(
+        self,
+        *,
+        token_name: str,
+        session_id: str,
+        ip: str | None,
+    ) -> SessionMetaRow:
         umo = _umo(token_name, session_id)
+        # Collect attachment rows BEFORE the CM wipe so we know what to
+        # delete from FileStore. clear_history must release these files
+        # too — without this they'd stay committed=1 in webchat_files
+        # forever (no longer referenced by CM, won't be picked up by
+        # orphan GC which only sees committed=0 rows), silently eating
+        # the token's storage quota for every "clear" the user clicks.
+        try:
+            attachment_rows = await self._storage.list_files_for_session(
+                token_name=token_name, session_id=session_id
+            )
+        except Exception:
+            logger.exception(
+                "[WebChatGateway] list_files_for_session during clear failed"
+            )
+            attachment_rows = []
         try:
             cid = await self._cm.get_curr_conversation_id(umo)
         except Exception:
@@ -580,6 +886,21 @@ class ConversationService:
                     "[WebChatGateway] CM.update_conversation(clear) failed"
                 )
                 raise ServiceError("clear_failed", status=500) from None
+        # Delete attachment storage objects FIRST, then their DB rows —
+        # `release_files_safely` enforces this order so a mid-cleanup
+        # crash leaves the DB row pointing at a missing object, which
+        # the next orphan / cascade prune sweep naturally retries. The
+        # alternative (DB-first) leaks R2 objects with no DB anchor for
+        # any future cleanup pass to find. The orphan GC also won't
+        # pick these up (committed=1 → not orphan), so this is the
+        # ONLY release path for clear_history.
+        if attachment_rows:
+            await release_files_safely(
+                storage=self._storage,
+                file_store=self._file_store,
+                rows=attachment_rows,
+                log_label="clear_history",
+            )
         now = self._now()
         row = await self._storage.upsert_session_meta(
             token_name=token_name,
@@ -619,6 +940,7 @@ class ConversationService:
         assistant_text: str,
         incomplete: bool = False,
         user_already_emitted: bool = False,
+        user_attachments: list[dict] | None = None,
     ) -> None:
         # Must never raise: the chat reply has already been delivered to the
         # client. A failure here is a sync hiccup, not a chat error. We
@@ -646,6 +968,7 @@ class ConversationService:
                 session_id=session_id,
                 user_text=user_text,
                 assistant_text=assistant_text,
+                user_attachments=user_attachments,
             )
         except Exception:
             # _cm_persist_pair already logs; the chat-sync layer below is
@@ -737,14 +1060,17 @@ class ConversationService:
                     now=now,
                 )
             if not user_already_emitted:
+                user_payload: dict[str, Any] = {
+                    "role": "user",
+                    "content": user_text,
+                }
+                if user_attachments:
+                    user_payload["attachments"] = list(user_attachments)
                 events.append(
                     NewEvent(
                         event_type=EVENT_MESSAGE_ADDED,
                         session_id=session_id,
-                        payload=json.dumps(
-                            {"role": "user", "content": user_text},
-                            ensure_ascii=False,
-                        ),
+                        payload=json.dumps(user_payload, ensure_ascii=False),
                     )
                 )
             assistant_payload: dict[str, Any] = {
@@ -794,6 +1120,7 @@ class ConversationService:
         session_id: str,
         user_text: str,
         stream_id: str,
+        attachments: list[dict] | None = None,
     ) -> None:
         """Emit `session_created` (if new) + `message_added(user)` +
         `stream_started` atomically.
@@ -811,6 +1138,13 @@ class ConversationService:
         (count = N+1, preview = user_text); record_chat_pair at close
         will update count again to N+2 and preview to the assistant
         text. The intermediate state is visible to peers but harmless.
+
+        `attachments` (optional) — list of `{file_id, mime}` dicts; when
+        non-empty, the user message_added payload carries them under an
+        `attachments` key so peer devices render the image bubble
+        immediately too. record_chat_pair at close intentionally does
+        NOT re-emit the user event (user_already_emitted=True path), so
+        attachments only appear here for the streaming flow.
 
         Must never raise — failures are logged + audited.
         """
@@ -865,14 +1199,17 @@ class ConversationService:
                     preview=preview,
                     now=now,
                 )
+            user_payload: dict[str, Any] = {
+                "role": "user",
+                "content": user_text,
+            }
+            if attachments:
+                user_payload["attachments"] = list(attachments)
             events.append(
                 NewEvent(
                     event_type=EVENT_MESSAGE_ADDED,
                     session_id=session_id,
-                    payload=json.dumps(
-                        {"role": "user", "content": user_text},
-                        ensure_ascii=False,
-                    ),
+                    payload=json.dumps(user_payload, ensure_ascii=False),
                 )
             )
             events.append(

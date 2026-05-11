@@ -19,7 +19,7 @@ is safe. Cross-version upgrades happen inside each backend's `initialize()`.
 
 from __future__ import annotations
 
-CURRENT_SCHEMA_VERSION = "4"
+CURRENT_SCHEMA_VERSION = "5"
 
 SCHEMA_SQLITE: tuple[str, ...] = (
     """
@@ -97,6 +97,23 @@ SCHEMA_SQLITE: tuple[str, ...] = (
     """,
     "CREATE INDEX IF NOT EXISTS idx_webchat_updates_ts "
     "ON webchat_updates(ts)",
+    """
+    CREATE TABLE IF NOT EXISTS webchat_files (
+        file_id      TEXT PRIMARY KEY,
+        token_name   TEXT NOT NULL,
+        session_id   TEXT NOT NULL,
+        mime         TEXT NOT NULL,
+        size_bytes   INTEGER NOT NULL,
+        storage_key  TEXT NOT NULL,
+        committed    INTEGER NOT NULL DEFAULT 0,
+        uploaded_at  INTEGER NOT NULL,
+        committed_at INTEGER
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_webchat_files_token_session "
+    "ON webchat_files (token_name, session_id)",
+    "CREATE INDEX IF NOT EXISTS idx_webchat_files_uncommitted "
+    "ON webchat_files (committed, uploaded_at)",
 )
 
 
@@ -234,6 +251,22 @@ SCHEMA_MYSQL: tuple[str, ...] = (
         INDEX idx_webchat_updates_ts (ts)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
+    """
+    CREATE TABLE IF NOT EXISTS webchat_files (
+        file_id      VARCHAR(32)  NOT NULL,
+        token_name   VARCHAR(128) NOT NULL,
+        session_id   VARCHAR(128) NOT NULL,
+        mime         VARCHAR(64)  NOT NULL,
+        size_bytes   BIGINT NOT NULL,
+        storage_key  VARCHAR(512) NOT NULL,
+        committed    TINYINT(1)   NOT NULL DEFAULT 0,
+        uploaded_at  BIGINT NOT NULL,
+        committed_at BIGINT NULL,
+        PRIMARY KEY (file_id),
+        INDEX idx_webchat_files_token_session (token_name, session_id),
+        INDEX idx_webchat_files_uncommitted (committed, uploaded_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
 )
 
 
@@ -275,4 +308,48 @@ ALTER_TOKENS_ADD_EXPIRES_AT_SQLITE = (
 )
 ALTER_TOKENS_ADD_EXPIRES_AT_MYSQL = (
     "ALTER TABLE tokens ADD COLUMN expires_at BIGINT NULL"
+)
+
+
+# v4 → v5: introduce webchat_files table for image uploads. Idempotent
+# via IF NOT EXISTS so a fresh v5 install (which already created the
+# table from SCHEMA_*) and a re-run both land in the same place.
+V4_TO_V5_SQLITE: tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS webchat_files (
+        file_id      TEXT PRIMARY KEY,
+        token_name   TEXT NOT NULL,
+        session_id   TEXT NOT NULL,
+        mime         TEXT NOT NULL,
+        size_bytes   INTEGER NOT NULL,
+        storage_key  TEXT NOT NULL,
+        committed    INTEGER NOT NULL DEFAULT 0,
+        uploaded_at  INTEGER NOT NULL,
+        committed_at INTEGER
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_webchat_files_token_session "
+    "ON webchat_files (token_name, session_id)",
+    "CREATE INDEX IF NOT EXISTS idx_webchat_files_uncommitted "
+    "ON webchat_files (committed, uploaded_at)",
+)
+
+
+V4_TO_V5_MYSQL: tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS webchat_files (
+        file_id      VARCHAR(32)  NOT NULL,
+        token_name   VARCHAR(128) NOT NULL,
+        session_id   VARCHAR(128) NOT NULL,
+        mime         VARCHAR(64)  NOT NULL,
+        size_bytes   BIGINT NOT NULL,
+        storage_key  VARCHAR(512) NOT NULL,
+        committed    TINYINT(1)   NOT NULL DEFAULT 0,
+        uploaded_at  BIGINT NOT NULL,
+        committed_at BIGINT NULL,
+        PRIMARY KEY (file_id),
+        INDEX idx_webchat_files_token_session (token_name, session_id),
+        INDEX idx_webchat_files_uncommitted (committed, uploaded_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
 )

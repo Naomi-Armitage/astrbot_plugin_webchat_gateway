@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as _dt
+import random
 import time
 from typing import Any
 
@@ -17,16 +18,19 @@ from astrbot.api.star import Context, Star
 
 from .core.audit import AuditLogger
 from .core.config import ConfigView
+from .core.cookie_logout import CookieLogoutTracker
 from .core.event_bus import EventBus
+from .core.file_store import FileStore, make_file_store_from_config
 from .core.ip_guard import IpGuard
 from .core.llm_bridge import LlmBridge
-from .core.ratelimit import PerTokenConcurrency
+from .core.ratelimit import PerTokenConcurrency, PerTokenUploadGate
 from .core.stream_buffer import InMemoryBuffer, RedisBuffer, StreamBuffer
 from .core.stream_registry import StreamRegistry
 from .handlers.admin_stats import AdminDeps
 from .handlers.admin_tokens import ServiceError, TokenService
 from .handlers.chat import ChatDeps
 from .handlers.conversations import ConversationDeps, ConversationService
+from .handlers.files import UploadDeps
 from .handlers.server import ServerDeps, ServerLifecycle, build_app
 from .handlers.title import TitleDeps
 from .storage import AbstractStorage, get_storage
@@ -39,9 +43,19 @@ class WebChatGatewayPlugin(Star):
     # background task; the long-poll endpoint forces clients past the
     # cutoff to do a cold refetch via tooFar. Soft-deleted session_meta
     # rows older than the deleted-meta cutoff are physically removed.
+    # Uncommitted file uploads older than the file-orphan cutoff are
+    # collected in the same pass — tab-close abandonment.
     _CHAT_SYNC_PRUNE_INTERVAL_SECONDS = 24 * 3600
     _CHAT_SYNC_EVENTS_RETENTION_SECONDS = 14 * 86400
     _CHAT_SYNC_DELETED_META_RETENTION_SECONDS = 90 * 86400
+    _UPLOAD_ORPHAN_RETENTION_SECONDS = 3600
+    # Boot-time delay before the FIRST prune iteration. Short enough
+    # that committed=0 orphans left over from a prior process crash
+    # don't occupy quota for a full day; long enough that startup-
+    # heavy systems aren't immediately competing with a DELETE pass.
+    # Randomised so multi-instance deployments don't sync up.
+    _CHAT_SYNC_PRUNE_BOOT_DELAY_MIN_SECONDS = 60
+    _CHAT_SYNC_PRUNE_BOOT_DELAY_MAX_SECONDS = 120
 
     def __init__(
         self,
@@ -55,6 +69,7 @@ class WebChatGatewayPlugin(Star):
         self._lifecycle = ServerLifecycle()
         self._token_service: TokenService | None = None
         self._audit: AuditLogger | None = None
+        self._file_store: FileStore | None = None
         self._prune_task: asyncio.Task[None] | None = None
 
     async def initialize(self) -> None:
@@ -101,6 +116,7 @@ class WebChatGatewayPlugin(Star):
                 block_seconds=cfg.ip_brute_force_block_seconds,
             )
             concurrency = PerTokenConcurrency()
+            upload_gate = PerTokenUploadGate()
             llm_bridge = LlmBridge(
                 self.context,
                 history_turns=cfg.history_turns,
@@ -109,11 +125,30 @@ class WebChatGatewayPlugin(Star):
             )
 
             event_bus = EventBus()
+
+            # FileStore (image uploads). Always constructed even when
+            # `uploads.enabled=False` — the conversations layer needs a
+            # FileStore handle to resolve attachments in CM history
+            # backfill. With uploads disabled, the upload route is
+            # simply not registered, so the store stays idle.
+            try:
+                file_store: FileStore = make_file_store_from_config(cfg.uploads)
+            except Exception:
+                logger.exception(
+                    "[WebChatGateway] FileStore init failed; uploads disabled"
+                )
+                from .core.file_store import LocalFileStore
+
+                file_store = LocalFileStore(root=cfg.uploads.local_path)
+            self._file_store = file_store
+
             conv_service = ConversationService(
                 storage=storage,
                 audit=audit,
                 event_bus=event_bus,
                 cm=self.context.conversation_manager,
+                file_store=file_store,
+                concurrency=concurrency,
             )
 
             # Streaming buffer + registry. Redis backend is opt-in via
@@ -172,6 +207,27 @@ class WebChatGatewayPlugin(Star):
                 concurrency=concurrency,
                 audit=audit,
                 conv_service=conv_service,
+                storage=storage,
+                file_store=file_store,
+            )
+
+            # HMAC secret for the /files-auth cookie. Rotates per
+            # plugin restart (cookie invalidation is operationally
+            # silent — clients re-issue on the next /me probe).
+            from .core.file_cookie import (
+                DEFAULT_TTL_SECONDS,
+                make_secret as _make_cookie_secret,
+            )
+
+            file_cookie_secret = _make_cookie_secret()
+            # In-memory tracker for server-side cookie invalidation on
+            # logout. Lives only for the plugin's runtime; on restart
+            # `file_cookie_secret` is rotated too, so all outstanding
+            # cookies are invalidated either way. The tracker's TTL
+            # mirrors the cookie's TTL so the invalidation window
+            # exactly covers any cookie issued at the logout moment.
+            cookie_logout_tracker = CookieLogoutTracker(
+                default_ttl_seconds=DEFAULT_TTL_SECONDS,
             )
 
             chat_deps = ChatDeps(
@@ -182,9 +238,14 @@ class WebChatGatewayPlugin(Star):
                 llm_bridge=llm_bridge,
                 conv_service=conv_service,
                 registry=registry,
+                file_store=file_store,
                 allowed_origins=cfg.allowed_origins,
                 max_message_length=cfg.max_message_length,
+                max_attachments_per_message=cfg.uploads.max_attachments_per_message,
                 trust_forwarded_for=cfg.trust_forwarded_for,
+                file_cookie_secret=file_cookie_secret,
+                file_cookie_path=cfg.files_cookie_path,
+                cookie_logout_tracker=cookie_logout_tracker,
                 trust_referer_as_origin=cfg.trust_referer_as_origin,
                 allow_missing_origin=cfg.allow_missing_origin,
             )
@@ -216,11 +277,37 @@ class WebChatGatewayPlugin(Star):
                 audit=audit,
                 event_bus=event_bus,
                 cm=self.context.conversation_manager,
+                file_store=file_store,
                 allowed_origins=cfg.allowed_origins,
                 trust_forwarded_for=cfg.trust_forwarded_for,
                 trust_referer_as_origin=cfg.trust_referer_as_origin,
                 allow_missing_origin=cfg.allow_missing_origin,
                 ip_guard=ip_guard,
+                concurrency=concurrency,
+            )
+            # Prefix the wire-format `url` field with the configured
+            # endpoint so a non-default `endpoint_prefix` flows through
+            # without separate plumbing. The handler appends `{file_id}`.
+            files_serve_prefix = f"{cfg.endpoint_prefix}/files/"
+            upload_deps = UploadDeps(
+                storage=storage,
+                audit=audit,
+                ip_guard=ip_guard,
+                file_store=file_store,
+                upload_gate=upload_gate,
+                allowed_origins=cfg.allowed_origins,
+                max_file_size_mb=cfg.uploads.max_file_size_mb,
+                per_token_storage_mb=cfg.uploads.per_token_storage_mb,
+                allowed_mime=cfg.uploads.allowed_mime,
+                storage_driver=cfg.uploads.storage_driver,
+                r2_serving_mode=cfg.uploads.r2_serving_mode,
+                r2_direct_link_ttl_seconds=cfg.uploads.r2_direct_link_ttl_seconds,
+                files_serve_prefix=files_serve_prefix,
+                trust_forwarded_for=cfg.trust_forwarded_for,
+                file_cookie_secret=file_cookie_secret,
+                cookie_logout_tracker=cookie_logout_tracker,
+                trust_referer_as_origin=cfg.trust_referer_as_origin,
+                allow_missing_origin=cfg.allow_missing_origin,
             )
             server_deps = ServerDeps(
                 config=cfg,
@@ -229,6 +316,7 @@ class WebChatGatewayPlugin(Star):
                 title=title_deps,
                 conv=conv_deps,
                 conv_service=conv_service,
+                upload=upload_deps,
             )
             app = build_app(server_deps)
 
@@ -261,31 +349,130 @@ class WebChatGatewayPlugin(Star):
         )
 
     async def _chat_sync_prune_loop(self) -> None:
-        """Periodically prune the event log + soft-deleted session meta.
+        """Periodically prune the event log + soft-deleted session meta
+        + attachment files past retention.
 
-        Tolerates errors: any failure logs and the next iteration retries
-        on the same cadence. Only exits when the task is cancelled (in
-        `_stop`). Cancellation propagates through `asyncio.sleep`.
+        Orchestration (DB-first ordering would leak storage objects on
+        crash — see `release_files_safely` rationale):
+
+            1. List candidate file rows to delete (orphans + cascade).
+            2. For each: `file_store.delete(storage_key)`. Collect
+               successful file_ids.
+            3. `storage.delete_files_by_ids(ok_ids)` — DB rows for
+               confirmed-deleted storage objects only.
+            4. List sessions about to be physically pruned, clear their
+               AstrBot CM history so dangling `ImageURLPart` segments
+               don't survive past the file's lifecycle.
+            5. `storage.prune_chat_sync(...)` — drop old events +
+               soft-deleted session_meta. The session_meta DELETE is
+               guarded by `NOT EXISTS (file)` so any failed-storage-
+               delete file keeps its session_meta around for next
+               iteration to retry.
+
+        First iteration runs after a short randomised delay (60-120s)
+        so a process that crashed during a prior prune doesn't have to
+        wait a full day for its leftover orphans to be cleaned up.
+        Tolerates errors at each step; the next iteration retries.
         """
         try:
-            # Wait one interval before the first run so a startup with a
-            # backlog isn't immediately followed by a heavy DELETE.
-            await asyncio.sleep(self._CHAT_SYNC_PRUNE_INTERVAL_SECONDS)
+            # First run: short randomised delay so committed=0 orphans
+            # left over from a prior process crash don't occupy quota
+            # for a full day. Multi-instance deployments don't sync up.
+            first_delay = random.uniform(
+                self._CHAT_SYNC_PRUNE_BOOT_DELAY_MIN_SECONDS,
+                self._CHAT_SYNC_PRUNE_BOOT_DELAY_MAX_SECONDS,
+            )
+            await asyncio.sleep(first_delay)
             while True:
                 try:
                     storage = self._storage
+                    file_store = self._file_store
                     if storage is None:
                         return
                     now = int(time.time())
-                    events_pruned, meta_pruned = await storage.prune_chat_sync(
-                        events_before_ts=now - self._CHAT_SYNC_EVENTS_RETENTION_SECONDS,
-                        deleted_meta_before_ts=now - self._CHAT_SYNC_DELETED_META_RETENTION_SECONDS,
+
+                    # Step 1: list candidate file rows.
+                    files_to_delete = await storage.list_files_to_prune(
+                        deleted_meta_before_ts=now
+                        - self._CHAT_SYNC_DELETED_META_RETENTION_SECONDS,
+                        uncommitted_files_before_ts=now
+                        - self._UPLOAD_ORPHAN_RETENTION_SECONDS,
                     )
-                    if events_pruned or meta_pruned:
+
+                    # Step 2 + 3: storage delete first, then DB rows
+                    # of those that succeeded. Failed-storage-delete
+                    # rows survive and are re-discovered next iter.
+                    files_deleted = 0
+                    if file_store is not None and files_to_delete:
+                        from .core.file_lifecycle import release_files_safely
+
+                        files_deleted = await release_files_safely(
+                            storage=storage,
+                            file_store=file_store,
+                            rows=files_to_delete,
+                            log_label="prune_loop",
+                        )
+
+                    # Step 4: list sessions about to be pruned, clear
+                    # their AstrBot CM history. Best-effort — a CM
+                    # failure for some session is logged but doesn't
+                    # block the prune. If we couldn't clear CM, the
+                    # session_meta still gets deleted next step
+                    # (NOT EXISTS guard only checks files), leaving a
+                    # narrow window where stale CM segments persist
+                    # for unreachable sessions. Documented trade-off.
+                    sessions_purged = 0
+                    sessions_to_purge = (
+                        await storage.list_sessions_to_purge(
+                            deleted_before_ts=now
+                            - self._CHAT_SYNC_DELETED_META_RETENTION_SECONDS,
+                        )
+                    )
+                    cm = self.context.conversation_manager
+                    for token_name, session_id in sessions_to_purge:
+                        umo = f"webchat_gateway:{token_name}:{session_id}"
+                        try:
+                            cid = await cm.get_curr_conversation_id(umo)
+                            if cid:
+                                await cm.update_conversation(
+                                    unified_msg_origin=umo,
+                                    conversation_id=cid,
+                                    history=[],
+                                )
+                                sessions_purged += 1
+                        except Exception:
+                            logger.exception(
+                                "[WebChatGateway] CM clear during prune "
+                                "failed token=%s session=%s",
+                                token_name,
+                                session_id,
+                            )
+
+                    # Step 5: events + session_meta. session_meta DELETE
+                    # uses NOT EXISTS (file) so any cascade file whose
+                    # storage delete failed in step 2 keeps its
+                    # session_meta around for next iter to retry.
+                    result = await storage.prune_chat_sync(
+                        events_before_ts=now
+                        - self._CHAT_SYNC_EVENTS_RETENTION_SECONDS,
+                        deleted_meta_before_ts=now
+                        - self._CHAT_SYNC_DELETED_META_RETENTION_SECONDS,
+                    )
+                    events_pruned, meta_pruned = result
+                    if (
+                        events_pruned
+                        or meta_pruned
+                        or files_to_delete
+                        or sessions_purged
+                    ):
                         logger.info(
-                            "[WebChatGateway] chat-sync prune: events=%d meta=%d",
+                            "[WebChatGateway] chat-sync prune: events=%d "
+                            "meta=%d files=%d/%d cm_cleared=%d",
                             events_pruned,
                             meta_pruned,
+                            files_deleted,
+                            len(files_to_delete),
+                            sessions_purged,
                         )
                 except asyncio.CancelledError:
                     raise
@@ -314,6 +501,7 @@ class WebChatGatewayPlugin(Star):
             self._storage = None
         self._token_service = None
         self._audit = None
+        self._file_store = None
 
     # ----- AstrBot in-bot admin commands -----
 

@@ -83,6 +83,32 @@ class NewEvent:
     payload: str
 
 
+@dataclass(frozen=True)
+class FileRow:
+    """A row from `webchat_files`.
+
+    `committed=True` means the file was attached to a sent message and is
+    safe from the orphan GC; `committed=False` means the file was uploaded
+    but never tied to a chat-stream call (likely abandoned). `committed_at`
+    captures the first-commit timestamp and is left untouched on
+    idempotent re-commits.
+
+    `storage_key` is opaque to the storage layer — Local uses a relative
+    path under the configured root, R2 uses an object key. The `FileStore`
+    Protocol is the only thing that interprets it.
+    """
+
+    file_id: str
+    token_name: str
+    session_id: str
+    mime: str
+    size_bytes: int
+    storage_key: str
+    committed: bool
+    uploaded_at: int
+    committed_at: int | None
+
+
 class AbstractStorage(ABC):
     """Pluggable storage interface for tokens, usage, IP failures, and audit."""
 
@@ -289,8 +315,27 @@ class AbstractStorage(ABC):
         `webchat_session_meta` rows whose `deleted_at` is older than
         `deleted_meta_before_ts`. Returns `(events_pruned, meta_pruned)`.
 
-        Idempotent and safe to run while the gateway is live; events older
-        than the cutoff have no remaining waiters that could observe them.
+        **Does NOT delete webchat_files rows.** Callers must orchestrate
+        file cleanup separately via `list_files_to_prune` →
+        `file_store.delete()` per row → `delete_files_by_ids()` for those
+        whose storage delete succeeded. This split exists because the
+        storage object must be removed BEFORE its DB row — otherwise a
+        mid-cleanup crash leaves an R2/disk object with no DB anchor
+        for any future prune sweep to find. The DB-first ordering
+        leaked storage objects permanently.
+
+        Session-meta DELETE is guarded by a `NOT EXISTS (file)` check:
+        if any `webchat_files` row still references this (token,
+        session) — typically because a previous prune iteration failed
+        to delete the storage object and left the DB row in place —
+        the session_meta row is retained for the next iteration to
+        retry. This preserves the cascade query's ability to
+        re-discover the file (via session_meta JOIN) on subsequent
+        prune passes.
+
+        Idempotent and safe to run while the gateway is live; events
+        older than the cutoff have no remaining waiters that could
+        observe them.
 
         Always retains the latest event per token regardless of age, to
         keep MAX(pts) monotonic. A prune that empties a token's row
@@ -309,4 +354,175 @@ class AbstractStorage(ABC):
         real events. Idempotent: rows already marked are skipped on
         subsequent prune passes via an `event_type != '_pruned_marker'`
         guard in the UPDATE.
+        """
+
+    @abstractmethod
+    async def list_files_to_prune(
+        self,
+        *,
+        deleted_meta_before_ts: int,
+        uncommitted_files_before_ts: int,
+        limit: int = 500,
+    ) -> list[FileRow]:
+        """READ-ONLY. Return file rows that should be physically deleted.
+
+        Two sources, deduplicated by file_id:
+
+        1. **Orphans**: `committed=0` rows with `uploaded_at <
+           uncommitted_files_before_ts` — uploaded but never attached
+           to a sent message (likely abandoned by a closed tab).
+        2. **Cascade**: rows whose `(token_name, session_id)` matches a
+           `webchat_session_meta` row about to be physically pruned
+           (`deleted_at < deleted_meta_before_ts`).
+
+        Capped at `limit` rows per source — pathological backlogs drain
+        over multiple prune cycles rather than all at once. Bound keeps
+        memory predictable.
+
+        Caller is responsible for orchestrating the cleanup:
+
+            rows = await storage.list_files_to_prune(...)
+            ok_ids = []
+            for r in rows:
+                try:
+                    await file_store.delete(storage_key=r.storage_key)
+                    ok_ids.append(r.file_id)
+                except Exception:
+                    logger.exception(...)
+            if ok_ids:
+                await storage.delete_files_by_ids(ok_ids)
+            await storage.prune_chat_sync(...)
+
+        Files whose storage delete fails retain their DB row, and the
+        next prune iteration re-discovers them via the same query.
+        """
+
+    @abstractmethod
+    async def list_sessions_to_purge(
+        self,
+        *,
+        deleted_before_ts: int,
+        limit: int = 500,
+    ) -> list[tuple[str, str]]:
+        """READ-ONLY. Return `(token_name, session_id)` tuples for
+        session_meta rows that `prune_chat_sync` is about to physically
+        delete.
+
+        Used by the prune loop to clear the corresponding AstrBot
+        ConversationManager history (so dangling `ImageURLPart`
+        segments don't survive past the file's lifecycle and produce
+        broken `<img>` references if the user later re-uses the same
+        session_id). The actual cm.update_conversation call lives in
+        the plugin's prune loop — this method just surfaces the list.
+        """
+
+    # ----- file uploads (v5) -----
+    @abstractmethod
+    async def insert_file(
+        self,
+        *,
+        file_id: str,
+        token_name: str,
+        session_id: str,
+        mime: str,
+        size_bytes: int,
+        storage_key: str,
+        now: int,
+    ) -> None:
+        """Insert a `webchat_files` row with `committed=0` and
+        `uploaded_at=now`. Caller has already validated all fields and
+        generated `file_id`; this is a straight INSERT — duplicate
+        `file_id` raises (which would indicate a token_urlsafe
+        collision, vanishingly unlikely given 96 bits of entropy).
+        """
+
+    @abstractmethod
+    async def get_file(self, file_id: str) -> FileRow | None:
+        """Look up a single file row by PK. Returns None if missing.
+
+        Caller is responsible for the ownership check
+        (`row.token_name == bearer.name`) — this method is a raw read
+        and does not enforce auth.
+        """
+
+    @abstractmethod
+    async def mark_files_committed(
+        self, file_ids: list[str], *, now: int
+    ) -> int:
+        """Flip `committed=1` and set `committed_at=now` on the listed
+        file_ids. Returns the number of rows actually updated.
+
+        Idempotent: re-marking an already-committed row is a no-op
+        (the existing `committed_at` is preserved — the first commit
+        wins). Empty `file_ids` returns 0 without touching the DB.
+        """
+
+    @abstractmethod
+    async def total_committed_size_for_token(self, token_name: str) -> int:
+        """Sum `size_bytes` over committed files owned by this token.
+
+        Use sparingly — `total_size_for_token` is what the upload quota
+        check uses to defend against the spam-upload-then-never-commit
+        DoS pattern. This committed-only variant is retained for
+        diagnostic / audit purposes.
+        """
+
+    @abstractmethod
+    async def total_size_for_token(self, token_name: str) -> int:
+        """Sum `size_bytes` over ALL files owned by this token, both
+        committed and uncommitted.
+
+        Used by the upload quota check. Counting uncommitted is the
+        defence against the "upload many, never send" abuse pattern —
+        without it an attacker can write `cap × (orphan_gc_cadence /
+        upload_rate)` bytes to disk/R2 before the orphan sweeper kicks
+        in. With it, total per-token storage is hard-capped at
+        `per_token_storage_mb` regardless of upload-vs-commit ratio.
+        """
+
+    @abstractmethod
+    async def list_files_for_session(
+        self, *, token_name: str, session_id: str
+    ) -> list[FileRow]:
+        """All committed and uncommitted file rows for one session.
+
+        Used by `get_conversation` to backfill `attachments` onto
+        message replies. Order is unspecified — callers that need a
+        stable order should sort by `uploaded_at` themselves.
+        """
+
+    @abstractmethod
+    async def list_uncommitted_orphans(
+        self, *, older_than_ts: int, limit: int = 500
+    ) -> list[FileRow]:
+        """Find `committed=0` rows older than `older_than_ts`.
+
+        Capped at `limit` to keep prune passes bounded; the daily prune
+        loop iterates this until empty. Used by the orphan GC in
+        `prune_chat_sync` but also exposed as a standalone primitive
+        so admin tooling can inspect or trigger cleanup out-of-band.
+        """
+
+    @abstractmethod
+    async def list_files_for_purged_sessions(
+        self, *, deleted_before_ts: int, limit: int = 500
+    ) -> list[FileRow]:
+        """Files belonging to sessions whose `webchat_session_meta`
+        row has `deleted_at < deleted_before_ts` (i.e. about to be
+        physically pruned by the cascade in `prune_chat_sync`).
+
+        Returns at most `limit` rows. Used internally by
+        `prune_chat_sync` to assemble the list of files to remove
+        from the FileStore.
+        """
+
+    @abstractmethod
+    async def delete_files_by_ids(self, file_ids: list[str]) -> int:
+        """Hard DELETE the listed file rows from `webchat_files`.
+
+        Returns the number of rows actually deleted. Empty `file_ids`
+        returns 0 without touching the DB. Caller is responsible for
+        ensuring no concurrent reader still needs the rows — typical
+        use is from the prune path, where the rows are already past
+        retention.
         """

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 from astrbot.api import logger
@@ -113,6 +113,43 @@ class StreamingConfig:
     max_global: int
 
 
+_DEFAULT_ALLOWED_MIME: tuple[str, ...] = (
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "image/gif",
+)
+
+
+@dataclass(frozen=True)
+class UploadsConfig:
+    """Image upload feature configuration.
+
+    Storage backend toggle (`storage_driver`) selects LocalFileStore or
+    R2FileStore. `enabled=False` keeps the routes installed but rejects
+    uploads at the handler entry (so the frontend can downgrade UX).
+
+    All sizes are MB so the operator-facing surface stays human-readable;
+    converted to bytes at the handler call sites.
+    """
+
+    enabled: bool
+    storage_driver: Literal["local", "r2"]
+    local_path: str
+    max_file_size_mb: int
+    per_token_storage_mb: int
+    max_attachments_per_message: int
+    allowed_mime: tuple[str, ...]
+    r2_account_id: str
+    r2_access_key_id: str
+    r2_secret_access_key: str
+    r2_bucket: str
+    r2_endpoint: str
+    r2_serving_mode: Literal["proxy", "direct"]
+    r2_direct_link_ttl_seconds: int
+    r2_cache_size_mb: int
+
+
 @dataclass(frozen=True)
 class ConfigView:
     host: str
@@ -139,6 +176,7 @@ class ConfigView:
     theme_family: str
     storage: StorageConfig
     streaming: StreamingConfig
+    uploads: UploadsConfig
 
     @property
     def chat_path(self) -> str:
@@ -215,6 +253,37 @@ class ConfigView:
     @property
     def events_path(self) -> str:
         return f"{self.endpoint_prefix}/events"
+
+    @property
+    def upload_path(self) -> str:
+        return f"{self.endpoint_prefix}/upload"
+
+    @property
+    def files_serve_path(self) -> str:
+        return f"{self.endpoint_prefix}/files/{{file_id}}"
+
+    @property
+    def files_cookie_path(self) -> str:
+        """Path attribute for the file-auth cookie's Set-Cookie header.
+
+        Must scope to the /files-prefix so the cookie is sent on serve
+        requests but NOT on /chat or /admin (least-privilege). Builds
+        off `endpoint_prefix` so a custom prefix doesn't silently break
+        cookie delivery — the browser scopes by exact path prefix.
+        """
+        return f"{self.endpoint_prefix}/files"
+
+    @property
+    def logout_path(self) -> str:
+        """POST endpoint that clears + server-side invalidates the file-
+        auth cookie. Scoped UNDER the cookie's `Path` attribute (which
+        is `{prefix}/files`) so the browser auto-sends the cookie on
+        the logout request — without that, `navigator.sendBeacon` (the
+        page-unload-safe channel the frontend uses for logout) cannot
+        attach the cookie and the handler has no way to identify which
+        token's cookies to invalidate server-side.
+        """
+        return f"{self.endpoint_prefix}/files/logout"
 
     @classmethod
     def from_raw(cls, cfg: Any) -> "ConfigView":
@@ -297,6 +366,75 @@ class ConfigView:
             _get(raw_streaming, "max_global"), default=200, lo=10, hi=10_000
         )
 
+        raw_uploads = _get(cfg, "uploads", {}) or {}
+        uploads_enabled = _parse_bool(_get(raw_uploads, "enabled"), default=True)
+        uploads_driver = (
+            str(_get(raw_uploads, "storage_driver", "local")).strip().lower()
+            or "local"
+        )
+        if uploads_driver not in {"local", "r2"}:
+            logger.warning(
+                "[WebChatGateway] unknown uploads.storage_driver=%s, fallback to local",
+                uploads_driver,
+            )
+            uploads_driver = "local"
+        local_path = str(
+            _get(raw_uploads, "local_path") or "data/webchat_uploads"
+        ).strip() or "data/webchat_uploads"
+        max_file_size_mb = _clamp_int(
+            _get(raw_uploads, "max_file_size_mb"), default=20, lo=1, hi=200
+        )
+        per_token_storage_mb = _clamp_int(
+            _get(raw_uploads, "per_token_storage_mb"),
+            default=500,
+            lo=1,
+            hi=1_000_000,
+        )
+        max_attachments_per_message = _clamp_int(
+            _get(raw_uploads, "max_attachments_per_message"),
+            default=4,
+            lo=1,
+            hi=16,
+        )
+        raw_allowed_mime = _get(raw_uploads, "allowed_mime")
+        if raw_allowed_mime is None:
+            allowed_mime: tuple[str, ...] = _DEFAULT_ALLOWED_MIME
+        elif isinstance(raw_allowed_mime, str):
+            parts = tuple(
+                p.strip() for p in raw_allowed_mime.split(",") if p.strip()
+            )
+            allowed_mime = parts or _DEFAULT_ALLOWED_MIME
+        elif isinstance(raw_allowed_mime, (list, tuple, set)):
+            parts = tuple(str(p).strip() for p in raw_allowed_mime if str(p).strip())
+            allowed_mime = parts or _DEFAULT_ALLOWED_MIME
+        else:
+            allowed_mime = _DEFAULT_ALLOWED_MIME
+
+        raw_r2 = _get(raw_uploads, "r2", {}) or {}
+        r2_account_id = str(_get(raw_r2, "account_id") or "").strip()
+        r2_access_key_id = str(_get(raw_r2, "access_key_id") or "").strip()
+        r2_secret_access_key = str(_get(raw_r2, "secret_access_key") or "").strip()
+        r2_bucket = str(_get(raw_r2, "bucket") or "").strip()
+        r2_endpoint = str(_get(raw_r2, "endpoint") or "").strip()
+        r2_serving_mode = (
+            str(_get(raw_r2, "serving_mode", "proxy")).strip().lower() or "proxy"
+        )
+        if r2_serving_mode not in {"proxy", "direct"}:
+            logger.warning(
+                "[WebChatGateway] unknown uploads.r2.serving_mode=%s, fallback to proxy",
+                r2_serving_mode,
+            )
+            r2_serving_mode = "proxy"
+        r2_direct_link_ttl_seconds = _clamp_int(
+            _get(raw_r2, "direct_link_ttl_seconds"),
+            default=300,
+            lo=30,
+            hi=3600,
+        )
+        r2_cache_size_mb = _clamp_int(
+            _get(raw_r2, "cache_size_mb"), default=200, lo=10, hi=100_000
+        )
+
         view = cls(
             host=host,
             port=port,
@@ -330,6 +468,23 @@ class ConfigView:
                 grace_seconds=grace_seconds,
                 max_per_token=max_per_token,
                 max_global=max_global,
+            ),
+            uploads=UploadsConfig(
+                enabled=uploads_enabled,
+                storage_driver=uploads_driver,
+                local_path=local_path,
+                max_file_size_mb=max_file_size_mb,
+                per_token_storage_mb=per_token_storage_mb,
+                max_attachments_per_message=max_attachments_per_message,
+                allowed_mime=allowed_mime,
+                r2_account_id=r2_account_id,
+                r2_access_key_id=r2_access_key_id,
+                r2_secret_access_key=r2_secret_access_key,
+                r2_bucket=r2_bucket,
+                r2_endpoint=r2_endpoint,
+                r2_serving_mode=r2_serving_mode,
+                r2_direct_link_ttl_seconds=r2_direct_link_ttl_seconds,
+                r2_cache_size_mb=r2_cache_size_mb,
             ),
         )
         view._emit_warnings()

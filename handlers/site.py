@@ -32,6 +32,14 @@ class SiteDeps:
     theme_family: str
     allowed_origins: set[str]
     trust_referer_as_origin: bool
+    # Upload-config view exposed to the chat client so the FE's
+    # composer enforces the same caps as the server (otherwise a
+    # rebind from default 4 to e.g. 8 on the operator side wouldn't
+    # take effect in the browser until a code change).
+    uploads_enabled: bool
+    uploads_max_file_size_mb: int
+    uploads_max_attachments_per_message: int
+    uploads_allowed_mime: tuple[str, ...]
 
 
 def make_site_handlers(deps: SiteDeps):
@@ -44,6 +52,12 @@ def make_site_handlers(deps: SiteDeps):
         "show_github_link": deps.show_github_link,
         "privacy_url": deps.privacy_url,
         "theme_family": deps.theme_family,
+        "uploads": {
+            "enabled": deps.uploads_enabled,
+            "max_file_size_mb": deps.uploads_max_file_size_mb,
+            "max_attachments_per_message": deps.uploads_max_attachments_per_message,
+            "allowed_mime": list(deps.uploads_allowed_mime),
+        },
     }
 
     async def get_site(request: web.Request) -> web.Response:

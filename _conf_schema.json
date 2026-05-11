@@ -189,5 +189,111 @@
         "default": 200
       }
     }
+  },
+  "uploads": {
+    "type": "object",
+    "description": "图片上传与附件存储",
+    "hint": "聊天页支持拖拽 / 粘贴 / 选择最多 4 张图片随消息发送。需要 LLM 提供方支持多模态（image_url）才能让模型实际看到图。",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "是否启用图片上传",
+        "hint": "关闭后上传接口直接拒绝，前端附件按钮也会变灰。",
+        "default": true
+      },
+      "storage_driver": {
+        "type": "string",
+        "description": "存储驱动",
+        "hint": "local 写入本地磁盘（默认，零配置）；r2 写入 Cloudflare R2，需要安装 aiobotocore（pip install aiobotocore）。",
+        "options": ["local", "r2"],
+        "default": "local"
+      },
+      "local_path": {
+        "type": "string",
+        "description": "本地存储根目录",
+        "hint": "相对路径以 AstrBot 工作目录为基准；文件按 {token_name}/{file_id}.{ext} 组织。",
+        "default": "data/webchat_uploads"
+      },
+      "max_file_size_mb": {
+        "type": "int",
+        "description": "单文件最大大小（MB）",
+        "hint": "超过会返回 413 payload_too_large。建议 5-50，默认 20。",
+        "default": 20
+      },
+      "per_token_storage_mb": {
+        "type": "int",
+        "description": "单 token 累计存储上限（MB）",
+        "hint": "已提交（committed）文件总大小达到该阈值后，新上传返回 429 storage_quota_exceeded。未提交的临时文件不计入，由 GC 在 1 小时后清理。",
+        "default": 500
+      },
+      "max_attachments_per_message": {
+        "type": "int",
+        "description": "单条消息最多附件数",
+        "hint": "超过会返回 400 too_many_attachments。建议 1-8，默认 4 与主流 LLM 对齐。",
+        "default": 4
+      },
+      "allowed_mime": {
+        "type": "string",
+        "description": "允许的 MIME 类型（逗号分隔）",
+        "hint": "默认 image/jpeg,image/png,image/webp,image/gif。不要包含 image/svg+xml（XSS）或 image/avif（解码器兼容性差）。",
+        "default": "image/jpeg,image/png,image/webp,image/gif"
+      },
+      "r2": {
+        "type": "object",
+        "description": "Cloudflare R2 后端配置",
+        "hint": "仅当 storage_driver=r2 时生效。account_id/access_key_id/secret_access_key/bucket/endpoint 缺一不可。",
+        "items": {
+          "account_id": {
+            "type": "string",
+            "description": "R2 Account ID",
+            "hint": "在 Cloudflare dashboard → R2 → Overview 顶部可见。",
+            "default": ""
+          },
+          "access_key_id": {
+            "type": "string",
+            "description": "R2 Access Key ID",
+            "hint": "R2 → Manage R2 API Tokens 创建后获取。仅授予该 bucket 的 Read & Write 权限。",
+            "default": ""
+          },
+          "secret_access_key": {
+            "type": "string",
+            "description": "R2 Secret Access Key",
+            "hint": "创建 token 时一次性显示，请妥善保存。请勿提交到代码仓库。",
+            "default": ""
+          },
+          "bucket": {
+            "type": "string",
+            "description": "Bucket 名称",
+            "hint": "建议为本插件单独建一个 bucket，与其他业务隔离。",
+            "default": ""
+          },
+          "endpoint": {
+            "type": "string",
+            "description": "R2 endpoint URL",
+            "hint": "形如 https://<account_id>.r2.cloudflarestorage.com，可在 bucket settings 查看。",
+            "default": ""
+          },
+          "serving_mode": {
+            "type": "string",
+            "description": "图片下发模式",
+            "hint": "proxy（默认）= 走插件代理读 R2，下行带宽算自己服务器，但对国内用户更快；direct = 302 跳转到 R2 预签名 URL，节省带宽但走 Cloudflare 边缘。",
+            "options": ["proxy", "direct"],
+            "default": "proxy"
+          },
+          "direct_link_ttl_seconds": {
+            "type": "int",
+            "description": "Direct 模式签名链接有效期（秒）",
+            "hint": "仅当 serving_mode=direct 时生效。30-3600，默认 300（5 分钟）。",
+            "default": 300
+          },
+          "cache_size_mb": {
+            "type": "int",
+            "description": "R2 本地缓存大小（MB）",
+            "hint": "LLM 调用需要本地路径时会先把 R2 对象 fetch 到 AstrBot 临时目录。LRU 淘汰，默认 200。",
+            "default": 200
+          }
+        }
+      }
+    }
   }
 }

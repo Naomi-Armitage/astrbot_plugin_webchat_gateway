@@ -3,6 +3,40 @@
 记录本插件的可见变化。版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)，
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/)。
 
+## v0.3.0 — 2026-05-11
+
+### Added — 图片上传 / 多模态附件
+- 新增 `POST {prefix}/upload` 多部分上传端点：单次最多 20 MB（默认）、按 token 总配额 500 MB（默认）、每条消息最多 4 张图。仅接受 `image/jpeg|png|webp|gif`，通过 Pillow `verify()` 抗解压炸弹（`MAX_IMAGE_PIXELS=50M`）
+- 新增 `GET {prefix}/files/{file_id}` 私有图床端点：`<img src>` 渲染走 HMAC 签名的 HttpOnly cookie（Path 限 `{prefix}/files`，SameSite=Lax），bearer header 仍可用（CLI / 服务端）。Cookie 签名折入 `token_hash`，admin `regenerate_token` 立即作废所有旧 cookie
+- 新增 `POST {prefix}/files/logout`：受 cookie 鉴权，登出时记录"该 token 此刻之前签发的所有 cookie 一律失效"，同时清空浏览器 cookie。前端 `sendBeacon` 优先、`fetch(keepalive)` 兜底
+- 新增 FileStore 抽象 + LocalFileStore（默认）+ R2FileStore（可选，opt-in `aiobotocore>=2.13`）；R2 支持 proxy 模式（透传）和 direct 模式（302 → 预签名 URL，TTL 30-3600s）+ 200MB 本地 LRU 缓存
+- 新增数据库表 `webchat_files`（schema v4→v5 自动迁移）追踪每个 file_id 的所有权、提交状态、存储 key。Orphan GC（committed=0，1 小时窗口）+ session cascade（committed=1 跟随 90 天软删 session 一起清掉）
+- 前端 chat 页支持多图缩略图气泡（grid 1/2/3/4 layout）、灯箱浏览（Esc / 左右方向键 / 滚轮缩放）、composer 多附件 chip 条、Canvas 自动缩到 2048px 长边（GIF 跳过）
+
+### Added — 配置
+- 新增 `uploads.*` 配置组（enabled / storage_driver / local_path / max_file_size_mb / per_token_storage_mb / max_attachments_per_message / allowed_mime + 嵌套 `r2.{account_id, access_key_id, secret_access_key, bucket, endpoint, serving_mode, direct_link_ttl_seconds, cache_size_mb}`）
+- 新增 Pillow 硬依赖（`requirements.txt`）；`aiobotocore` 仍为 R2 可选 opt-in
+
+### Changed
+- `prune_chat_sync` 现在只返回 `(events_pruned, meta_pruned)` —— 文件清理由 `main.py` 编排：列举 → 存储删除 → DB 删除（先存储后 DB，避免崩溃留 R2 orphan）。`session_meta` 物理删除前增加 `NOT EXISTS (file)` 保护，存储删除失败时 `session_meta` 留待下轮重试
+- 90 天 session 物理删除时同步清 AstrBot CM 历史（`update_conversation(history=[])`），防止用户重新使用同名 session 时 CM 残留过期 `ImageURLPart` 显示破图
+- 启动后 60-120s 跑首次 prune（之前要等满一个间隔 24 小时），让上次进程崩溃留下的 orphan 不必占着 quota 一整天
+- `clear_history` 现在阻塞获取 PerTokenConcurrency 锁，避免和正在 stream 的 `/chat/stream` 并发删除其附件
+
+### Fixed
+- **B1** 非流式 `/chat` 在 LLM 失败时未释放已 commit 的附件 → 配额泄漏。改为 try/except 包住 LLM 调用，失败时调用统一的 `release_files_safely` 助手
+- **B2 + H2/H3/H4** prune loop / `_release_attached_files` / `clear_history` 之前都是先删 DB 再删存储，崩溃可能留 R2 orphan 永远找不回。统一改为先删存储后删 DB（删存储成功的才删 DB 行）
+- **H4 / 安全** logout 现在服务端真正失效 cookie：`CookieLogoutTracker` 记录每个 token 的登出时间戳，验证 cookie 时若签发时间早于 logout 则拒绝。Cookie 路径仍是 `{prefix}/files`，logout 路径同步移到 `{prefix}/files/logout` 让浏览器自动带上 cookie
+- **H5** stream 中 `emit_stream_started` 已经把用户气泡（含附件 file_id）推给对端设备，紧接着 `close_failed`（如 empty_reply / llm_timeout 零 chunk）会释放文件 → 对端显示破图。修复：`StreamHandle.user_message_emitted` 标志，已发就跳过 `_release_attached_files`
+- **#24** `mark_files_committed` 失败之前被 `logger.exception` 静默吞掉，下游 CM 会持久化指向不存在文件的 ImageURLPart。改为 fatal：触发 `close_failed("commit_failed")` + 500
+- **#27 安全** `GET /files/{id}` 在"无 bearer + 无 cookie"分支之前直接返回 401 不调 `ip_guard.record_failure` → 匿名探测无成本。补齐 IP-guard 计数 + audit `auth_fail`，和 `/chat` 行为对齐
+- **#28 安全** `/files/{id}` 响应补 `X-Content-Type-Options: nosniff` 和 `Content-Disposition: inline; filename=...` —— 当前 MIME 白名单很严已经够安全，这是 defense-in-depth
+- **#33 并发** R2 LRU `_trim_cache_dir_sync` 之前跨 key 并发可能误删别的 coroutine 刚下载的文件（`protect_path` 只保护自己写的那个）。增加 store-级 `_trim_lock` 串行所有 trim 调用
+
+### Internal / Schema
+- 数据库 schema v4 → v5（webchat_files 表 + 索引）；新装直接 v5
+- `storage/base.py` `prune_chat_sync` 签名变更：移除 `uncommitted_files_before_ts` 参数，移除返回值里的 `files_to_delete`。新增 `list_files_to_prune` + `list_sessions_to_purge` 助手让 main.py 编排 storage-first 删除流程
+
 ## v0.2.1 — 2026-05-02
 
 ### Added

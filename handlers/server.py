@@ -24,6 +24,7 @@ from .chat import (
     make_chat_handler,
     make_chat_stream_handler,
     make_chat_stream_resume_handler,
+    make_logout_handler,
     make_me_handler,
     make_preflight_handler,
 )
@@ -31,6 +32,12 @@ from .conversations import (
     ConversationDeps,
     ConversationService,
     make_conversation_handlers,
+)
+from .files import (
+    UploadDeps,
+    make_files_preflight,
+    make_serve_handler,
+    make_upload_handler,
 )
 from .site import SiteDeps, make_site_handlers
 from .title import TitleDeps, make_title_handler
@@ -44,6 +51,7 @@ class ServerDeps:
     title: TitleDeps
     conv: ConversationDeps
     conv_service: ConversationService
+    upload: UploadDeps
 
 
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
@@ -95,7 +103,16 @@ def build_app(deps: ServerDeps) -> web.Application:
     cfg = deps.config
     # Cap incoming body size: max_message_length is char count; multiply for
     # JSON envelope + unicode escaping headroom, with a 64 KB floor.
-    body_cap = max(64 * 1024, cfg.max_message_length * 4)
+    # Uploads use the same cap, so when image uploads are enabled raise the
+    # ceiling to fit the largest single file plus a multipart envelope
+    # overhead. The cap applies to BOTH /chat (JSON) and /upload (multipart);
+    # /chat doesn't suffer from the higher value because its own
+    # `max_message_length` check rejects bloated text long before we look at
+    # the bytes.
+    upload_cap_bytes = 0
+    if cfg.uploads.enabled:
+        upload_cap_bytes = cfg.uploads.max_file_size_mb * 1024 * 1024 + 256 * 1024
+    body_cap = max(64 * 1024, cfg.max_message_length * 4, upload_cap_bytes)
     app = web.Application(client_max_size=body_cap)
 
     # Stream buffer eviction sweeper — runs for the lifetime of the app.
@@ -137,6 +154,26 @@ def build_app(deps: ServerDeps) -> web.Application:
     me_handler = make_me_handler(deps.chat)
     app.router.add_get(cfg.me_path, me_handler)
     app.router.add_options(cfg.me_path, chat_preflight)
+
+    logout_handler = make_logout_handler(deps.chat)
+    app.router.add_post(cfg.logout_path, logout_handler)
+    app.router.add_options(cfg.logout_path, chat_preflight)
+
+    # Upload + serve. Same allow-list, same IP guard, same bearer gate
+    # as /chat — wired off `deps.upload` so the handler doesn't have to
+    # reach into ChatDeps for storage/audit/ip_guard.
+    # Serve route is ALWAYS registered, regardless of uploads.enabled —
+    # disabling new uploads must not also brick reading historical
+    # images that are already in DB + storage. Only the POST upload
+    # route gates on the flag.
+    serve_handler = make_serve_handler(deps.upload)
+    files_preflight = make_files_preflight(deps.upload)
+    app.router.add_get(cfg.files_serve_path, serve_handler)
+    app.router.add_options(cfg.files_serve_path, files_preflight)
+    if cfg.uploads.enabled:
+        upload_handler = make_upload_handler(deps.upload)
+        app.router.add_post(cfg.upload_path, upload_handler)
+        app.router.add_options(cfg.upload_path, files_preflight)
 
     title_handler = make_title_handler(deps.title)
     app.router.add_post(cfg.title_path, title_handler)
@@ -202,6 +239,10 @@ def build_app(deps: ServerDeps) -> web.Application:
             theme_family=cfg.theme_family,
             allowed_origins=cfg.allowed_origins,
             trust_referer_as_origin=deps.chat.trust_referer_as_origin,
+            uploads_enabled=cfg.uploads.enabled,
+            uploads_max_file_size_mb=cfg.uploads.max_file_size_mb,
+            uploads_max_attachments_per_message=cfg.uploads.max_attachments_per_message,
+            uploads_allowed_mime=tuple(cfg.uploads.allowed_mime),
         )
     )
     app.router.add_get(cfg.site_info_path, site["get_site"])

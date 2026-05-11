@@ -87,6 +87,24 @@ class StreamHandle:
     session_id: str
     started_at: float
     next_seq: int = 0
+    # file_ids of attachments that were `mark_files_committed`-ed at
+    # POST time. On `close_failed` (stream produced no content), the
+    # registry uses this list to release those files — without it the
+    # files would stay committed=1 forever, occupying quota for a turn
+    # that has no CM record. On close_ok / close_incomplete the files
+    # legitimately belong to a persisted user message and stay.
+    attachment_file_ids: list[str] = field(default_factory=list)
+    # Set to True by the HTTP handler IMMEDIATELY after the chat-sync
+    # `message_added(user)` event with these attachments has been
+    # successfully written + notified. Once that's happened, peer
+    # devices' webchat_updates stream has already rendered the user
+    # bubble; releasing the files in close_failed would 404 every
+    # `<img src>` on the peer side. So the release path checks this
+    # flag and skips file cleanup when set — the cost is the files
+    # staying committed=1 until the user clears the session or the
+    # 90-day cascade prune runs, which is a quota leak we accept in
+    # exchange for not breaking already-rendered peer UI.
+    user_message_emitted: bool = False
     _used: bool = field(default=False, repr=False)
 
 
@@ -98,11 +116,17 @@ class StreamRegistry:
         concurrency: PerTokenConcurrency,
         audit: AuditLogger,
         conv_service: Any,
+        storage: Any = None,
+        file_store: Any = None,
     ) -> None:
         self._buffer = buffer
         self._concurrency = concurrency
         self._audit = audit
         self._conv_service = conv_service
+        # Optional — only needed for close_failed attachment cleanup.
+        # Tests can still construct StreamRegistry without these.
+        self._storage = storage
+        self._file_store = file_store
 
     # --- buffer surface for the resume handler ---
 
@@ -165,7 +189,12 @@ class StreamRegistry:
     # --- lifecycle ---
 
     async def open(
-        self, *, token_name: str, session_id: str
+        self,
+        *,
+        token_name: str,
+        session_id: str,
+        attachments: list[dict] | None = None,
+        attachment_file_ids: list[str] | None = None,
     ) -> StreamHandle | None:
         """Acquire the per-token lock and create a new buffer entry.
 
@@ -179,6 +208,17 @@ class StreamRegistry:
         the HTTP handler only after the SSE handshake and stream_id frame
         are written. Emitting it here would let peer devices attach to a
         stream that the origin client never successfully opened.
+
+        `attachments` (optional, full {file_id, mime, ...} dicts) flows
+        through to the handler so it can pass them to
+        `emit_stream_started` once the SSE handshake is complete.
+
+        `attachment_file_ids` (optional, bare list of file_ids) is stored
+        on the handle so `close_failed` can release those files —
+        without this list, a stream that fails before producing any
+        content (no chunks → close_failed → no CM persist) would leave
+        files committed=1 indefinitely with no UI record, eating the
+        token's storage quota for a "ghost turn".
         """
         stream_id = self._new_stream_id(token_name)
         # Defensive: the constructor format always satisfies the
@@ -251,6 +291,7 @@ class StreamRegistry:
             token_name=token_name,
             session_id=session_id,
             started_at=time.time(),
+            attachment_file_ids=list(attachment_file_ids or []),
         )
         try:
             await self._audit.write(
@@ -295,8 +336,17 @@ class StreamRegistry:
         full_text: str,
         remaining: int,
         daily_quota: int,
+        user_attachments: list[dict] | None = None,
     ) -> None:
-        """Successful completion: persist + emit ok + close OK + audit."""
+        """Successful completion: persist + emit ok + close OK + audit.
+
+        `user_attachments` is forwarded to record_chat_pair so the CM
+        write attaches ImageURLParts for the user turn — purely the
+        persistence side. The stream's user message_added event has
+        already been emitted by emit_stream_started with the same
+        attachments list, so peers see them at stream start; this kwarg
+        keeps CM history aligned with the wire event.
+        """
         await self._close(
             handle,
             buffer_state="closed_ok",
@@ -321,6 +371,7 @@ class StreamRegistry:
                 assistant_text=full_text,
                 incomplete=False,
                 user_already_emitted=True,
+                user_attachments=user_attachments or [],
             ),
         )
 
@@ -333,9 +384,15 @@ class StreamRegistry:
         remaining: int,
         daily_quota: int,
         reason: str,
+        user_attachments: list[dict] | None = None,
     ) -> None:
         """Aborted-with-content: persist as incomplete + emit incomplete +
-        close INCOMPLETE + audit."""
+        close INCOMPLETE + audit.
+
+        Mirrors `close_ok`'s `user_attachments` forwarding — partial
+        replies still carry the original user attachments into CM so
+        the next turn's context sees them too.
+        """
         await self._close(
             handle,
             buffer_state="closed_incomplete",
@@ -361,6 +418,7 @@ class StreamRegistry:
                 assistant_text=partial_text,
                 incomplete=True,
                 user_already_emitted=True,
+                user_attachments=user_attachments or [],
             ),
         )
 
@@ -374,8 +432,13 @@ class StreamRegistry:
 
         The previous user message stays in CM history alone (or doesn't
         land at all — record_chat_pair was never called) and the user
-        can resend.
+        can resend. Any attachments that were `mark_files_committed`-ed
+        at POST time get released here, otherwise they'd sit at
+        committed=1 forever (no CM record, no UI record, only quota
+        consumption) since this path doesn't persist the user message
+        to CM.
         """
+        await self._release_attached_files(handle)
         await self._close(
             handle,
             buffer_state="closed_failed",
@@ -388,6 +451,71 @@ class StreamRegistry:
                 "error": error_code,
             },
             persist=None,
+        )
+
+    async def _release_attached_files(self, handle: StreamHandle) -> None:
+        """Delete the DB rows + storage objects for files attached to a
+        failed stream. Best-effort: each failure is logged and skipped
+        so a flaky storage step doesn't leave the lock stranded.
+
+        Skipped entirely when `handle.user_message_emitted` is True —
+        peer devices have already rendered the user bubble (containing
+        these file_ids) from the `message_added` event written by
+        `emit_stream_started`, and deleting the files now would 404
+        every `<img>` on those peers. The trade-off is documented on
+        `StreamHandle.user_message_emitted`: files stay committed=1
+        until session clear / cascade prune.
+
+        Order is storage-first, DB-second (handled by
+        `release_files_safely`): a mid-cleanup crash leaves the DB
+        row pointing at a missing storage object, which the next
+        orphan / cascade sweep naturally re-discovers and retries.
+        Reversing the order would risk a permanent R2 orphan with no
+        DB anchor (no sweep could find it again).
+        """
+        if handle.user_message_emitted:
+            return
+        file_ids = list(handle.attachment_file_ids)
+        if not file_ids or self._storage is None:
+            return
+        rows = []
+        for fid in file_ids:
+            try:
+                row = await self._storage.get_file(fid)
+            except Exception:
+                logger.exception(
+                    "[WebChatGateway] _release_attached_files lookup failed fid=%s",
+                    fid,
+                )
+                row = None
+            if row is None:
+                continue
+            # Defence in depth: only release files owned by this stream's
+            # token. The validation already ran upstream in the chat
+            # handler, but a future refactor that weakens it would make
+            # this method a vector for deleting any file_id by guessing
+            # it. Cheap check, no observable cost.
+            if row.token_name != handle.token_name:
+                logger.warning(
+                    "[WebChatGateway] _release_attached_files: skipping "
+                    "cross-token file fid=%s handle_token=%s row_token=%s",
+                    fid,
+                    handle.token_name,
+                    row.token_name,
+                )
+                continue
+            rows.append(row)
+        if not rows:
+            return
+        # Import locally to avoid a circular import with core.file_lifecycle
+        # (which itself imports from storage.base — module load order).
+        from .file_lifecycle import release_files_safely
+
+        await release_files_safely(
+            storage=self._storage,
+            file_store=self._file_store,
+            rows=rows,
+            log_label="_release_attached_files",
         )
 
     # --- shared close path ---

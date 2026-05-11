@@ -12,6 +12,7 @@ from .base import (
     _UNSET,
     AbstractStorage,
     AuditRow,
+    FileRow,
     NewEvent,
     SessionMetaRow,
     TokenRow,
@@ -27,6 +28,7 @@ from .ddl import (
     CURRENT_SCHEMA_VERSION,
     SCHEMA_SQLITE,
     V2_TO_V3_SQLITE,
+    V4_TO_V5_SQLITE,
 )
 
 
@@ -106,6 +108,16 @@ class SqliteStorage(AbstractStorage):
                 # CREATE INDEX IF NOT EXISTS is its own idempotency.
                 await self._conn.execute(ALTER_UPDATES_ADD_TS_INDEX_SQLITE)
                 stored = "4"
+            if stored == "4":
+                # v4 → v5: introduce webchat_files for image uploads.
+                # SCHEMA_SQLITE already ran the same CREATE TABLE IF NOT
+                # EXISTS / CREATE INDEX IF NOT EXISTS statements above on
+                # a fresh install; replaying them here is a no-op for that
+                # case but keeps the migration ladder explicit so an
+                # operator can `tail -f` the version progression.
+                for stmt in V4_TO_V5_SQLITE:
+                    await self._conn.execute(stmt)
+                stored = "5"
             await self._conn.execute(
                 "UPDATE _schema_meta SET value = ? WHERE key = 'schema_version'",
                 (CURRENT_SCHEMA_VERSION,),
@@ -298,6 +310,18 @@ class SqliteStorage(AbstractStorage):
                 )
                 await self._db.execute(
                     "UPDATE webchat_updates SET token_name = ? "
+                    "WHERE token_name = ?",
+                    (new_name, old_name),
+                )
+                # webchat_files is keyed by token_name too; on-disk files
+                # also live under `{root}/{token_name}/...` but the prune
+                # path uses `storage_key` (which carries the token name
+                # baked-in at upload time), so the on-disk layout
+                # diverges from the DB column. The serve path goes
+                # through the DB column → no observable inconsistency.
+                # Out-of-scope to move the disk files here.
+                await self._db.execute(
+                    "UPDATE webchat_files SET token_name = ? "
                     "WHERE token_name = ?",
                     (new_name, old_name),
                 )
@@ -719,20 +743,12 @@ class SqliteStorage(AbstractStorage):
         deleted_meta_before_ts: int,
     ) -> tuple[int, int]:
         async with self._write_lock:
-            # Always retain the latest row per token, even if it's past
-            # the cutoff. Without this guard, a token with all events
-            # past the cutoff would have its MAX(pts) reset to 0 after
-            # the prune; new events would restart at pts=1, and any
-            # client polling with `since=N` (N from before the prune)
-            # would silently miss the new pts 1..N because the
-            # `since > current_max` tooFar check only catches cases
-            # where since runs ahead of MAX. Keeping at least one row
-            # per token preserves MAX(pts) monotonicity.
-            #
-            # The exclusion uses a COMPOSITE key: a bare `pts NOT IN
-            # (SELECT MAX(pts) ...)` would over-protect rows because
-            # token A's stale pts=2 would match token B's MAX(pts)=2
-            # in the subquery. Pairing with token_name fixes that.
+            # 1. Event prune + retention marker dance — see
+            #    AbstractStorage.prune_chat_sync for the full rationale.
+            #    Always retain the latest row per token, even if past
+            #    the cutoff, to keep MAX(pts) monotonic. Composite
+            #    (token_name, pts) keys avoid the cross-token over-
+            #    protection bug.
             cur = await self._db.execute(
                 "DELETE FROM webchat_updates "
                 "WHERE ts < ? "
@@ -743,14 +759,10 @@ class SqliteStorage(AbstractStorage):
                 (events_before_ts,),
             )
             events_pruned = cur.rowcount or 0
-            # If the retained row is itself past the cutoff, it still
-            # carries real chat text — which violates the retention
-            # contract (14 days advertised in main.py). Replace such
-            # rows with a content-free `_pruned_marker` so the row
-            # continues to anchor MAX(pts) but no longer leaks payload.
-            # Idempotent: rows that are already markers are excluded by
-            # the `event_type != '_pruned_marker'` guard so daily prune
-            # runs don't re-update the same row.
+            # If the retained row is itself past the cutoff, replace
+            # its content with a `_pruned_marker` so MAX(pts) stays
+            # anchored without leaking payload. Idempotent via the
+            # `event_type != '_pruned_marker'` guard.
             await self._db.execute(
                 "UPDATE webchat_updates "
                 "SET payload = '{}', event_type = '_pruned_marker' "
@@ -762,11 +774,246 @@ class SqliteStorage(AbstractStorage):
                 "  )",
                 (events_before_ts,),
             )
+            # 2. Physically prune session_meta rows past retention,
+            #    BUT only when no webchat_files row still references
+            #    the (token, session). Caller drives file deletion
+            #    OUTSIDE this method (storage-first, DB-second). If a
+            #    previous iteration's file_store.delete failed for any
+            #    cascade file, its DB row remains; the NOT EXISTS
+            #    guard then keeps session_meta around for the next
+            #    iteration to retry. Without this guard we'd lose the
+            #    cascade JOIN basis for re-discovering the file and
+            #    permanently orphan its storage object.
             cur = await self._db.execute(
                 "DELETE FROM webchat_session_meta "
-                "WHERE deleted_at IS NOT NULL AND deleted_at < ?",
+                "WHERE deleted_at IS NOT NULL AND deleted_at < ? "
+                "  AND NOT EXISTS ("
+                "    SELECT 1 FROM webchat_files f "
+                "    WHERE f.token_name = webchat_session_meta.token_name "
+                "      AND f.session_id = webchat_session_meta.session_id"
+                "  )",
                 (deleted_meta_before_ts,),
             )
             meta_pruned = cur.rowcount or 0
             await self._db.commit()
         return events_pruned, meta_pruned
+
+    async def list_files_to_prune(
+        self,
+        *,
+        deleted_meta_before_ts: int,
+        uncommitted_files_before_ts: int,
+        limit: int = 500,
+    ) -> list[FileRow]:
+        limit = max(1, min(limit, 1000))
+        # Orphan source: uploaded-but-never-committed (tab close).
+        async with self._db.execute(
+            "SELECT file_id, token_name, session_id, mime, size_bytes, "
+            "       storage_key, committed, uploaded_at, committed_at "
+            "FROM webchat_files "
+            "WHERE committed = 0 AND uploaded_at < ? "
+            "ORDER BY uploaded_at ASC LIMIT ?",
+            (uncommitted_files_before_ts, limit),
+        ) as cursor:
+            orphan_rows = await cursor.fetchall()
+        orphans = [self._row_to_file(r) for r in orphan_rows]
+        # Cascade source: belong to a soft-deleted session about to be
+        # physically pruned. The JOIN snapshots against the still-
+        # present session_meta rows; once `prune_chat_sync` deletes
+        # them, this query returns nothing — by that time the cascade
+        # files should already have been removed by the caller.
+        async with self._db.execute(
+            "SELECT f.file_id, f.token_name, f.session_id, f.mime, "
+            "       f.size_bytes, f.storage_key, f.committed, "
+            "       f.uploaded_at, f.committed_at "
+            "FROM webchat_files AS f "
+            "INNER JOIN webchat_session_meta AS m "
+            "  ON m.token_name = f.token_name "
+            " AND m.session_id = f.session_id "
+            "WHERE m.deleted_at IS NOT NULL AND m.deleted_at < ? "
+            "LIMIT ?",
+            (deleted_meta_before_ts, limit),
+        ) as cursor:
+            cascade_rows = await cursor.fetchall()
+        cascade = [self._row_to_file(r) for r in cascade_rows]
+        # Dedup by file_id, orphans first so the natural draining order
+        # is "uncommitted abandonment → cascade".
+        seen: set[str] = set()
+        out: list[FileRow] = []
+        for row in orphans + cascade:
+            if row.file_id in seen:
+                continue
+            seen.add(row.file_id)
+            out.append(row)
+        return out
+
+    async def list_sessions_to_purge(
+        self,
+        *,
+        deleted_before_ts: int,
+        limit: int = 500,
+    ) -> list[tuple[str, str]]:
+        limit = max(1, min(limit, 1000))
+        async with self._db.execute(
+            "SELECT token_name, session_id FROM webchat_session_meta "
+            "WHERE deleted_at IS NOT NULL AND deleted_at < ? "
+            "ORDER BY deleted_at ASC LIMIT ?",
+            (deleted_before_ts, limit),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [(r["token_name"], r["session_id"]) for r in rows]
+
+    # ----- file uploads (v5) -----
+    @staticmethod
+    def _row_to_file(row: aiosqlite.Row) -> FileRow:
+        return FileRow(
+            file_id=row["file_id"],
+            token_name=row["token_name"],
+            session_id=row["session_id"],
+            mime=row["mime"],
+            size_bytes=int(row["size_bytes"]),
+            storage_key=row["storage_key"],
+            committed=bool(row["committed"]),
+            uploaded_at=int(row["uploaded_at"]),
+            committed_at=(
+                int(row["committed_at"]) if row["committed_at"] is not None else None
+            ),
+        )
+
+    async def insert_file(
+        self,
+        *,
+        file_id: str,
+        token_name: str,
+        session_id: str,
+        mime: str,
+        size_bytes: int,
+        storage_key: str,
+        now: int,
+    ) -> None:
+        async with self._write_lock:
+            await self._db.execute(
+                "INSERT INTO webchat_files("
+                "file_id, token_name, session_id, mime, size_bytes, "
+                "storage_key, committed, uploaded_at, committed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 0, ?, NULL)",
+                (file_id, token_name, session_id, mime, size_bytes, storage_key, now),
+            )
+            await self._db.commit()
+
+    async def get_file(self, file_id: str) -> FileRow | None:
+        async with self._db.execute(
+            "SELECT file_id, token_name, session_id, mime, size_bytes, "
+            "       storage_key, committed, uploaded_at, committed_at "
+            "FROM webchat_files WHERE file_id = ?",
+            (file_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return self._row_to_file(row) if row else None
+
+    async def mark_files_committed(
+        self, file_ids: list[str], *, now: int
+    ) -> int:
+        if not file_ids:
+            return 0
+        placeholders = ",".join("?" for _ in file_ids)
+        async with self._write_lock:
+            # `committed = 0` guard makes the UPDATE idempotent: a row
+            # already committed keeps its earlier committed_at and is
+            # excluded from rowcount. Safe to call twice with the same
+            # ids (e.g. retry on transient stream-handler failure).
+            cur = await self._db.execute(
+                f"UPDATE webchat_files "
+                f"SET committed = 1, committed_at = ? "
+                f"WHERE file_id IN ({placeholders}) AND committed = 0",
+                (now, *file_ids),
+            )
+            affected = cur.rowcount or 0
+            await self._db.commit()
+        return affected
+
+    async def total_committed_size_for_token(self, token_name: str) -> int:
+        # COALESCE so an empty result (no committed files yet) returns 0
+        # instead of NULL — keeps the caller's quota arithmetic simple.
+        async with self._db.execute(
+            "SELECT COALESCE(SUM(size_bytes), 0) AS total "
+            "FROM webchat_files "
+            "WHERE token_name = ? AND committed = 1",
+            (token_name,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return int(row["total"]) if row else 0
+
+    async def total_size_for_token(self, token_name: str) -> int:
+        # Sum committed + uncommitted. Used by the upload quota check
+        # so spam-upload-no-commit can't bypass per_token_storage_mb
+        # for up to a full orphan-GC cycle.
+        async with self._db.execute(
+            "SELECT COALESCE(SUM(size_bytes), 0) AS total "
+            "FROM webchat_files "
+            "WHERE token_name = ?",
+            (token_name,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return int(row["total"]) if row else 0
+
+    async def list_files_for_session(
+        self, *, token_name: str, session_id: str
+    ) -> list[FileRow]:
+        async with self._db.execute(
+            "SELECT file_id, token_name, session_id, mime, size_bytes, "
+            "       storage_key, committed, uploaded_at, committed_at "
+            "FROM webchat_files "
+            "WHERE token_name = ? AND session_id = ? "
+            "ORDER BY uploaded_at ASC",
+            (token_name, session_id),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [self._row_to_file(r) for r in rows]
+
+    async def list_uncommitted_orphans(
+        self, *, older_than_ts: int, limit: int = 500
+    ) -> list[FileRow]:
+        limit = max(1, min(limit, 1000))
+        async with self._db.execute(
+            "SELECT file_id, token_name, session_id, mime, size_bytes, "
+            "       storage_key, committed, uploaded_at, committed_at "
+            "FROM webchat_files "
+            "WHERE committed = 0 AND uploaded_at < ? "
+            "ORDER BY uploaded_at ASC LIMIT ?",
+            (older_than_ts, limit),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [self._row_to_file(r) for r in rows]
+
+    async def list_files_for_purged_sessions(
+        self, *, deleted_before_ts: int, limit: int = 500
+    ) -> list[FileRow]:
+        limit = max(1, min(limit, 1000))
+        async with self._db.execute(
+            "SELECT f.file_id, f.token_name, f.session_id, f.mime, "
+            "       f.size_bytes, f.storage_key, f.committed, "
+            "       f.uploaded_at, f.committed_at "
+            "FROM webchat_files AS f "
+            "INNER JOIN webchat_session_meta AS m "
+            "  ON m.token_name = f.token_name "
+            " AND m.session_id = f.session_id "
+            "WHERE m.deleted_at IS NOT NULL AND m.deleted_at < ? "
+            "LIMIT ?",
+            (deleted_before_ts, limit),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [self._row_to_file(r) for r in rows]
+
+    async def delete_files_by_ids(self, file_ids: list[str]) -> int:
+        if not file_ids:
+            return 0
+        placeholders = ",".join("?" for _ in file_ids)
+        async with self._write_lock:
+            cur = await self._db.execute(
+                f"DELETE FROM webchat_files WHERE file_id IN ({placeholders})",
+                tuple(file_ids),
+            )
+            affected = cur.rowcount or 0
+            await self._db.commit()
+        return affected

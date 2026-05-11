@@ -57,13 +57,25 @@
 pip install aiosqlite
 ```
 
+`Pillow` 是必需的（图片上传的 MIME 检测 + 抗解压炸弹）：
+
+```bash
+pip install Pillow
+```
+
 如果计划使用 MySQL，请额外安装：
 
 ```bash
 pip install aiomysql
 ```
 
-> AstrBot 自身已经提供 `aiohttp`，本插件不会重复声明。`requirements.txt` 仅列出 `aiosqlite`；MySQL 驱动按需手动安装。
+如果计划使用 Cloudflare R2 作为图片存储后端（`uploads.storage_driver=r2`），请额外安装：
+
+```bash
+pip install aiobotocore>=2.13
+```
+
+> AstrBot 自身已经提供 `aiohttp`，本插件不会重复声明。`requirements.txt` 列出 `aiosqlite` + `Pillow`；MySQL / R2 驱动按需手动安装。
 
 ### 放入插件目录
 
@@ -166,6 +178,14 @@ curl -X POST http://127.0.0.1:6186/api/webchat/chat \
 | `storage.driver` | `sqlite` | `sqlite` 或 `mysql` |
 | `storage.sqlite_path` | `data/webchat_gateway.db` | SQLite 文件路径，相对路径以 AstrBot 工作目录为基准 |
 | `storage.mysql_dsn` | `""` | MySQL DSN，如 `mysql://user:pass@host:3306/dbname`（也支持 `mariadb://`）；`driver=mysql` 时必填 |
+| `uploads.enabled` | `true` | 是否启用图片上传（关掉只是不注册 `/upload` 路由，已有图片仍可通过 `/files/{id}` 访问） |
+| `uploads.storage_driver` | `local` | `local`（默认）或 `r2`（Cloudflare R2） |
+| `uploads.local_path` | `data/webchat_uploads` | 本地存储根目录；相对路径以 AstrBot 工作目录为基准 |
+| `uploads.max_file_size_mb` | `20` | 单文件上限（1-200 MB） |
+| `uploads.per_token_storage_mb` | `500` | 每 token 累计存储上限（含未提交的暂存） |
+| `uploads.max_attachments_per_message` | `4` | 单条消息最多附件数（1-16） |
+| `uploads.allowed_mime` | `image/jpeg,image/png,image/webp,image/gif` | 允许的 MIME 类型（逗号分隔） |
+| `uploads.r2.*` | `""` | R2 配置（`account_id` / `access_key_id` / `secret_access_key` / `bucket` / `endpoint` / `serving_mode=proxy|direct` / `direct_link_ttl_seconds` / `cache_size_mb`）；仅 `storage_driver=r2` 时需要，需要额外 `pip install aiobotocore>=2.13` |
 
 ---
 
@@ -218,7 +238,36 @@ curl -X POST http://127.0.0.1:6186/api/webchat/chat \
 | 500 | `llm_call_failed` | LLM 服务异常 |
 | 504 | `llm_timeout` | LLM 调用超出 `llm_timeout_seconds` |
 
-### 管理 API（需 `master_admin_key`）
+### `POST {prefix}/upload` — 图片上传（v0.3.0+）
+
+朋友通过聊天页发送多模态消息时，前端会先把图片 POST 到这里换回 `file_id`，再带在后续 `/chat` / `/chat/stream` 请求的 `attachments` 字段里。
+
+**请求头：** 同 `/chat`（`Authorization: Bearer <token>` 或 `X-API-Key`）。
+
+**请求体：** `multipart/form-data`，两个字段：
+- `file` — 二进制图片，单文件 ≤ `uploads.max_file_size_mb`（默认 20 MB）
+- `session_id` — 会话 id，必须满足 `^[a-zA-Z0-9_\-.]{1,128}$`
+
+**成功 200：** `{"file_id": "...", "mime": "image/png", "size": 12345, "url": "{prefix}/files/<file_id>"}`
+
+**错误码：** `payload_too_large` (413)、`unsupported_mime` (415)、`storage_quota_exceeded` (429，达到 `per_token_storage_mb` 上限)、`invalid_session_id` (400)。
+
+MIME 通过 Pillow `verify()` 检测（不信任客户端 Content-Type），允许白名单为 `image/jpeg|png|webp|gif`（可在 `uploads.allowed_mime` 调整）。每条消息最多带 `uploads.max_attachments_per_message`（默认 4）张图。
+
+### `GET {prefix}/files/{file_id}` — 私有图床（v0.3.0+）
+
+聊天页 `<img src>` 渲染走这里。两种鉴权：
+
+- HMAC-SHA256 签名的 HttpOnly cookie `wcg_file`（`/me` 端点上行下发，Path 限 `{prefix}/files`，SameSite=Lax，签名折入 token_hash + 登出时间戳）
+- `Authorization: Bearer` / `X-API-Key`（兼容 CLI / 服务端）
+
+跨 token 访问统一返回 404（不区分"存在但无权"和"不存在"，避免 file_id 枚举）。R2 后端可配 direct 模式：直接 302 到 30-3600 秒的 R2 预签名 URL。
+
+### `POST {prefix}/files/logout` — 服务端 cookie 失效（v0.3.0+）
+
+用户点登出按钮时，前端用 `navigator.sendBeacon` 调它（fallback `fetch` keepalive）。服务端记录 token 名 + 当前时间戳到内存表，从此刻起所有签发时间早于该时间的 cookie 一律拒绝。返回 `Set-Cookie: wcg_file=; Max-Age=0` 把浏览器侧 cookie 也清掉。
+
+
 
 所有管理端点都需要 `Authorization: Bearer <master_admin_key>`。`master_admin_key` 为空时所有 `/admin/*` 返回 `403 admin_disabled`。
 

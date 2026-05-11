@@ -109,3 +109,56 @@ class PerTokenConcurrency:
                 lock.release()
             if not lock.locked():
                 self._locks.pop(name, None)
+
+
+class PerTokenUploadGate:
+    """Serialize uploads within a single token.
+
+    Unlike `PerTokenConcurrency` (single-flight, returns False on
+    contention), this is a BLOCKING per-token lock — concurrent uploads
+    for the same token queue up and execute one at a time. The lock
+    scopes just the quota-check + insert critical section: a Reader
+    seeing `total_size_for_token = 450MB` followed by a writer doing
+    `insert_file(size=30MB)` must observe each other's effects without
+    a check-then-act race that lets multiple uploads pass the same
+    cap.
+
+    Two concurrent uploads to DIFFERENT tokens still run in parallel
+    (different lock objects). Idle locks evict on release.
+
+    Outside the gate, the file_store.save() (disk/R2 I/O) runs without
+    holding the lock — keeps the critical section short.
+    """
+
+    def __init__(self) -> None:
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._mutex = asyncio.Lock()
+
+    @asynccontextmanager
+    async def acquire(self, name: str) -> AsyncIterator[None]:
+        async with self._mutex:
+            lock = self._locks.get(name)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._locks[name] = lock
+        # Manual acquire/release (instead of `async with lock`) so the
+        # eviction check below runs AFTER the lock has been released —
+        # otherwise `lock.locked()` is always True at the check point
+        # (we're still inside our own `async with` scope) and the dict
+        # entry would never get popped. The token-locks dict would
+        # grow monotonically over time across distinct token names.
+        await lock.acquire()
+        try:
+            yield
+        finally:
+            lock.release()
+            async with self._mutex:
+                # Idle-evict only if (a) the dict still points at the
+                # same lock object (no concurrent re-create racing us)
+                # and (b) nobody else has taken it in the gap between
+                # our release and re-acquiring the mutex. If another
+                # coroutine grabbed it, THEY will run this cleanup on
+                # their own release.
+                current = self._locks.get(name)
+                if current is lock and not lock.locked():
+                    self._locks.pop(name, None)
