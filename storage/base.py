@@ -310,6 +310,7 @@ class AbstractStorage(ABC):
         *,
         events_before_ts: int,
         deleted_meta_before_ts: int,
+        exclude_sessions: list[tuple[str, str]] | None = None,
     ) -> tuple[int, int]:
         """Delete `webchat_updates` rows older than `events_before_ts` AND
         `webchat_session_meta` rows whose `deleted_at` is older than
@@ -332,6 +333,33 @@ class AbstractStorage(ABC):
         retry. This preserves the cascade query's ability to
         re-discover the file (via session_meta JOIN) on subsequent
         prune passes.
+
+        `exclude_sessions` (optional): list of `(token_name, session_id)`
+        tuples that must NOT have their session_meta deleted this
+        iteration. Used by the prune-loop caller to skip sessions
+        whose AstrBot CM history clear failed — without skipping them,
+        session_meta would be deleted while CM still holds stale
+        `ImageURLPart` references, and a user re-using the same
+        session_id would later see the old context / broken images
+        with no way to retry the cleanup. Excluded sessions are
+        retained for the next prune iteration's retry. Empty / None
+        means no exclusions (the default). Implementations are
+        expected to inline the exclusion as a portable
+        `AND NOT (token_name = ? AND session_id = ?)` chain rather
+        than relying on composite-key IN syntax that differs across
+        SQLite versions.
+
+        **Symmetric protection contract** — `exclude_sessions` is
+        coupled with caller-side file-list filtering. This method
+        protects only the session_meta DELETE; the caller (prune
+        loop) is expected to filter its file-delete candidate list
+        by the same `cm_failed` set BEFORE invoking `file_store.delete`
+        / `delete_files_by_ids`. The two halves together keep an
+        excluded session's state internally consistent (cascade files
+        AND meta both retained until the retry succeeds). Without the
+        file-side filter, a CM-clear failure would leave files deleted
+        but meta retained, which is harder to diagnose and recover
+        from than "nothing happened, retry next time".
 
         Idempotent and safe to run while the gateway is live; events
         older than the cutoff have no remaining waiters that could

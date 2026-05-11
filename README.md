@@ -493,6 +493,7 @@ https://chat.example.com,http://localhost:5173
 ### 8. 已知限制
 
 - **单进程并发锁**：每 token 单飞（concurrency=1）的限制由进程内 `asyncio.Lock` 实现。如果你把 AstrBot 跑成多 worker / 多副本，每个进程各自计数，并发限制会按副本数放大。本插件预期单进程部署；多进程部署不在 v0.1.0 范围内。
+- **登出 cookie 服务端失效是单进程的**（v0.3.0+）：`POST {prefix}/files/logout` 在进程内的 `CookieLogoutTracker` 里记下时间戳，验证 cookie 时签发时间早于该值的一律拒绝。**多 worker 部署**下，每个 worker 独立持有 tracker，logout 只在收到该请求的那个 worker 立刻生效；其他 worker 继续认旧 cookie 直到自然过期（默认 24h）或下次插件重启（`file_cookie_secret` 轮转一次性失效所有 cookie）。缓解：(a) 反代上启用 sticky session 让同一用户固定到同一 worker；(b) 把 `file_cookie_ttl_seconds` 调短（如 1h）让"窗口期"缩短；(c) 真正需要硬踢的场景用 admin `regenerate_token` —— 它轮转 `token_hash`，所有 worker 验证 cookie 时都会立刻拒绝。
 - **每日配额无 race-free 保证**：`daily_usage` 是"读 + 增"两步；但因为同 token 并发=1，单 token 维度上不会超额。跨 token 不共享配额。
 - **Origin 白名单不防 API 直连**：curl / Postman / 服务端代理一律视为非浏览器请求放行。鉴权完全靠 Token。
 - **审计是 best-effort**：写 `audit_log` 失败只会打 ERROR 日志，不会让请求失败。生产环境强烈建议把 AstrBot 日志接到集中收集（Loki / ELK），而不是只看 `audit_log` 表。

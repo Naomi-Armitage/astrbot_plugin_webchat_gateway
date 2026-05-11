@@ -741,6 +741,7 @@ class SqliteStorage(AbstractStorage):
         *,
         events_before_ts: int,
         deleted_meta_before_ts: int,
+        exclude_sessions: list[tuple[str, str]] | None = None,
     ) -> tuple[int, int]:
         async with self._write_lock:
             # 1. Event prune + retention marker dance — see
@@ -784,16 +785,35 @@ class SqliteStorage(AbstractStorage):
             #    iteration to retry. Without this guard we'd lose the
             #    cascade JOIN basis for re-discovering the file and
             #    permanently orphan its storage object.
-            cur = await self._db.execute(
-                "DELETE FROM webchat_session_meta "
-                "WHERE deleted_at IS NOT NULL AND deleted_at < ? "
-                "  AND NOT EXISTS ("
-                "    SELECT 1 FROM webchat_files f "
-                "    WHERE f.token_name = webchat_session_meta.token_name "
-                "      AND f.session_id = webchat_session_meta.session_id"
+            #
+            #    Additionally, exclude_sessions lets the caller skip
+            #    specific (token, session) pairs whose AstrBot CM
+            #    clear failed in this iteration. Without the skip,
+            #    deleting session_meta would strand the stale
+            #    `ImageURLPart` references in CM (operators can't
+            #    retry the cleanup once meta is gone). The exclusion
+            #    is expressed as a portable chain of
+            #    `AND NOT (token_name = ? AND session_id = ?)`
+            #    instead of composite-key IN syntax that requires
+            #    SQLite 3.39+; the N stays small (usually 0,
+            #    occasionally 1-3 when CM had a transient hiccup) so
+            #    the linear growth is irrelevant.
+            sql_parts = [
+                "DELETE FROM webchat_session_meta",
+                "WHERE deleted_at IS NOT NULL AND deleted_at < ?",
+                "  AND NOT EXISTS (",
+                "    SELECT 1 FROM webchat_files f",
+                "    WHERE f.token_name = webchat_session_meta.token_name",
+                "      AND f.session_id = webchat_session_meta.session_id",
                 "  )",
-                (deleted_meta_before_ts,),
-            )
+            ]
+            args: list = [deleted_meta_before_ts]
+            for token_name, session_id in exclude_sessions or ():
+                sql_parts.append(
+                    "  AND NOT (token_name = ? AND session_id = ?)"
+                )
+                args.extend([token_name, session_id])
+            cur = await self._db.execute("\n".join(sql_parts), args)
             meta_pruned = cur.rowcount or 0
             await self._db.commit()
         return events_pruned, meta_pruned

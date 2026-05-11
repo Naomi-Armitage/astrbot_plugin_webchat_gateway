@@ -24,14 +24,15 @@
 - `clear_history` 现在阻塞获取 PerTokenConcurrency 锁，避免和正在 stream 的 `/chat/stream` 并发删除其附件
 
 ### Fixed
-- **B1** 非流式 `/chat` 在 LLM 失败时未释放已 commit 的附件 → 配额泄漏。改为 try/except 包住 LLM 调用，失败时调用统一的 `release_files_safely` 助手
-- **B2 + H2/H3/H4** prune loop / `_release_attached_files` / `clear_history` 之前都是先删 DB 再删存储，崩溃可能留 R2 orphan 永远找不回。统一改为先删存储后删 DB（删存储成功的才删 DB 行）
-- **H4 / 安全** logout 现在服务端真正失效 cookie：`CookieLogoutTracker` 记录每个 token 的登出时间戳，验证 cookie 时若签发时间早于 logout 则拒绝。Cookie 路径仍是 `{prefix}/files`，logout 路径同步移到 `{prefix}/files/logout` 让浏览器自动带上 cookie
-- **H5** stream 中 `emit_stream_started` 已经把用户气泡（含附件 file_id）推给对端设备，紧接着 `close_failed`（如 empty_reply / llm_timeout 零 chunk）会释放文件 → 对端显示破图。修复：`StreamHandle.user_message_emitted` 标志，已发就跳过 `_release_attached_files`
-- **#24** `mark_files_committed` 失败之前被 `logger.exception` 静默吞掉，下游 CM 会持久化指向不存在文件的 ImageURLPart。改为 fatal：触发 `close_failed("commit_failed")` + 500
-- **#27 安全** `GET /files/{id}` 在"无 bearer + 无 cookie"分支之前直接返回 401 不调 `ip_guard.record_failure` → 匿名探测无成本。补齐 IP-guard 计数 + audit `auth_fail`，和 `/chat` 行为对齐
-- **#28 安全** `/files/{id}` 响应补 `X-Content-Type-Options: nosniff` 和 `Content-Disposition: inline; filename=...` —— 当前 MIME 白名单很严已经够安全，这是 defense-in-depth
-- **#33 并发** R2 LRU `_trim_cache_dir_sync` 之前跨 key 并发可能误删别的 coroutine 刚下载的文件（`protect_path` 只保护自己写的那个）。增加 store-级 `_trim_lock` 串行所有 trim 调用
+- 非流式 `POST /chat` 在 LLM 失败（timeout / empty / error）时未释放已 commit 的附件，导致 token 配额永久泄漏。改为 try/finally 包住 LLM 调用，失败时通过统一 `release_files_safely` 助手释放
+- prune loop、`StreamRegistry._release_attached_files`、`ConversationService.clear_history` 之前都是先删 DB 行再删存储对象，进程崩溃可能留 R2 / 磁盘 orphan 永远无法找回。三处统一改为先删存储后删 DB（删存储成功的才删 DB 行），失败的下一轮 prune 自动重发现重试
+- 90 天 session 物理删除时同步清 AstrBot CM 历史（`update_conversation(history=[])`），防止用户复用同名 session 时 CM 残留过期 `ImageURLPart` 渲染破图。CM clear 失败的 session 跳过本轮 meta 删除，下轮重试
+- 用户登出现在服务端真正失效 cookie：进程内 `CookieLogoutTracker` 记录每个 token 的登出时间戳；验证 cookie 时签发时间在登出前的一律拒绝。Cookie 路径仍是 `{prefix}/files`，logout 端点同步移到 `{prefix}/files/logout` 让浏览器自动带上 cookie。前端 `sendBeacon` 优先、`fetch(keepalive)` 兜底
+- 流式中 `emit_stream_started` 已经把用户气泡（含附件 file_id）推给对端设备后，紧接着的 `close_failed`（如 empty_reply / llm_timeout 零 chunk）会释放文件 → 对端 `<img>` 集体 404 显示破图。修复：`StreamHandle.user_message_emitted` 标志，已发就跳过 `_release_attached_files`，附件留到 session 被 clear 或 90 天 cascade
+- `mark_files_committed` 失败之前被 `logger.exception` 静默吞掉，下游 `record_chat_pair` 会把 `ImageURLPart` 写入 CM 指向不存在的文件，导致历史渲染破图。改为 fatal：非流式触发 release + 500，流式让异常传播到 outer except → `close_failed` 释放
+- `GET /files/{file_id}` 在"无 bearer + 无 cookie"分支之前直接返回 401 不调 IP brute-force 计数 → 匿名探测无成本。补齐 `ip_guard.record_failure` + `auth_fail` audit，和 `/chat` 行为对齐
+- `GET /files/{file_id}` 响应补 `X-Content-Type-Options: nosniff`、`Content-Disposition: inline; filename=...`、`Referrer-Policy: no-referrer` 三个安全头（defense in depth — 当前 MIME 白名单已经够严，这是为将来 allowlist 放宽留余地）
+- R2 LRU 缓存的 `_trim_cache_dir_sync` 之前跨 key 并发可能误删别的 coroutine 刚下载的文件（`protect_path` 只保护本地调用刚写的）。增加 store-级 `_trim_lock` 串行所有 trim 调用
 
 ### Internal / Schema
 - 数据库 schema v4 → v5（webchat_files 表 + 索引）；新装直接 v5

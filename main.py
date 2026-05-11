@@ -355,19 +355,34 @@ class WebChatGatewayPlugin(Star):
         Orchestration (DB-first ordering would leak storage objects on
         crash — see `release_files_safely` rationale):
 
-            1. List candidate file rows to delete (orphans + cascade).
-            2. For each: `file_store.delete(storage_key)`. Collect
-               successful file_ids.
-            3. `storage.delete_files_by_ids(ok_ids)` — DB rows for
-               confirmed-deleted storage objects only.
-            4. List sessions about to be physically pruned, clear their
-               AstrBot CM history so dangling `ImageURLPart` segments
-               don't survive past the file's lifecycle.
-            5. `storage.prune_chat_sync(...)` — drop old events +
-               soft-deleted session_meta. The session_meta DELETE is
-               guarded by `NOT EXISTS (file)` so any failed-storage-
-               delete file keeps its session_meta around for next
-               iteration to retry.
+            1. List candidate file rows (orphans + cascade) — read-only.
+            2. List sessions about to be physically pruned — read-only.
+            3. Clear AstrBot CM history for each candidate session.
+               Collect (token, session) pairs whose CM clear raised
+               into `cm_failed`.
+            4. Filter the file candidates to exclude any whose
+               (token, session) is in `cm_failed`. This is the
+               symmetry guarantee: a CM-clear failure protects BOTH
+               session_meta AND its cascade files this iteration, so
+               an operator inspecting a stalled retry sees a consistent
+               snapshot (files + meta both still present) rather than
+               "files gone but meta retained" which would be harder
+               to diagnose.
+            5. For each filtered file: `file_store.delete(storage_key)`,
+               then `delete_files_by_ids()` for the ones whose storage
+               delete succeeded (storage-first, DB-second).
+            6. `storage.prune_chat_sync(exclude_sessions=cm_failed)` —
+               drops old events + soft-deleted session_meta. The
+               session_meta DELETE has both a `NOT EXISTS(file)` guard
+               (covers file-delete failures) and a `NOT (token=?
+               AND session=?)` chain for the explicit cm_failed
+               exclusions.
+
+        Next prune iteration re-discovers cm_failed sessions via
+        list_sessions_to_purge and retries CM clear; the cascade
+        files are re-included in step 1 (because their DB rows
+        survived step 5 thanks to the filter), so on success the
+        entire session drains atomically.
 
         First iteration runs after a short randomised delay (60-120s)
         so a process that crashed during a prior prune doesn't have to
@@ -391,7 +406,7 @@ class WebChatGatewayPlugin(Star):
                         return
                     now = int(time.time())
 
-                    # Step 1: list candidate file rows.
+                    # Step 1: list candidate file rows (read-only).
                     files_to_delete = await storage.list_files_to_prune(
                         deleted_meta_before_ts=now
                         - self._CHAT_SYNC_DELETED_META_RETENTION_SECONDS,
@@ -399,35 +414,23 @@ class WebChatGatewayPlugin(Star):
                         - self._UPLOAD_ORPHAN_RETENTION_SECONDS,
                     )
 
-                    # Step 2 + 3: storage delete first, then DB rows
-                    # of those that succeeded. Failed-storage-delete
-                    # rows survive and are re-discovered next iter.
-                    files_deleted = 0
-                    if file_store is not None and files_to_delete:
-                        from .core.file_lifecycle import release_files_safely
-
-                        files_deleted = await release_files_safely(
-                            storage=storage,
-                            file_store=file_store,
-                            rows=files_to_delete,
-                            log_label="prune_loop",
-                        )
-
-                    # Step 4: list sessions about to be pruned, clear
-                    # their AstrBot CM history. Best-effort — a CM
-                    # failure for some session is logged but doesn't
-                    # block the prune. If we couldn't clear CM, the
-                    # session_meta still gets deleted next step
-                    # (NOT EXISTS guard only checks files), leaving a
-                    # narrow window where stale CM segments persist
-                    # for unreachable sessions. Documented trade-off.
-                    sessions_purged = 0
+                    # Step 2: list sessions about to be pruned (read-only).
                     sessions_to_purge = (
                         await storage.list_sessions_to_purge(
                             deleted_before_ts=now
                             - self._CHAT_SYNC_DELETED_META_RETENTION_SECONDS,
                         )
                     )
+
+                    # Step 3: CM clear, collect failures. The CM call
+                    # runs BEFORE file deletion so a failure can
+                    # protect the session's cascade files in step 4 —
+                    # without this ordering the files would be gone
+                    # before we knew CM was stuck, and the asymmetric
+                    # state ("files deleted, meta retained, CM stale")
+                    # would be harder to recover from.
+                    sessions_purged = 0
+                    cm_failed: list[tuple[str, str]] = []
                     cm = self.context.conversation_manager
                     for token_name, session_id in sessions_to_purge:
                         umo = f"webchat_gateway:{token_name}:{session_id}"
@@ -439,7 +442,12 @@ class WebChatGatewayPlugin(Star):
                                     conversation_id=cid,
                                     history=[],
                                 )
-                                sessions_purged += 1
+                            # "Purged" counts both "cleared CM content"
+                            # and "no CM conversation to clear" — both
+                            # are successful outcomes from the
+                            # cleanup's perspective. Only outright
+                            # exceptions count as failures.
+                            sessions_purged += 1
                         except Exception:
                             logger.exception(
                                 "[WebChatGateway] CM clear during prune "
@@ -447,16 +455,55 @@ class WebChatGatewayPlugin(Star):
                                 token_name,
                                 session_id,
                             )
+                            cm_failed.append((token_name, session_id))
 
-                    # Step 5: events + session_meta. session_meta DELETE
+                    # Step 4: filter files by cm_failed sessions.
+                    # Symmetric protection: a session whose CM clear
+                    # failed retains its meta (via exclude_sessions in
+                    # step 6) AND its cascade files (via this filter).
+                    # Orphans without a session_meta row are
+                    # unaffected — they're never in cm_failed (the
+                    # source is list_sessions_to_purge).
+                    cm_failed_set = set(cm_failed)
+                    if cm_failed_set:
+                        filtered_files = [
+                            r
+                            for r in files_to_delete
+                            if (r.token_name, r.session_id)
+                            not in cm_failed_set
+                        ]
+                    else:
+                        filtered_files = files_to_delete
+                    files_protected = (
+                        len(files_to_delete) - len(filtered_files)
+                    )
+
+                    # Step 5: storage delete first, then DB rows
+                    # of those that succeeded. Failed-storage-delete
+                    # rows survive and are re-discovered next iter.
+                    files_deleted = 0
+                    if file_store is not None and filtered_files:
+                        from .core.file_lifecycle import release_files_safely
+
+                        files_deleted = await release_files_safely(
+                            storage=storage,
+                            file_store=file_store,
+                            rows=filtered_files,
+                            log_label="prune_loop",
+                        )
+
+                    # Step 6: events + session_meta. session_meta DELETE
                     # uses NOT EXISTS (file) so any cascade file whose
-                    # storage delete failed in step 2 keeps its
-                    # session_meta around for next iter to retry.
+                    # storage delete failed in step 5 keeps its
+                    # session_meta around for next iter to retry. The
+                    # `exclude_sessions` list above adds the second
+                    # retry mechanism for CM-clear failures.
                     result = await storage.prune_chat_sync(
                         events_before_ts=now
                         - self._CHAT_SYNC_EVENTS_RETENTION_SECONDS,
                         deleted_meta_before_ts=now
                         - self._CHAT_SYNC_DELETED_META_RETENTION_SECONDS,
+                        exclude_sessions=cm_failed or None,
                     )
                     events_pruned, meta_pruned = result
                     if (
@@ -464,15 +511,19 @@ class WebChatGatewayPlugin(Star):
                         or meta_pruned
                         or files_to_delete
                         or sessions_purged
+                        or cm_failed
                     ):
                         logger.info(
                             "[WebChatGateway] chat-sync prune: events=%d "
-                            "meta=%d files=%d/%d cm_cleared=%d",
+                            "meta=%d files=%d/%d cm_cleared=%d "
+                            "cm_failed=%d files_protected=%d",
                             events_pruned,
                             meta_pruned,
                             files_deleted,
-                            len(files_to_delete),
+                            len(filtered_files),
                             sessions_purged,
+                            len(cm_failed),
+                            files_protected,
                         )
                 except asyncio.CancelledError:
                     raise

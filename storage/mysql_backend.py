@@ -825,6 +825,7 @@ class MysqlStorage(AbstractStorage):
         *,
         events_before_ts: int,
         deleted_meta_before_ts: int,
+        exclude_sessions: list[tuple[str, str]] | None = None,
     ) -> tuple[int, int]:
         async with self._write_tx() as conn:
             async with conn.cursor() as cur:
@@ -863,16 +864,30 @@ class MysqlStorage(AbstractStorage):
                 #    BUT only when no webchat_files row still references
                 #    the (token, session). See AbstractStorage docstring
                 #    for retry rationale.
-                await cur.execute(
-                    "DELETE FROM webchat_session_meta "
-                    "WHERE deleted_at IS NOT NULL AND deleted_at < %s "
-                    "  AND NOT EXISTS ("
-                    "    SELECT 1 FROM webchat_files f "
-                    "    WHERE f.token_name = webchat_session_meta.token_name "
-                    "      AND f.session_id = webchat_session_meta.session_id"
+                #
+                #    exclude_sessions lets the caller skip specific
+                #    pairs whose CM clear failed this iteration —
+                #    expressed as a portable chain of
+                #    `AND NOT (token_name = %s AND session_id = %s)`
+                #    instead of composite-key IN syntax (which works in
+                #    MySQL but we keep the form identical to the SQLite
+                #    backend for easier review parity).
+                sql_parts = [
+                    "DELETE FROM webchat_session_meta",
+                    "WHERE deleted_at IS NOT NULL AND deleted_at < %s",
+                    "  AND NOT EXISTS (",
+                    "    SELECT 1 FROM webchat_files f",
+                    "    WHERE f.token_name = webchat_session_meta.token_name",
+                    "      AND f.session_id = webchat_session_meta.session_id",
                     "  )",
-                    (deleted_meta_before_ts,),
-                )
+                ]
+                args: list = [deleted_meta_before_ts]
+                for token_name, session_id in exclude_sessions or ():
+                    sql_parts.append(
+                        "  AND NOT (token_name = %s AND session_id = %s)"
+                    )
+                    args.extend([token_name, session_id])
+                await cur.execute("\n".join(sql_parts), args)
                 meta_pruned = cur.rowcount or 0
         return events_pruned, meta_pruned
 

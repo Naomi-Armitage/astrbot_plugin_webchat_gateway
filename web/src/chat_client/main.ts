@@ -1238,6 +1238,10 @@ function switchSession(id: string): void {
     saveStore();
     replayActive();
     renderSessionList();
+    // Active session changed — the clear button's enabled state
+    // depends on whether THIS session has a pending stream, so the
+    // state must refresh here too (not just at stream start/end).
+    updateClearButtonState();
     void fetchConversation(id).then((detail) => {
       if (!detail) return;
       ingestConversationDetail(detail);
@@ -2498,11 +2502,13 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
       started_at: store.pendingStreams[sid]?.started_at ?? Date.now(),
     };
     savePendingStreams();
+    updateClearButtonState();
   };
   const clearPending = (): void => {
     if (store.pendingStreams[sid]) {
       delete store.pendingStreams[sid];
       savePendingStreams();
+      updateClearButtonState();
     }
   };
 
@@ -2773,6 +2779,7 @@ async function attemptResumeOnLoad(sid: string): Promise<void> {
   if (!startedAt || Date.now() - startedAt > STALE_AFTER_MS) {
     delete store.pendingStreams[sid];
     savePendingStreams();
+    updateClearButtonState();
     return;
   }
   await attachStreamingBubble({
@@ -2898,6 +2905,30 @@ async function runNonStreamingSend(sid: string, message: string, attachments: At
 
 $<HTMLButtonElement>("clearHistory").onclick = () => { void clearActiveHistory(); };
 $<HTMLButtonElement>("newSessionBtn").onclick = newSession;
+
+// Disable the "clear history" button while a stream is in flight for
+// the active session. The backend already rejects clear_history with
+// 429 concurrent_request if a /chat/stream is mid-flight (it shares
+// the same PerTokenConcurrency lock); without the frontend gate the
+// user would just see a 429 toast and have to retry manually.
+//
+// We intentionally do NOT auto-retry on 429. Clear is a destructive
+// operation: if we wait 5s and retry, the assistant might have just
+// produced a long reply that gets wiped — confusing UX. Disabling
+// the button shows the user "wait for the message to finish" up
+// front, which is the safer pattern for irreversible actions.
+function updateClearButtonState(): void {
+  const btn = $<HTMLButtonElement>("clearHistory");
+  const sid = store.activeId;
+  const streaming = !!(sid && store.pendingStreams[sid]);
+  btn.disabled = streaming;
+  if (streaming) {
+    btn.title = "当前正在回复，完成后再清空";
+  } else {
+    btn.removeAttribute("title");
+  }
+}
+updateClearButtonState();
 $<HTMLButtonElement>("logout").onclick = () => {
   if (!confirm("登出会清除本机保存的 token 与对话历史。继续？")) return;
   sync.stopped = true;
