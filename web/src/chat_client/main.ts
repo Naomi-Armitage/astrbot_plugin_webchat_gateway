@@ -152,7 +152,14 @@ interface HistoryItem {
   ts: number;
   incomplete?: boolean;
   attachments?: AttachmentRef[];
+  // Local-only failure marker for user-side turns that didn't go through
+  // (cancelled before any chunk, network error, server rejected, etc).
+  // We render a small status caption + retry/edit links under the bubble
+  // and the entry is NOT promoted to the server CM (so the next LLM turn
+  // doesn't see it). Cleared on successful retry/edit.
+  failure?: { reason: FailureReason };
 }
+type FailureReason = "stopped" | "send_failed";
 interface SessionMeta {
   id: string;
   title: string;
@@ -277,6 +284,11 @@ function isHistoryItem(it: unknown): it is HistoryItem {
     if (!Array.isArray(o.attachments)) return false;
     if (!o.attachments.every(isAttachmentRef)) return false;
   }
+  if (o.failure !== undefined) {
+    if (!o.failure || typeof o.failure !== "object") return false;
+    const f = o.failure as Record<string, unknown>;
+    if (f.reason !== "stopped" && f.reason !== "send_failed") return false;
+  }
   return typeof o.text === "string" && typeof o.ts === "number" &&
     (o.role === "user" || o.role === "bot" || o.role === "error" || o.role === "notice");
 }
@@ -377,7 +389,7 @@ const serverRoleToLocal = (r: ServerRole): Role => r === "assistant" ? "bot" : "
 function replayActive(): void {
   clearMsgList();
   for (const item of currentSession().history) {
-    addMessageBubble(item.role, item.text, item.attachments);
+    addMessageBubble(item.role, item.text, item.attachments, item.failure);
     if (item.role === "bot" && item.incomplete) appendIncompleteNoticeToLastBubble();
   }
   scrollToEnd();
@@ -443,7 +455,12 @@ function renderMarkdown(text: string): string {
 // because it's untrusted input echoed back to the same DOM. User bubbles
 // may also include an image grid (1..4 attachments) rendered above the
 // text; clicking any thumbnail opens a lightbox with carousel.
-function addMessageBubble(role: Role, text: string, attachments?: AttachmentRef[]): void {
+function addMessageBubble(
+  role: Role,
+  text: string,
+  attachments?: AttachmentRef[],
+  failure?: { reason: FailureReason },
+): HTMLDivElement {
   hideTyping();
   const div = document.createElement("div");
   div.className = "msg " + role;
@@ -480,8 +497,151 @@ function addMessageBubble(role: Role, text: string, attachments?: AttachmentRef[
       div.textContent = text;
     }
   }
+  if (role === "user" && failure) {
+    div.classList.add("failed");
+    attachUserFailureActions(div, text, attachments, failure.reason);
+  }
   msgs.appendChild(div);
   scrollToEnd();
+  return div;
+}
+
+// Render the small "已停止 · 重试 · 编辑" action row under a failed user
+// bubble. Copy is deliberately user-facing (not error codes): see
+// FailureReason — only "stopped" (user pressed terminate) and
+// "send_failed" (anything else) are surfaced, matching the
+// ChatGPT/iMessage convention of one human sentence per failure.
+function attachUserFailureActions(
+  bubble: HTMLDivElement,
+  text: string,
+  attachments: AttachmentRef[] | undefined,
+  reason: FailureReason,
+): void {
+  const row = document.createElement("div");
+  row.className = "msg-failure";
+  const status = document.createElement("span");
+  status.className = "msg-failure-status";
+  status.textContent = reason === "stopped" ? "已停止" : "发送失败";
+  row.appendChild(status);
+  const retry = document.createElement("button");
+  retry.type = "button";
+  retry.className = "msg-failure-action";
+  retry.textContent = "重试";
+  retry.addEventListener("click", () => retryFailedUserMessage(bubble, text, attachments));
+  row.appendChild(retry);
+  const edit = document.createElement("button");
+  edit.type = "button";
+  edit.className = "msg-failure-action";
+  edit.textContent = "编辑";
+  edit.addEventListener("click", () => editFailedUserMessage(bubble, text, attachments));
+  row.appendChild(edit);
+  bubble.appendChild(row);
+}
+
+// Remove a failed user history entry by matching on (text, ts? — actually
+// we don't carry ts onto the DOM, so we match on text+attachments+
+// failure). Returns true if found and removed. Both retry and edit need
+// this so a single failed turn doesn't sprout duplicates.
+function removeFailedHistoryEntry(text: string, attachments: AttachmentRef[] | undefined): void {
+  const sess = currentSession();
+  const aKey = attachmentsKeyFromRefs(attachments);
+  for (let i = sess.history.length - 1; i >= 0; i--) {
+    const h = sess.history[i]!;
+    if (h.role !== "user" || !h.failure) continue;
+    if (h.text !== text) continue;
+    if (attachmentsKeyFromRefs(h.attachments) !== aKey) continue;
+    sess.history.splice(i, 1);
+    sess.lastActiveAt = Date.now();
+    saveStore();
+    return;
+  }
+}
+
+function retryFailedUserMessage(
+  bubble: HTMLDivElement,
+  text: string,
+  attachments: AttachmentRef[] | undefined,
+): void {
+  // While a stream is in flight retry would race the live POST; we'd
+  // either 429 concurrent_request or duplicate the user echo. Silently
+  // ignore — the failure caption stays put, user can retry once the
+  // current turn settles.
+  if (sync.streamAbort) return;
+  bubble.remove();
+  removeFailedHistoryEntry(text, attachments);
+  void performSend(text, attachments ? [...attachments] : []);
+}
+
+function editFailedUserMessage(
+  bubble: HTMLDivElement,
+  text: string,
+  attachments: AttachmentRef[] | undefined,
+): void {
+  // Don't clobber whatever the user is currently typing — if they've
+  // started a new message in the composer, opening edit would lose it.
+  // Confirm first; cancelling leaves the failed bubble in place.
+  const draft = inputEl.value.trim();
+  if (draft && draft !== text) {
+    if (!confirm("当前输入框有未发送的内容，编辑会覆盖。是否继续？")) return;
+  }
+  bubble.remove();
+  removeFailedHistoryEntry(text, attachments);
+  // Image attachments don't restore into the composer chip row — the
+  // local blob URLs are gone, and reconstructing chips from file_ids
+  // would need a fetch round-trip for the previews. The original
+  // file_ids ARE still uploaded server-side, so the simpler UX is:
+  // edit only re-loads text. If the user wants to resend with images,
+  // they should use 重试 instead. Surface a one-line hint when this
+  // matters so it's not silent.
+  inputEl.value = text;
+  autosizeInput();
+  inputEl.focus();
+  // Move caret to end so the user can keep typing.
+  try { inputEl.setSelectionRange(text.length, text.length); } catch {}
+  if (attachments && attachments.length) {
+    addMessageBubble("notice", "已加载文字到输入框；如需保留图片请点「重试」。");
+  }
+  updateSendButtonState();
+}
+
+// Find the last optimistic user history item matching (text, attachments)
+// and mark it failed. Re-renders the bubble in place so the action row
+// shows up. Called by the streaming POST error branches when the failure
+// happens before any chunk lands (close_failed-side outcomes).
+function markLastUserAsFailed(
+  text: string,
+  attachments: AttachmentRef[] | undefined,
+  reason: FailureReason,
+): void {
+  const sess = currentSession();
+  const aKey = attachmentsKeyFromRefs(attachments);
+  for (let i = sess.history.length - 1; i >= 0; i--) {
+    const h = sess.history[i]!;
+    if (h.role !== "user") continue;
+    if (h.text !== text) continue;
+    if (attachmentsKeyFromRefs(h.attachments) !== aKey) continue;
+    if (h.failure) return;  // already marked
+    h.failure = { reason };
+    saveStore();
+    // Re-decorate the matching DOM bubble in place. The last .msg.user
+    // in the message list with the same text is the one we want — the
+    // optimistic echo from this turn.
+    const list = msgs.querySelectorAll<HTMLDivElement>(".msg.user");
+    for (let k = list.length - 1; k >= 0; k--) {
+      const el = list[k]!;
+      if (el.classList.contains("failed")) continue;
+      const tnode = el.querySelector(".msg-text");
+      const elText = tnode ? tnode.textContent ?? "" : el.textContent ?? "";
+      // textContent on the bare bubble includes the action row text on
+      // already-failed bubbles, but we skipped those above. For fresh
+      // bubbles, textContent is just the message text.
+      if (elText !== text) continue;
+      el.classList.add("failed");
+      attachUserFailureActions(el, text, attachments, reason);
+      break;
+    }
+    return;
+  }
 }
 
 const scrollToEnd = (): void => { msgs.scrollTop = msgs.scrollHeight; };
@@ -2346,6 +2506,22 @@ async function send(): Promise<void> {
   // Don't fire while uploads are still in flight — server would reject
   // unknown file_ids and the user would lose their text.
   if (composerAttachments.some((a) => a.state === "uploading")) return;
+  inputEl.value = "";
+  autosizeInput();
+  // Clear chips post-render — the optimistic bubble already references the
+  // file_ids, so revoking the local preview URLs is safe and we want the
+  // composer empty for the next turn.
+  clearComposerAttachments();
+  await performSend(message, readyAttachments);
+}
+
+// Same as send() but takes pre-resolved text + attachments, bypassing the
+// composer read. Used by the retry path on a failed user bubble — the
+// composer state is preserved (user may have started typing the next
+// turn already) and the resend reuses the same file_ids the failed turn
+// originally uploaded.
+async function performSend(message: string, readyAttachments: AttachmentRef[]): Promise<void> {
+  if (!message && !readyAttachments.length) return;
   // Re-entry guard: while a stream is in flight the same button is the
   // stop button, so only the streaming click path should reach abort, not
   // a second send().
@@ -2377,13 +2553,6 @@ async function send(): Promise<void> {
   recordOptimistic(sid, "user", message, readyAttachments.length ? readyAttachments : undefined);
   saveStore();
   renderSessionList();
-
-  inputEl.value = "";
-  autosizeInput();
-  // Clear chips post-render — the optimistic bubble already references the
-  // file_ids, so revoking the local preview URLs is safe and we want the
-  // composer empty for the next turn.
-  clearComposerAttachments();
 
   if (eligibleForAutoTitle) {
     requestAutoTitle(sid, message).catch(() => {});
@@ -2757,9 +2926,14 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
         persistPending();
         return "ok";
       }
-      // User cancelled before any text arrived: drop the empty bubble and
-      // do not fall back — the user explicitly stopped the request.
+      // User cancelled before any text arrived: drop the empty bubble.
+      // For "post" mark the user's message as stopped so it stays
+      // visible with a "已停止 · 重试 · 编辑" footer instead of being
+      // wiped on next refresh by ingestConversationDetail.
       discardBubble();
+      if (kind === "post") {
+        markLastUserAsFailed(opts.message ?? "", opts.attachments, "stopped");
+      }
       return "ok";
     }
 
@@ -2813,10 +2987,19 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
         return "ok";
       }
       discardBubble();
-      addMessageBubble(
-        isSoft ? "notice" : "error",
-        streamErrorCopy(sce.code),
-      );
+      // No content arrived → user message effectively didn't go through.
+      // Mark it failed so the bubble keeps the retry/edit affordance
+      // instead of dropping a separate red error bubble the user can't
+      // act on. Resume-kind keeps the old behavior because resume doesn't
+      // own a user echo to attach the failure to.
+      if (kind === "post") {
+        markLastUserAsFailed(opts.message ?? "", opts.attachments, "send_failed");
+      } else {
+        addMessageBubble(
+          isSoft ? "notice" : "error",
+          streamErrorCopy(sce.code),
+        );
+      }
       return "ok";
     }
 
@@ -2984,23 +3167,49 @@ async function runNonStreamingSend(sid: string, message: string, attachments: At
 
     const err = (payload.error as string) || `http_${resp.status}`;
     const s = resp.status;
+    // Non-retryable cases: surface the specific notice so the user
+    // knows what to fix (login, quota, message length, IP block, etc.)
+    // — these don't get a per-message "重试" because retry of the same
+    // text won't work without a different action first.
     if (s === 401) {
       addMessageBubble("error", "Token 无效或已撤销，请重新登录。");
       setTimeout(() => { handle401(); }, 1500);
-    } else if (s === 429 && err === "quota_exceeded") {
+      return;
+    }
+    if (s === 429 && err === "quota_exceeded") {
       setBadge(0, payload.daily_quota as number);
       addMessageBubble("notice", "今日额度已用完，明日 0 点重置。");
-    } else if (s === 429 && err === "concurrent_request") addMessageBubble("notice", "上一条还在处理中，稍候。");
-    else if (s === 429 && err === "ip_blocked") {
+      return;
+    }
+    if (s === 429 && err === "concurrent_request") {
+      // The previous turn is still being processed — the user's message
+      // wasn't lost, just queued. Surface a notice and leave the bubble
+      // intact (no failure marker — retry would just 429 again).
+      addMessageBubble("notice", "上一条还在处理中，稍候。");
+      return;
+    }
+    if (s === 429 && err === "ip_blocked") {
       const retry = resp.headers.get("Retry-After") || payload.retry_after || "?";
       addMessageBubble("error", `请求过于频繁，已暂时封禁，${retry} 秒后重试。`);
-    } else if (s === 400 && err === "message_too_long") addMessageBubble("error", `消息过长 (上限 ${payload.max_length})。`);
-    else if (s === 403 && err === "forbidden_origin") addMessageBubble("error", "页面来源未在 allowed_origins 中。");
-    else if (s === 504 && err === "llm_timeout") addMessageBubble("notice", streamErrorCopy("llm_timeout"));
-    else if (s === 502 && err === "empty_reply") addMessageBubble("notice", streamErrorCopy("empty_reply"));
-    else addMessageBubble("error", `请求失败: ${err} ${payload.detail || ""}`);
+      return;
+    }
+    if (s === 400 && err === "message_too_long") {
+      addMessageBubble("error", `消息过长 (上限 ${payload.max_length})。`);
+      return;
+    }
+    if (s === 403 && err === "forbidden_origin") {
+      addMessageBubble("error", "页面来源未在 allowed_origins 中。");
+      return;
+    }
+    // Retryable failures (5xx, llm_timeout/empty_reply with no fallback
+    // path remaining, etc.). Mark the user bubble failed instead of
+    // dropping a generic red bubble — the user gets a 重试 button right
+    // where they sent, matching ChatGPT/iMessage patterns.
+    markLastUserAsFailed(message, attachments, "send_failed");
   } catch (error) {
-    addMessageBubble("error", `网络错误: ${String(error)}`);
+    // Network error, fetch timeout, etc. Same treatment as retryable
+    // server failures above.
+    markLastUserAsFailed(message, attachments, "send_failed");
   }
 }
 
