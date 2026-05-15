@@ -22,6 +22,7 @@ from .admin_stats import AdminDeps, make_admin_handlers
 from .chat import (
     ChatDeps,
     make_chat_handler,
+    make_chat_stream_cancel_handler,
     make_chat_stream_handler,
     make_chat_stream_resume_handler,
     make_logout_handler,
@@ -150,6 +151,10 @@ def build_app(deps: ServerDeps) -> web.Application:
     chat_stream_resume_handler = make_chat_stream_resume_handler(deps.chat)
     app.router.add_get(cfg.chat_stream_resume_path, chat_stream_resume_handler)
     app.router.add_options(cfg.chat_stream_resume_path, chat_preflight)
+
+    chat_stream_cancel_handler = make_chat_stream_cancel_handler(deps.chat)
+    app.router.add_post(cfg.chat_stream_cancel_path, chat_stream_cancel_handler)
+    app.router.add_options(cfg.chat_stream_cancel_path, chat_preflight)
 
     me_handler = make_me_handler(deps.chat)
     app.router.add_get(cfg.me_path, me_handler)

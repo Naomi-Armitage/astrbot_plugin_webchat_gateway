@@ -775,6 +775,18 @@ def make_chat_stream_handler(deps: ChatDeps):
             )
 
         # Step 7: open SSE response.
+        # Register this request's driving Task with the registry BEFORE
+        # the SSE handshake so a cancel landing during the handshake
+        # window still finds the driver and aborts it; the matching
+        # `unregister_driver` runs in the outermost finally below so the
+        # entry never outlives the request task.
+        driver_task = asyncio.current_task()
+        if driver_task is not None:
+            deps.registry.register_driver(
+                stream_id=handle_obj.stream_id,
+                token_name=token.name,
+                task=driver_task,
+            )
         cors = build_cors_headers(origin, allowed, same_origin_host=same_host)
         response = web.StreamResponse(
             status=200,
@@ -1667,6 +1679,81 @@ def make_chat_stream_resume_handler(deps: ChatDeps):
     return handle
 
 
+def make_chat_stream_cancel_handler(deps: ChatDeps):
+    """POST /chat/stream/{stream_id}/cancel — user-initiated stop.
+
+    The client-side AbortController only tears down the live SSE viewer;
+    the LLM iteration continues server-side (by design, so peer devices
+    and resume callers still get the full reply). This endpoint is the
+    real "stop the task" signal: it cancels the driver Task registered by
+    the POST handler, which raises asyncio.CancelledError inside the
+    iteration loop. The existing CancelledError branch in that loop then
+    persists whatever partial reply was collected (close_incomplete with
+    reason="cancelled") or, if no chunks arrived yet, close_failed.
+
+    Cross-token cancel returns 404 — identical to /resume — so an
+    attacker cannot enumerate stream existence across tokens by probing
+    cancel responses. A cancel for a stream that has already terminated
+    naturally also returns 204; that's the inherent race between the
+    client reading the `done` frame and clicking stop, and treating it
+    as success keeps the client code simpler.
+    """
+
+    async def handle(request: web.Request) -> web.Response:
+        gated = await gate_request(request, deps)
+        if isinstance(gated, web.Response):
+            return gated
+        token = gated.token
+        ip = gated.ip
+        origin = gated.origin
+        allowed = gated.allowed
+        same_host = gated.same_host
+
+        stream_id = (request.match_info.get("stream_id") or "").strip()
+        if not stream_id or not STREAM_ID_PATTERN.match(stream_id):
+            return json_response(
+                {"error": "invalid_stream_id"},
+                status=400,
+                origin=origin,
+                allowed_origins=allowed,
+                same_origin_host=same_host,
+            )
+
+        # `cancel` enforces the cross-token-returns-404 invariant: both
+        # "no such stream" and "stream owned by a different token" come
+        # back as False, so no timing leak between the cases.
+        ok = deps.registry.cancel(stream_id=stream_id, token_name=token.name)
+        if not ok:
+            return json_response(
+                {"error": "stream_not_found"},
+                status=404,
+                origin=origin,
+                allowed_origins=allowed,
+                same_origin_host=same_host,
+            )
+
+        try:
+            await deps.audit.write(
+                "chat_stream_cancelled",
+                name=token.name,
+                ip=ip,
+                detail={"stream_id": stream_id},
+            )
+        except Exception:
+            logger.exception(
+                "[WebChatGateway] audit chat_stream_cancelled failed sid=%s",
+                stream_id,
+            )
+
+        # 204 with CORS headers so the browser doesn't strip the preflight
+        # cache. No body — the client treats any 2xx as "cancel accepted"
+        # and waits for the SSE `done`/`error` frame for the actual outcome.
+        cors = build_cors_headers(origin, allowed, same_origin_host=same_host)
+        return web.Response(status=204, headers=cors)
+
+    return handle
+
+
 def make_preflight_handler(
     allowed: set[str],
     *,
@@ -1916,6 +2003,7 @@ __all__ = [
     "make_chat_handler",
     "make_chat_stream_handler",
     "make_chat_stream_resume_handler",
+    "make_chat_stream_cancel_handler",
     "make_logout_handler",
     "make_me_handler",
     "make_preflight_handler",

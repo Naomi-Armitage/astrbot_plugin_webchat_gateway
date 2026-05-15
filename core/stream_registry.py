@@ -127,6 +127,69 @@ class StreamRegistry:
         # Tests can still construct StreamRegistry without these.
         self._storage = storage
         self._file_store = file_store
+        # stream_id -> (token_name, driver task). Populated by the SSE
+        # handler immediately after open() and cleared in its finally so
+        # the entry never outlives the request task. Lets the user-initiated
+        # cancel endpoint reach across requests to stop the LLM iteration —
+        # without this the only termination signal is the client-side
+        # AbortController, which the design comment in handlers/chat.py
+        # makes clear does NOT stop the driver (it just tears down the
+        # live SSE viewer while the LLM keeps generating).
+        self._drivers: dict[str, tuple[str, asyncio.Task]] = {}
+
+    # --- driver task registry (for user-initiated cancel) ---
+
+    def register_driver(
+        self, *, stream_id: str, token_name: str, task: asyncio.Task
+    ) -> None:
+        """Record the asyncio Task driving `stream_id` so cancel() can find it.
+
+        Called by the SSE handler exactly once per stream, after open()
+        succeeds and before the main iteration begins. Stored keyed by
+        stream_id; the token_name is kept alongside so cancel() can enforce
+        the cross-token-returns-404 invariant without leaking existence.
+        """
+        self._drivers[stream_id] = (token_name, task)
+
+    def unregister_driver(self, stream_id: str) -> None:
+        """Forget the driver task for `stream_id`. Idempotent.
+
+        Called from the SSE handler's `finally` so the entry doesn't
+        outlive the request task — important because a stale Task ref
+        would let a cancel() landing after natural completion send a
+        no-op cancel to a Task that may already be gc'd or reused.
+        """
+        self._drivers.pop(stream_id, None)
+
+    def cancel(self, *, stream_id: str, token_name: str) -> bool:
+        """Cancel the driver task for `stream_id` if it belongs to `token_name`.
+
+        Returns True iff a matching driver was found AND cancel() was
+        called on it. False covers BOTH "no such stream" AND "stream
+        owned by a different token" — the caller maps both to 404 so
+        an attacker can't enumerate stream existence across tokens.
+
+        Cancellation is fire-and-forget: this method does not await the
+        driver's teardown. The driver's existing `except asyncio.CancelledError`
+        handler (see handlers/chat.py) persists any partial reply as
+        incomplete, emits the terminal frame, and runs close_incomplete /
+        close_failed; we do not need to coordinate from here.
+        """
+        entry = self._drivers.get(stream_id)
+        if entry is None:
+            return False
+        owner, task = entry
+        if owner != token_name:
+            return False
+        if task.done():
+            # Driver already terminated naturally between the registry
+            # lookup and the cancel call — treat as a no-op success so
+            # the caller doesn't have to special-case the race. Either
+            # way the close_* path has run (or is running) and the
+            # client will see the terminal frame on its existing SSE.
+            return True
+        task.cancel()
+        return True
 
     # --- buffer surface for the resume handler ---
 
@@ -605,6 +668,12 @@ class StreamRegistry:
                     "[WebChatGateway] stream-registry release failed sid=%s",
                     handle.stream_id,
                 )
+            # Drop the driver-task ref unconditionally so a cancel landing
+            # AFTER the natural close doesn't try to cancel a finished /
+            # gc'd Task. unregister_driver is idempotent; safe even on
+            # paths where register_driver was never called (e.g. open()
+            # returned None and the handler never got this far).
+            self.unregister_driver(handle.stream_id)
         # 5. Audit last. Outside the try/finally because if everything
         #    above was cancelled we'd rather drop this audit row than
         #    further extend the cancellation window.

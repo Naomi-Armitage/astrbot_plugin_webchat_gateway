@@ -553,6 +553,12 @@ interface SyncState {
   stopped: boolean;                  // logout sets this; loops bail out
   loopRunning: boolean;              // re-entrancy guard for runLongPoll/runShortPoll
   streamAbort: AbortController | null;  // active /chat/stream POST fetch+reader; null when not streaming
+  // stream_id of the active POST stream, captured on the first SSE frame
+  // via onStreamId. Lets the stop button POST /chat/stream/{id}/cancel so
+  // the server-side LLM iteration actually terminates — without this the
+  // client-side abort only tears down the live viewer while the server
+  // keeps generating (see handlers/chat.py:"Client-disconnect semantics").
+  streamAbortId: string | null;
   streamFailedAt: number[];          // ms timestamps of recent /chat/stream failures
   streamSkipRemaining: number;       // sends to bypass /chat/stream after a trip
   // Per-session resume controllers. A resume runs in the background even
@@ -584,6 +590,7 @@ const sync: SyncState = {
   stopped: false,
   loopRunning: false,
   streamAbort: null,
+  streamAbortId: null,
   streamFailedAt: [],
   streamSkipRemaining: 0,
   activeResumeAborts: {},
@@ -2602,6 +2609,11 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
 
   const onStreamId = (id: string): void => {
     streamId = id;
+    // Expose the id to the stop button so a click can fire
+    // POST /chat/stream/{id}/cancel and stop the server-side LLM,
+    // not just our local SSE reader. Only set for the POST path —
+    // resume/peer attach is not the user's outgoing request.
+    if (kind === "post") sync.streamAbortId = id;
     // Persist immediately on the first stream_id frame so a refresh
     // BEFORE any chunks arrive can still resume.
     persistPending();
@@ -2829,6 +2841,7 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
   } finally {
     if (kind === "post") {
       if (sync.streamAbort === ac) sync.streamAbort = null;
+      sync.streamAbortId = null;
       setSendMode("send");
     } else {
       if (sync.activeResumeAborts[sid] === ac) delete sync.activeResumeAborts[sid];
@@ -3160,6 +3173,23 @@ sendBtn.onclick = (): void => {
   // stream cancels the AbortController; the streaming path catches the
   // resulting AbortError and either keeps the partial bubble or drops it.
   if (sync.streamAbort) {
+    // If we already know the server-side stream_id, ask the server to
+    // stop the LLM iteration too. Without this the server keeps
+    // generating after we drop the SSE connection (by design — see the
+    // "Client-disconnect semantics" comment in handlers/chat.py) and
+    // the full reply lands later via long-poll. Fire-and-forget: the
+    // SSE reader's AbortError handles the local teardown either way,
+    // and a 404 from a stream that already finished naturally is fine.
+    const cancelId = sync.streamAbortId;
+    if (cancelId) {
+      const url = `${CHAT_STREAM_URL}/${encodeURIComponent(cancelId)}/cancel`;
+      fetch(url, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: bearer(),
+        keepalive: true,
+      }).catch(() => {});
+    }
     sync.streamAbort.abort();
     return;
   }

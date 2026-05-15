@@ -191,6 +191,10 @@ class ConfigView:
         return f"{self.endpoint_prefix}/chat/stream/{{stream_id}}/resume"
 
     @property
+    def chat_stream_cancel_path(self) -> str:
+        return f"{self.endpoint_prefix}/chat/stream/{{stream_id}}/cancel"
+
+    @property
     def me_path(self) -> str:
         return f"{self.endpoint_prefix}/me"
 
