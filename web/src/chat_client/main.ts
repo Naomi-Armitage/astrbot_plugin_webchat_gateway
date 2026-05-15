@@ -23,6 +23,12 @@ const LS_LAST_PTS = "wcg.chat.lastPts";
 // ~20 full-store JSON.stringifies and triggering frame jank on weaker
 // hardware. Splitting it keeps streaming writes O(small).
 const LS_PENDING_STREAMS = "wcg.chat.pending_streams";
+// Optimistic-echo dedup buffer. Persisted so a refresh fired between the
+// local echo and the server's `message_added` doesn't drop the dedup entry
+// and produce a duplicate bubble. Also lets ingestConversationDetail know
+// which local-only tail entries are still "in flight" and must be preserved
+// across a coldRefetch that arrives before the server has persisted them.
+const LS_PENDING_LOCALS = "wcg.chat.pending_locals";
 
 const API = "/api/webchat";
 const CHAT_URL = `${API}/chat`;
@@ -614,7 +620,49 @@ interface PendingLocal {
   expiresAt: number;                 // ms
 }
 const PENDING_TTL_MS = 660_000;
-const pendingLocals: PendingLocal[] = [];
+
+function loadPendingLocals(): PendingLocal[] {
+  let parsed: unknown = null;
+  try { parsed = JSON.parse(localStorage.getItem(LS_PENDING_LOCALS) || "null"); } catch {}
+  if (!Array.isArray(parsed)) return [];
+  const now = Date.now();
+  const out: PendingLocal[] = [];
+  for (const v of parsed) {
+    if (!v || typeof v !== "object") continue;
+    const o = v as Record<string, unknown>;
+    if (typeof o.sessionId !== "string") continue;
+    if (o.role !== "user" && o.role !== "assistant") continue;
+    if (typeof o.contentKey !== "string") continue;
+    if (typeof o.attachmentsKey !== "string") continue;
+    if (typeof o.recordedAtSec !== "number") continue;
+    if (typeof o.expiresAt !== "number") continue;
+    if (o.expiresAt < now) continue;
+    out.push({
+      sessionId: o.sessionId,
+      role: o.role as ServerRole,
+      contentKey: o.contentKey,
+      attachmentsKey: o.attachmentsKey,
+      recordedAtSec: o.recordedAtSec,
+      expiresAt: o.expiresAt,
+    });
+  }
+  return out;
+}
+
+const pendingLocals: PendingLocal[] = loadPendingLocals();
+
+function savePendingLocals(): void {
+  try { localStorage.setItem(LS_PENDING_LOCALS, JSON.stringify(pendingLocals)); } catch {}
+}
+
+function prunePendingLocals(): void {
+  const now = Date.now();
+  let mutated = false;
+  for (let i = pendingLocals.length - 1; i >= 0; i--) {
+    if (pendingLocals[i]!.expiresAt < now) { pendingLocals.splice(i, 1); mutated = true; }
+  }
+  if (mutated) savePendingLocals();
+}
 
 function trimContent(s: string): string {
   return s.trim().slice(0, DEDUP_CONTENT_LEN);
@@ -634,6 +682,7 @@ function recordOptimistic(sessionId: string, role: ServerRole, content: string, 
     recordedAtSec: nowSec(),
     expiresAt: Date.now() + PENDING_TTL_MS,
   });
+  savePendingLocals();
 }
 
 function consumeIfDuplicate(
@@ -645,8 +694,9 @@ function consumeIfDuplicate(
 ): boolean {
   const now = Date.now();
   // Drop expired entries first so we don't hold stale matches forever.
+  let mutated = false;
   for (let i = pendingLocals.length - 1; i >= 0; i--) {
-    if (pendingLocals[i]!.expiresAt < now) pendingLocals.splice(i, 1);
+    if (pendingLocals[i]!.expiresAt < now) { pendingLocals.splice(i, 1); mutated = true; }
   }
   const key = trimContent(content);
   const aKey = attachmentsKeyFromRefs(attachments);
@@ -656,8 +706,10 @@ function consumeIfDuplicate(
     if (p.attachmentsKey !== aKey) continue;
     if (Math.abs(eventTs - p.recordedAtSec) > DEDUP_TS_WINDOW_S) continue;
     pendingLocals.splice(i, 1);
+    savePendingLocals();
     return true;
   }
+  if (mutated) savePendingLocals();
   return false;
 }
 
@@ -908,7 +960,7 @@ function ingestConversationDetail(detail: ServerConversationDetail): void {
   if (typeof detail.title_manual === "boolean") sess.titleManual = detail.title_manual;
   if (typeof detail.pinned === "boolean") sess.pinned = detail.pinned;
   sess.lastActiveAt = detail.updated_at * 1000;
-  sess.history = detail.messages.map((m) => {
+  const merged: HistoryItem[] = detail.messages.map((m) => {
     const item: HistoryItem = {
       role: serverRoleToLocal(m.role),
       text: m.content,
@@ -921,6 +973,37 @@ function ingestConversationDetail(detail: ServerConversationDetail): void {
     }
     return item;
   });
+  // Preserve local tail entries that haven't yet appeared in the server
+  // response but are still vouched for by a live pendingLocal (optimistic
+  // echo). Without this, a coldRefetch fired while the server is still
+  // processing the user's just-sent /chat would wipe the user bubble until
+  // the next sync re-delivers it — exactly the "message disappeared after
+  // refresh, came back later" race.
+  prunePendingLocals();
+  const sid = detail.session_id;
+  const survivors = pendingLocals.filter((p) => p.sessionId === sid);
+  if (survivors.length && sess.history.length) {
+    const serverKeys = new Set<string>();
+    for (const item of merged) {
+      const serverRole: ServerRole = item.role === "bot" ? "assistant" : "user";
+      serverKeys.add(`${serverRole}|${trimContent(item.text)}|${attachmentsKeyFromRefs(item.attachments)}`);
+    }
+    for (const local of sess.history) {
+      if (local.role !== "user" && local.role !== "bot") continue;
+      const serverRole: ServerRole = local.role === "bot" ? "assistant" : "user";
+      const contentKey = trimContent(local.text);
+      const aKey = attachmentsKeyFromRefs(local.attachments);
+      const key = `${serverRole}|${contentKey}|${aKey}`;
+      if (serverKeys.has(key)) continue;
+      const vouched = survivors.some(
+        (p) => p.role === serverRole && p.contentKey === contentKey && p.attachmentsKey === aKey,
+      );
+      if (!vouched) continue;
+      merged.push(local);
+      serverKeys.add(key);
+    }
+  }
+  sess.history = merged;
 }
 
 async function coldRefetch(): Promise<void> {
@@ -1006,6 +1089,11 @@ function handle401(): void {
   // purpose to avoid stream-existence enumeration), so leaving them on
   // disk would just trigger a doomed resume on the next bootstrap.
   localStorage.removeItem(LS_PENDING_STREAMS);
+  // Optimistic-echo dedup entries reference the OLD token's session ids;
+  // keeping them around would let a stale entry incorrectly suppress a
+  // legitimate message_added on the new login.
+  localStorage.removeItem(LS_PENDING_LOCALS);
+  pendingLocals.length = 0;
   location.replace("/login");
 }
 
@@ -2963,7 +3051,7 @@ $<HTMLButtonElement>("logout").onclick = () => {
       }).catch(() => {});
     } catch { /* fall through */ }
   }
-  for (const k of [LS_TOKEN, LS_USERNAME, LS_STORE, LS_LAST_PTS, LS_PENDING_STREAMS]) localStorage.removeItem(k);
+  for (const k of [LS_TOKEN, LS_USERNAME, LS_STORE, LS_LAST_PTS, LS_PENDING_STREAMS, LS_PENDING_LOCALS]) localStorage.removeItem(k);
   location.replace("/");
 };
 
