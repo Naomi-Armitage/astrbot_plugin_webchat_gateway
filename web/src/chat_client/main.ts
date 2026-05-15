@@ -498,44 +498,97 @@ function addMessageBubble(
     }
   }
   if (role === "user" && failure) {
-    div.classList.add("failed");
-    attachUserFailureActions(div, text, attachments, failure.reason);
+    applyUserFailureChrome(div, text, attachments);
   }
   msgs.appendChild(div);
   scrollToEnd();
   return div;
 }
 
-// Render the small "已停止 · 重试 · 编辑" action row under a failed user
-// bubble. Copy is deliberately user-facing (not error codes): see
-// FailureReason — only "stopped" (user pressed terminate) and
-// "send_failed" (anything else) are surfaced, matching the
-// ChatGPT/iMessage convention of one human sentence per failure.
-function attachUserFailureActions(
+// Telegram-style red "!" badge on the LEFT of the bubble (click =
+// resend) plus a small ChatGPT-style pencil icon BELOW the bubble
+// (click = load into composer for edit). No status text — the badge's
+// color + symbol already signals failure unambiguously and the user
+// asked to keep the chrome minimal.
+//
+// We wrap the bubble in a flex row so the badge can sit beside it
+// while the row stays right-aligned overall; the edit icon is a
+// separate sibling under the row so it lines up with the bubble's
+// trailing edge.
+function applyUserFailureChrome(
   bubble: HTMLDivElement,
   text: string,
   attachments: AttachmentRef[] | undefined,
-  reason: FailureReason,
 ): void {
-  const row = document.createElement("div");
-  row.className = "msg-failure";
-  const status = document.createElement("span");
-  status.className = "msg-failure-status";
-  status.textContent = reason === "stopped" ? "已停止" : "发送失败";
-  row.appendChild(status);
-  const retry = document.createElement("button");
-  retry.type = "button";
-  retry.className = "msg-failure-action";
-  retry.textContent = "重试";
-  retry.addEventListener("click", () => retryFailedUserMessage(bubble, text, attachments));
-  row.appendChild(retry);
+  // Idempotent: skip if already wrapped from an earlier mark/render.
+  if (bubble.parentElement && bubble.parentElement.classList.contains("msg-user-failed")) {
+    return;
+  }
+  const parent = bubble.parentElement;
+  const wrapper = document.createElement("div");
+  wrapper.className = "msg-user-failed";
+  if (parent) parent.insertBefore(wrapper, bubble);
+  const badge = document.createElement("button");
+  badge.type = "button";
+  badge.className = "msg-retry-badge";
+  badge.setAttribute("aria-label", "重试发送");
+  badge.title = "重试";
+  badge.innerHTML = ICON_BADGE_REFRESH;
+  badge.addEventListener("click", () => retryFailedUserMessage(bubble, text, attachments));
+  wrapper.appendChild(badge);
+  wrapper.appendChild(bubble);
   const edit = document.createElement("button");
   edit.type = "button";
-  edit.className = "msg-failure-action";
-  edit.textContent = "编辑";
+  edit.className = "msg-edit-icon";
+  edit.setAttribute("aria-label", "编辑消息");
+  edit.title = "编辑";
+  edit.innerHTML = ICON_PENCIL;
   edit.addEventListener("click", () => editFailedUserMessage(bubble, text, attachments));
-  row.appendChild(edit);
-  bubble.appendChild(row);
+  if (parent) parent.insertBefore(edit, wrapper.nextSibling);
+}
+
+// Inline SVGs kept local so the rest of the file stays the single
+// source of truth for the chat UI. Both icons are sized via CSS
+// width/height on the <svg>; viewBox is intrinsic so they scale
+// crisply at any DPI.
+//
+// Badge: single circular arrow (Lucide RotateCw). One arrowhead
+// reads as "redo / refresh" unambiguously; a two-arrow ring
+// (RefreshCw) has both ends meeting nose-to-nose and adds no
+// information, just visual clutter.
+const ICON_BADGE_REFRESH = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"`
+  + ` stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">`
+  + `<path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/>`
+  + `<path d="M21 3v5h-5"/>`
+  + `</svg>`;
+// Pencil: heavier-stroke outline (Lucide Pencil at stroke-width 2.5)
+// to read as "chubby hollow pencil" per the design call. Hollow =
+// no fill; chubby = thicker strokes than the default 1.5-2 Feather
+// weight used elsewhere on the page. Still part of the same
+// outline family so it doesn't clash visually.
+const ICON_PENCIL = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"`
+  + ` stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">`
+  + `<path d="M17 3a2.85 2.85 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/>`
+  + `<path d="m15 5 4 4"/>`
+  + `</svg>`;
+
+// Remove a failed user bubble plus the chrome we wrapped it in
+// (parent wrapper + the trailing edit-icon sibling). Used by retry
+// and edit so the "three-DOM-nodes-act-as-one" detail lives in a
+// single place.
+function removeUserBubbleAndFailureChrome(bubble: HTMLDivElement): void {
+  const wrapper = bubble.closest<HTMLElement>(".msg-user-failed");
+  if (wrapper) {
+    const edit = wrapper.nextElementSibling;
+    if (edit && (edit as HTMLElement).classList?.contains("msg-edit-icon")) {
+      edit.remove();
+    }
+    wrapper.remove();
+    return;
+  }
+  // Defensive: not wrapped (shouldn't happen for failed entries, but
+  // a transient race could land here). Remove the bare bubble.
+  bubble.remove();
 }
 
 // Remove a failed user history entry by matching on (text, ts? — actually
@@ -567,7 +620,7 @@ function retryFailedUserMessage(
   // ignore — the failure caption stays put, user can retry once the
   // current turn settles.
   if (sync.streamAbort) return;
-  bubble.remove();
+  removeUserBubbleAndFailureChrome(bubble);
   removeFailedHistoryEntry(text, attachments);
   void performSend(text, attachments ? [...attachments] : []);
 }
@@ -584,7 +637,7 @@ function editFailedUserMessage(
   if (draft && draft !== text) {
     if (!confirm("当前输入框有未发送的内容，编辑会覆盖。是否继续？")) return;
   }
-  bubble.remove();
+  removeUserBubbleAndFailureChrome(bubble);
   removeFailedHistoryEntry(text, attachments);
   // Image attachments don't restore into the composer chip row — the
   // local blob URLs are gone, and reconstructing chips from file_ids
@@ -605,9 +658,10 @@ function editFailedUserMessage(
 }
 
 // Find the last optimistic user history item matching (text, attachments)
-// and mark it failed. Re-renders the bubble in place so the action row
-// shows up. Called by the streaming POST error branches when the failure
-// happens before any chunk lands (close_failed-side outcomes).
+// and mark it failed. Re-decorates the matching DOM bubble by wrapping
+// it with the failure chrome (badge + edit-icon). Called by the
+// streaming POST error branches when the failure happens before any
+// chunk lands (close_failed-side outcomes).
 function markLastUserAsFailed(
   text: string,
   attachments: AttachmentRef[] | undefined,
@@ -623,21 +677,18 @@ function markLastUserAsFailed(
     if (h.failure) return;  // already marked
     h.failure = { reason };
     saveStore();
-    // Re-decorate the matching DOM bubble in place. The last .msg.user
-    // in the message list with the same text is the one we want — the
-    // optimistic echo from this turn.
+    // Walk back through user bubbles in the DOM. The match is the most
+    // recent one NOT already wrapped by .msg-user-failed — wrappers
+    // belong to earlier failed turns.
     const list = msgs.querySelectorAll<HTMLDivElement>(".msg.user");
     for (let k = list.length - 1; k >= 0; k--) {
       const el = list[k]!;
-      if (el.classList.contains("failed")) continue;
+      const wrapped = el.parentElement && el.parentElement.classList.contains("msg-user-failed");
+      if (wrapped) continue;
       const tnode = el.querySelector(".msg-text");
       const elText = tnode ? tnode.textContent ?? "" : el.textContent ?? "";
-      // textContent on the bare bubble includes the action row text on
-      // already-failed bubbles, but we skipped those above. For fresh
-      // bubbles, textContent is just the message text.
       if (elText !== text) continue;
-      el.classList.add("failed");
-      attachUserFailureActions(el, text, attachments, reason);
+      applyUserFailureChrome(el, text, attachments);
       break;
     }
     return;
@@ -645,7 +696,13 @@ function markLastUserAsFailed(
 }
 
 const scrollToEnd = (): void => { msgs.scrollTop = msgs.scrollHeight; };
-const clearMsgList = (): void => { msgs.querySelectorAll(".msg").forEach((m) => m.remove()); };
+const clearMsgList = (): void => {
+  // Wipe ALL chat-list children, not just .msg nodes — failed user
+  // turns wrap the bubble in .msg-user-failed and append a sibling
+  // .msg-edit-icon; matching only .msg would leave those orphans
+  // behind on replayActive / history_cleared.
+  msgs.replaceChildren();
+};
 
 // Append a "（回复未完整）" notice to the most recently rendered bot bubble
 // (assumed to be the last `.msg.bot` in the message list). Used by the
