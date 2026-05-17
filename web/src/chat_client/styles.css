@@ -500,6 +500,93 @@ header h1 {
   font-size: inherit;
 }
 .msg.md pre code::-webkit-scrollbar { height: 6px; }
+/* Telegram-style fenced code block. .codeblock wraps a header (language tag
+   + copy-all button) and a <pre><code> body whose lines are each wrapped in
+   .codeblock-line spans so individual lines can be click-copied. */
+.msg.md .codeblock {
+  margin: 0.6em 0;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: var(--paper-deep);
+  overflow: hidden;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.msg.md .codeblock-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 10px;
+  background: color-mix(in oklab, var(--paper-deep) 70%, var(--ink) 6%);
+  border-bottom: 1px solid var(--rule);
+  font-size: 12px;
+  color: var(--ink-soft);
+  user-select: none;
+}
+.msg.md .codeblock-lang {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  text-transform: lowercase;
+  opacity: 0.85;
+}
+.msg.md .codeblock-lang-empty::before { content: "code"; opacity: 0.55; }
+.msg.md .codeblock-copy {
+  appearance: none;
+  border: 1px solid var(--rule);
+  background: transparent;
+  color: var(--ink-soft);
+  font: inherit;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.msg.md .codeblock-copy:hover {
+  background: color-mix(in oklab, var(--accent) 12%, transparent);
+  color: var(--ink);
+  border-color: color-mix(in oklab, var(--accent) 40%, var(--rule));
+}
+.msg.md .codeblock-copy.copied {
+  background: color-mix(in oklab, var(--accent) 22%, transparent);
+  color: var(--ink);
+  border-color: color-mix(in oklab, var(--accent) 55%, var(--rule));
+}
+.msg.md .codeblock-pre {
+  margin: 0;
+  padding: 10px 12px;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  overflow-x: auto;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.msg.md .codeblock-code {
+  display: block;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font-family: inherit;
+  font-size: inherit;
+  white-space: pre;
+}
+.msg.md .codeblock-line {
+  display: block;
+  padding: 0 4px;
+  margin: 0 -4px;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.msg.md .codeblock-line:hover {
+  background: color-mix(in oklab, var(--accent) 8%, transparent);
+}
+.msg.md .codeblock-line.copied {
+  background: color-mix(in oklab, var(--accent) 28%, transparent);
+  transition: background 0.6s ease-out;
+}
 .msg.md table {
   margin: 0.5em 0;
   border-collapse: collapse;

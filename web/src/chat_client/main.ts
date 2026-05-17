@@ -429,6 +429,44 @@ marked.use({
   ],
 });
 
+// Telegram-style fenced code blocks: header (lang + copy-all button) +
+// per-line clickable spans. We replace marked's default `<pre><code>` with
+// a `.codeblock` div so we can attach the header and wrap each line; the
+// click handlers themselves live in a single delegated listener on the
+// message list (DOMPurify strips inline event handlers).
+function escapeCodeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+marked.use({
+  renderer: {
+    code({ text, lang }) {
+      // Strip a single trailing newline so the last line isn't an empty span.
+      const body = text.replace(/\n$/, "");
+      const lines = body.split("\n");
+      const escapedLines = lines
+        .map((ln) => `<span class="codeblock-line">${escapeCodeHtml(ln) || "&#8203;"}</span>`)
+        .join("\n");
+      const langLabel = (lang || "").trim();
+      const langHtml = langLabel
+        ? `<span class="codeblock-lang">${escapeCodeHtml(langLabel)}</span>`
+        : `<span class="codeblock-lang codeblock-lang-empty"></span>`;
+      return (
+        `<div class="codeblock">`
+        + `<div class="codeblock-header">${langHtml}`
+        + `<button class="codeblock-copy" type="button" aria-label="复制全部">复制</button>`
+        + `</div>`
+        + `<pre class="codeblock-pre"><code class="codeblock-code">${escapedLines}</code></pre>`
+        + `</div>`
+      );
+    },
+  },
+});
+
 // Open every link in a new tab with safe rel. DOMPurify lets attributes
 // like target/rel through but doesn't add them — that's a separate hook.
 DOMPurify.addHook("afterSanitizeAttributes", (node) => {
@@ -448,6 +486,45 @@ function renderMarkdown(text: string): string {
     FORBID_ATTR: ["formaction"],
   });
 }
+
+// Code-block interactions: one delegated listener handles every fenced
+// block under the message list. We can't use inline `onclick` because
+// DOMPurify strips event-handler attributes during sanitize.
+function copyText(s: string): void {
+  if (navigator.clipboard?.writeText) {
+    void navigator.clipboard.writeText(s).catch(() => {});
+  }
+}
+function gatherBlockText(block: Element): string {
+  const lineEls = block.querySelectorAll<HTMLElement>(".codeblock-line");
+  const lines: string[] = [];
+  lineEls.forEach((el) => { lines.push(el.textContent ?? ""); });
+  return lines.join("\n");
+}
+msgs.addEventListener("click", (e: MouseEvent) => {
+  const target = e.target as Element | null;
+  if (!target) return;
+  const copyBtn = target.closest<HTMLButtonElement>(".codeblock-copy");
+  if (copyBtn) {
+    const block = copyBtn.closest(".codeblock");
+    if (!block) return;
+    copyText(gatherBlockText(block));
+    const orig = copyBtn.textContent ?? "复制";
+    copyBtn.textContent = "已复制";
+    copyBtn.classList.add("copied");
+    window.setTimeout(() => {
+      copyBtn.textContent = orig;
+      copyBtn.classList.remove("copied");
+    }, 1200);
+    return;
+  }
+  const line = target.closest<HTMLElement>(".codeblock-line");
+  if (line) {
+    copyText(line.textContent ?? "");
+    line.classList.add("copied");
+    window.setTimeout(() => { line.classList.remove("copied"); }, 600);
+  }
+});
 
 // Append a chat bubble. `text` is the raw content as stored in history;
 // for the bot role we render markdown (sanitized), everything else stays
