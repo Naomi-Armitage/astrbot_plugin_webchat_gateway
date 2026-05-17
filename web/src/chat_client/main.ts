@@ -398,6 +398,7 @@ const savePendingStreams = (): void => {
 const saveLastPts = (pts: number): void => { try { localStorage.setItem(LS_LAST_PTS, String(pts)); } catch {} };
 const currentSession = (): SessionMeta => store.sessions[store.activeId]!;
 const serverRoleToLocal = (r: ServerRole): Role => r === "assistant" ? "bot" : "user";
+const localRoleToServer = (r: Role): ServerRole => r === "bot" ? "assistant" : "user";
 
 function replayActive(): void {
   clearMsgList();
@@ -503,10 +504,31 @@ function renderMarkdown(text: string): string {
 // Code-block interactions: one delegated listener handles every fenced
 // block under the message list. We can't use inline `onclick` because
 // DOMPurify strips event-handler attributes during sanitize.
-function copyText(s: string): void {
+// navigator.clipboard requires a secure context (HTTPS or localhost), so
+// plain-HTTP intranet deployments fall back to a hidden textarea +
+// document.execCommand. Returns true on success so callers can branch on
+// visual feedback (button flash, line flash).
+async function writeClipboard(text: string): Promise<boolean> {
   if (navigator.clipboard?.writeText) {
-    void navigator.clipboard.writeText(s).catch(() => {});
+    try { await navigator.clipboard.writeText(text); return true; } catch {}
   }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+function copyText(s: string): void {
+  void writeClipboard(s);
 }
 function gatherBlockText(block: Element): string {
   const lineEls = block.querySelectorAll<HTMLElement>(".codeblock-line");
@@ -1189,7 +1211,6 @@ interface PendingLocalDelete {
   sessionId: string;
   index: number;
   role: ServerRole;
-  recordedAtSec: number;
   expiresAt: number;
 }
 // Short TTL is fine here — peer broadcast typically lands within a second
@@ -1210,14 +1231,12 @@ function loadPendingLocalDeletes(): PendingLocalDelete[] {
     if (typeof o.sessionId !== "string") continue;
     if (typeof o.index !== "number" || !Number.isInteger(o.index)) continue;
     if (o.role !== "user" && o.role !== "assistant") continue;
-    if (typeof o.recordedAtSec !== "number") continue;
     if (typeof o.expiresAt !== "number") continue;
     if (o.expiresAt < now) continue;
     out.push({
       sessionId: o.sessionId,
       index: o.index,
       role: o.role as ServerRole,
-      recordedAtSec: o.recordedAtSec,
       expiresAt: o.expiresAt,
     });
   }
@@ -1237,7 +1256,6 @@ function recordPendingDelete(sessionId: string, index: number, role: ServerRole)
     sessionId,
     index,
     role,
-    recordedAtSec: nowSec(),
     expiresAt: Date.now() + PENDING_DELETE_TTL_MS,
   });
   savePendingLocalDeletes();
@@ -1269,7 +1287,7 @@ function consumeIfDeleteDuplicate(sessionId: string, index: number, role: Server
 //     time would desync after any preceding delete / insert.
 //   * Network paths use fetchWithTimeout + bearer() + same-origin
 //     credentials, matching runNonStreamingSend.
-//   * 401 always routes through handle401; 409 conversation_locked is
+//   * 401 always routes through handle401; 429 concurrent_request is
 //     surfaced as a soft notice (the user just needs to wait for the
 //     in-flight chat to finish, not a hard error).
 //   * On success they update store.sessions + replayActive (for delete)
@@ -1295,29 +1313,8 @@ function flashActionButton(btn: HTMLButtonElement, kind: "copied" | "ok"): void 
 }
 
 async function copyMessage(text: string, btn: HTMLButtonElement): Promise<void> {
-  if (!text) { return; }
-  // navigator.clipboard requires a secure context (HTTPS or localhost);
-  // we lose the API in plain-HTTP intranet deployments. Fall back to a
-  // hidden textarea + document.execCommand to keep parity with the
-  // codeblock copy path.
-  let ok = false;
-  if (navigator.clipboard?.writeText) {
-    try { await navigator.clipboard.writeText(text); ok = true; } catch {}
-  }
-  if (!ok) {
-    try {
-      const ta = document.createElement("textarea");
-      ta.value = text;
-      ta.setAttribute("readonly", "");
-      ta.style.position = "fixed";
-      ta.style.opacity = "0";
-      document.body.appendChild(ta);
-      ta.select();
-      ok = document.execCommand("copy");
-      document.body.removeChild(ta);
-    } catch {}
-  }
-  if (ok) flashActionButton(btn, "copied");
+  if (!text) return;
+  if (await writeClipboard(text)) flashActionButton(btn, "copied");
 }
 
 async function deleteMessage(bubble: HTMLDivElement): Promise<void> {
@@ -1328,7 +1325,7 @@ async function deleteMessage(bubble: HTMLDivElement): Promise<void> {
   const sid = sess.id;
   const role = sess.history[idx]!.role;
   if (role !== "user" && role !== "bot") return;
-  const wireRole: ServerRole = role === "bot" ? "assistant" : "user";
+  const wireRole: ServerRole = localRoleToServer(role);
   if (!confirm("删除该消息？")) return;
   let resp: Response;
   try {
@@ -1344,7 +1341,7 @@ async function deleteMessage(bubble: HTMLDivElement): Promise<void> {
   let payload: Record<string, unknown> = {};
   try { payload = await resp.json(); } catch {}
   if (resp.status === 401) { handle401(); return; }
-  if (resp.status === 409 && (payload.error as string) === "conversation_locked") {
+  if (resp.status === 429 && (payload.error as string) === "concurrent_request") {
     addMessageBubble("notice", "正在处理中，稍候。");
     return;
   }
@@ -1426,7 +1423,7 @@ async function regenerateMessage(bubble: HTMLDivElement): Promise<void> {
   bubble.classList.remove("regenerating");
   for (const b of actionBtns) b.disabled = false;
   if (resp.status === 401) { handle401(); return; }
-  if (resp.status === 409 && (payload.error as string) === "conversation_locked") {
+  if (resp.status === 429 && (payload.error as string) === "concurrent_request") {
     addMessageBubble("notice", "正在处理中，稍候。");
     return;
   }
@@ -1639,13 +1636,9 @@ function applyEvent(ev: ServerEvent): void {
         // about to add carries the server's complete text and replaces
         // the partial streaming view both visually and in history.
         if (role === "assistant") {
-          const streamingBubble = msgs.querySelector(".msg.bot.streaming");
+          const streamingBubble = msgs.querySelector<HTMLElement>(".msg.bot.streaming");
           if (streamingBubble) {
-            // streamingBubble lives inside .msg-row (wrapped by
-            // attachStreamingBubble). Remove the row so the action
-            // chrome doesn't orphan.
-            const row = streamingBubble.closest(".msg-row");
-            (row ?? streamingBubble).remove();
+            removeBubbleWithRow(streamingBubble);
             sync.streamFinalizeSuppressed[sid] = true;
           }
         }
@@ -1678,7 +1671,7 @@ function applyEvent(ev: ServerEvent): void {
       // the wrong message.
       const target = sess.history[rawIndex];
       if (!target) break;
-      const expectedLocalRole: Role = rawRole === "assistant" ? "bot" : "user";
+      const expectedLocalRole: Role = serverRoleToLocal(rawRole as ServerRole);
       if (target.role !== expectedLocalRole) break;
       sess.history.splice(rawIndex, 1);
       sess.lastActiveAt = ev.ts * 1000;

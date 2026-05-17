@@ -1032,6 +1032,102 @@ class ConversationService:
         )
         return row
 
+    async def _resolve_target_raw_index(
+        self,
+        *,
+        token_name: str,
+        session_id: str,
+        message_index: int,
+    ) -> tuple[list[Any], str, int, dict[str, Any], str]:
+        """Map a client-supplied rendered-history index to its raw CM entry.
+
+        Returns `(raw_history, conversation_id, raw_idx, target_entry,
+        role)`. Raises `ServiceError("session_not_found", 404)` if the
+        session is empty, or `ServiceError("message_not_found", 404)` if
+        the index is out of the rendered-view range. Role is normalized
+        lowercase; callers still need to enforce their own role
+        constraint (delete accepts user|assistant; regenerate requires
+        assistant).
+        """
+        raw_history, cid = await self._cm_history_raw(
+            token_name=token_name, session_id=session_id
+        )
+        if not cid or not raw_history:
+            raise ServiceError("session_not_found", status=404)
+        rendered_to_raw = self._render_to_raw_indices(raw_history)
+        if message_index < 0 or message_index >= len(rendered_to_raw):
+            raise ServiceError("message_not_found", status=404)
+        raw_idx = rendered_to_raw[message_index]
+        target = raw_history[raw_idx]
+        if not isinstance(target, dict):
+            raise ServiceError("message_not_found", status=404)
+        role = str(target.get("role") or "").strip().lower()
+        if role not in ("user", "assistant"):
+            # _render_to_raw_indices already filters non-user/assistant
+            # out — defensive recheck against future filter-rule drift.
+            raise ServiceError("message_not_found", status=404)
+        return raw_history, cid, raw_idx, target, role
+
+    async def _release_orphaned_attachments(
+        self,
+        *,
+        token_name: str,
+        session_id: str,
+        removed_entries: list[Any],
+        surviving_history: list[Any],
+        log_label: str,
+    ) -> None:
+        """Release attachment files referenced ONLY by `removed_entries`.
+
+        Walks the removed entries to collect their file_ids, then subtracts
+        any file_id still referenced by `surviving_history` (cross-message
+        attachment reuse is rare but legal — copy-pasted images, retry of
+        the same turn, etc.). The diff goes through `release_files_safely`.
+        Failure to list session files degrades silently to "release nothing"
+        rather than crashing the caller — the orphan sweep will catch it.
+        """
+        removed_file_ids: set[str] = set()
+        for entry in removed_entries:
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("role") or "").strip().lower() != "user":
+                continue
+            for fid in _extract_attachment_file_ids(entry.get("content")):
+                removed_file_ids.add(fid)
+        if not removed_file_ids:
+            return
+        still_referenced: set[str] = set()
+        for surviving in surviving_history:
+            if not isinstance(surviving, dict):
+                continue
+            if str(surviving.get("role") or "").strip().lower() != "user":
+                continue
+            for fid in _extract_attachment_file_ids(surviving.get("content")):
+                still_referenced.add(fid)
+        to_release_ids = removed_file_ids - still_referenced
+        if not to_release_ids:
+            return
+        try:
+            session_files = await self._storage.list_files_for_session(
+                token_name=token_name, session_id=session_id
+            )
+        except Exception:
+            logger.exception(
+                "[WebChatGateway] list_files_for_session during %s failed",
+                log_label,
+            )
+            return
+        rows_to_release = [
+            r for r in session_files if r.file_id in to_release_ids
+        ]
+        if rows_to_release:
+            await release_files_safely(
+                storage=self._storage,
+                file_store=self._file_store,
+                rows=rows_to_release,
+                log_label=log_label,
+            )
+
     async def delete_message_by_index(
         self,
         *,
@@ -1046,7 +1142,7 @@ class ConversationService:
         and emit a `message_deleted` event for peers.
 
         Acquires the per-token concurrency lock; raises
-        `ServiceError("conversation_locked", 409)` on contention (a
+        `ServiceError("concurrent_request", 429)` on contention (a
         `/chat/stream` in flight on the same token). Raises
         `ServiceError("session_not_found", 404)` if the session has no
         CM conversation or `("message_not_found", 404)` if the index is
@@ -1071,7 +1167,7 @@ class ConversationService:
             )
         async with self._concurrency.acquire(token_name) as acquired:
             if not acquired:
-                raise ServiceError("conversation_locked", status=409)
+                raise ServiceError("concurrent_request", status=429)
             return await self._delete_message_inner(
                 token_name=token_name,
                 session_id=session_id,
@@ -1087,29 +1183,13 @@ class ConversationService:
         message_index: int,
         ip: str | None,
     ) -> SessionMetaRow:
-        raw_history, cid = await self._cm_history_raw(
-            token_name=token_name, session_id=session_id
+        raw_history, cid, raw_idx, removed_entry, removed_role = (
+            await self._resolve_target_raw_index(
+                token_name=token_name,
+                session_id=session_id,
+                message_index=message_index,
+            )
         )
-        if not cid or not raw_history:
-            raise ServiceError("session_not_found", status=404)
-        rendered_to_raw = self._render_to_raw_indices(raw_history)
-        if (
-            message_index < 0
-            or message_index >= len(rendered_to_raw)
-        ):
-            raise ServiceError("message_not_found", status=404)
-        raw_idx = rendered_to_raw[message_index]
-        removed_entry = raw_history[raw_idx]
-        removed_role = (
-            str(removed_entry.get("role") or "").strip().lower()
-            if isinstance(removed_entry, dict)
-            else ""
-        )
-        if removed_role not in ("user", "assistant"):
-            # Defensive: _render_to_raw_indices already filters non-
-            # user/assistant out, but if the raw shape ever drifts we'd
-            # rather 404 than crash here.
-            raise ServiceError("message_not_found", status=404)
 
         # Splice the raw list in place. Keep all non-rendered entries
         # (system / tool calls) intact — we only drop the one chosen
@@ -1129,52 +1209,13 @@ class ConversationService:
             )
             raise ServiceError("delete_failed", status=500) from None
 
-        # File release: only drop files that are NO LONGER referenced
-        # by any surviving message. Walk the spliced raw list once and
-        # subtract surviving file_ids from `removed_file_ids` to keep
-        # the cross-message-reuse case correct.
-        removed_file_ids: set[str] = set()
-        if removed_role == "user" and isinstance(removed_entry, dict):
-            for fid in _extract_attachment_file_ids(removed_entry.get("content")):
-                removed_file_ids.add(fid)
-        if removed_file_ids:
-            still_referenced: set[str] = set()
-            for surviving in new_history:
-                if not isinstance(surviving, dict):
-                    continue
-                if (
-                    str(surviving.get("role") or "").strip().lower()
-                    != "user"
-                ):
-                    continue
-                for fid in _extract_attachment_file_ids(
-                    surviving.get("content")
-                ):
-                    still_referenced.add(fid)
-            to_release_ids = removed_file_ids - still_referenced
-            if to_release_ids:
-                try:
-                    session_files = (
-                        await self._storage.list_files_for_session(
-                            token_name=token_name, session_id=session_id
-                        )
-                    )
-                except Exception:
-                    logger.exception(
-                        "[WebChatGateway] list_files_for_session during "
-                        "message delete failed"
-                    )
-                    session_files = []
-                rows_to_release = [
-                    r for r in session_files if r.file_id in to_release_ids
-                ]
-                if rows_to_release:
-                    await release_files_safely(
-                        storage=self._storage,
-                        file_store=self._file_store,
-                        rows=rows_to_release,
-                        log_label="delete_message_by_index",
-                    )
+        await self._release_orphaned_attachments(
+            token_name=token_name,
+            session_id=session_id,
+            removed_entries=[removed_entry],
+            surviving_history=new_history,
+            log_label="delete_message_by_index",
+        )
 
         # Recompute message_count + preview from the new rendered view
         # so peer `list_conversations` calls reflect the deletion. The
@@ -1244,7 +1285,7 @@ class ConversationService:
         assistant reply, and emit `message_deleted` + `message_added` events.
 
         Acquires the per-token concurrency lock; raises
-        `ServiceError("conversation_locked", 409)` on contention.
+        `ServiceError("concurrent_request", 429)` on contention.
 
         Raises `ServiceError("session_not_found", 404)` if no conversation
         exists for the session; `("message_not_found", 404)` if the index
@@ -1278,7 +1319,7 @@ class ConversationService:
             )
         async with self._concurrency.acquire(token_name) as acquired:
             if not acquired:
-                raise ServiceError("conversation_locked", status=409)
+                raise ServiceError("concurrent_request", status=429)
             return await self._regenerate_inner(
                 token_name=token_name,
                 session_id=session_id,
@@ -1298,28 +1339,17 @@ class ConversationService:
         token_daily_quota: int,
         ip: str | None,
     ) -> RegenerateResult:
-        raw_history, cid = await self._cm_history_raw(
-            token_name=token_name, session_id=session_id
-        )
-        if not cid or not raw_history:
-            raise ServiceError("session_not_found", status=404)
-        rendered_to_raw = self._render_to_raw_indices(raw_history)
-        if (
-            message_index < 0
-            or message_index >= len(rendered_to_raw)
-        ):
-            raise ServiceError("message_not_found", status=404)
-        target_raw_idx = rendered_to_raw[message_index]
-        target_entry = raw_history[target_raw_idx]
-        target_role = (
-            str(target_entry.get("role") or "").strip().lower()
-            if isinstance(target_entry, dict)
-            else ""
+        raw_history, cid, target_raw_idx, _target_entry, target_role = (
+            await self._resolve_target_raw_index(
+                token_name=token_name,
+                session_id=session_id,
+                message_index=message_index,
+            )
         )
         if target_role != "assistant":
-            # Per spec: only assistant messages can be regenerated. The
-            # preceding user turn stays in place and is fed back to the
-            # LLM as fresh context.
+            # Only assistant messages can be regenerated. The preceding
+            # user turn stays in place and is fed back to the LLM as
+            # fresh context.
             raise ServiceError("message_not_found", status=404)
 
         # Recover the most recent user message text from the surviving
@@ -1348,6 +1378,7 @@ class ConversationService:
         # `_history_text`; with the truncated history in place the
         # provider sees the right context.
         truncated_history = raw_history[:target_raw_idx]
+        dropped_tail = raw_history[target_raw_idx:]
         umo = _umo(token_name, session_id)
         try:
             await self._cm.update_conversation(
@@ -1361,6 +1392,17 @@ class ConversationService:
                 " failed"
             )
             raise ServiceError("regenerate_failed", status=500) from None
+
+        # Release attachments referenced ONLY by the dropped tail. The new
+        # assistant reply we're about to generate is text-only, so the
+        # final reference set equals truncated_history's reference set.
+        await self._release_orphaned_attachments(
+            token_name=token_name,
+            session_id=session_id,
+            removed_entries=dropped_tail,
+            surviving_history=truncated_history,
+            log_label="regenerate_assistant_message",
+        )
 
         # Quota check + LLM call. Quota is read-then-increment; the
         # per-token concurrency lock we're holding makes that safe
@@ -2327,7 +2369,7 @@ def make_conversation_handlers(
           400 `{error: "invalid_payload"}` — bad session_id or index.
           401 — auth gate.
           404 `{error: "session_not_found"|"message_not_found"}`.
-          409 `{error: "conversation_locked"}` — stream in-flight.
+          429 `{error: "concurrent_request"}` — stream in-flight.
           500 `{error: "internal_error"|"delete_failed"}`.
         """
         gated = await gate_request(request, deps)
@@ -2380,7 +2422,7 @@ def make_conversation_handlers(
           400 `{error: "invalid_payload"|"invalid_json"}`.
           401 — auth gate.
           404 `{error: "session_not_found"|"message_not_found"}`.
-          409 `{error: "conversation_locked"}` — another in-flight op.
+          429 `{error: "concurrent_request"}` — another in-flight op.
           429 `{error: "quota_exceeded"}` — daily quota hit.
           502 `{error: "empty_reply"}` — provider returned no tokens.
           504 `{error: "llm_timeout"}` — provider stalled.
