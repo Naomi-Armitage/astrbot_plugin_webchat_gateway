@@ -192,6 +192,18 @@ def build_app(deps: ServerDeps) -> web.Application:
     app.router.add_options(cfg.conversations_item_path, conv["preflight"])
     app.router.add_post(cfg.conversations_clear_path, conv["clear"])
     app.router.add_options(cfg.conversations_clear_path, conv["preflight"])
+    app.router.add_delete(
+        cfg.conversations_message_path, conv["delete_message"]
+    )
+    app.router.add_options(
+        cfg.conversations_message_path, conv["preflight"]
+    )
+    app.router.add_post(
+        cfg.conversations_regenerate_path, conv["regenerate_message"]
+    )
+    app.router.add_options(
+        cfg.conversations_regenerate_path, conv["preflight"]
+    )
     app.router.add_get(cfg.events_path, conv["events"])
     app.router.add_options(cfg.events_path, conv["preflight"])
 

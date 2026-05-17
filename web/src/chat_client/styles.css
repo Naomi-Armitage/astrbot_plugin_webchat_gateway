@@ -500,6 +500,7 @@ header h1 {
   font-size: inherit;
 }
 .msg.md pre code::-webkit-scrollbar { height: 6px; }
+
 /* Telegram-style fenced code block. .codeblock wraps a header (language tag
    + copy-all button) and a <pre><code> body whose lines are each wrapped in
    .codeblock-line spans so individual lines can be click-copied. */
@@ -1268,6 +1269,148 @@ body.lightbox-open { overflow: hidden; }
   width: 16px;
   height: 16px;
   pointer-events: none;
+}
+
+/* ----- per-message hover actions (copy / delete / regenerate) -----
+   Each user/bot bubble is wrapped in a .msg-row. Inside the row sit
+   the bubble itself plus a .msg-actions cluster. The row takes over
+   the bubble's old align-self anchoring so the bubble + actions stay
+   visually attached on the same side. The copy button is always
+   visible (cheap discoverability — users expect it without hover);
+   the other buttons fade in on hover (or keyboard focus, for a11y).
+
+   The chrome stays out of the way of streaming + failure-state
+   layouts: .streaming hides actions entirely (no point showing them
+   on a half-rendered bubble), .msg-user-failed re-anchors the
+   bubble inside a sub-wrapper that the row still hosts. */
+.msg-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-width: 100%;
+  /* Animation only runs on the row itself (was on .msg). Moving it
+     here avoids a double-animate when the bubble swaps innerHTML on
+     regenerate; the row stays put. */
+  animation: msgIn .25s cubic-bezier(.2,.8,.3,1) both;
+}
+.msg-row.bot-row { align-self: flex-start; align-items: flex-start; }
+.msg-row.user-row { align-self: flex-end; align-items: flex-end; }
+/* The bubble's own animation now lives on the row (above) so the
+   inner element doesn't re-animate during a regenerate innerHTML
+   swap. Bubbles wrapped in .msg-row no longer need it. */
+.msg-row > .msg { animation: none; }
+
+.msg-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  /* Pull the action row tight against the bubble's bottom edge —
+     matches the visual weight of .msg-edit-icon (which uses a
+     similar negative top margin). */
+  margin: -2px 4px 0;
+  padding: 0;
+  /* Hidden by default — the .msg-action-copy override below keeps
+     the copy button visible. */
+  pointer-events: auto;
+}
+/* Reveal the full row on bubble hover OR keyboard focus within. */
+.msg-row:hover .msg-action-btn,
+.msg-row:focus-within .msg-action-btn { opacity: 1; }
+/* Streaming bubble → suppress chrome entirely. The bubble is still
+   morphing; copy / delete / regenerate aren't meaningful yet. */
+.msg-row:has(.msg.streaming) .msg-actions { display: none; }
+
+.msg-action-btn {
+  appearance: none;
+  border: none;
+  padding: 4px;
+  margin: 0;
+  background: none;
+  color: var(--ink-soft);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  opacity: 0;
+  transition: opacity 0.15s ease, background-color 0.15s ease,
+              color 0.15s ease, transform 0.15s ease;
+  /* Match the codeblock-copy button's font intent — UI font, not
+     monospace (the codeblock equivalent is monospace because it sits
+     inside a code header; these buttons don't). */
+  font: inherit;
+}
+/* Copy stays visible (subtle by default, fully opaque on hover). */
+.msg-action-btn.msg-action-copy {
+  opacity: 0.55;
+}
+.msg-row:hover .msg-action-btn.msg-action-copy,
+.msg-row:focus-within .msg-action-btn.msg-action-copy { opacity: 1; }
+
+.msg-action-btn:hover {
+  background: color-mix(in oklab, var(--ink) 6%, transparent);
+  color: var(--ink);
+}
+.msg-action-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  opacity: 1;
+}
+.msg-action-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.35 !important;
+}
+.msg-action-btn svg {
+  width: 14px;
+  height: 14px;
+  pointer-events: none;
+}
+/* Brief flash after a successful copy. The .copied class lives ~1.2s. */
+.msg-action-btn.msg-action-copy.copied {
+  background: color-mix(in oklab, var(--accent) 22%, transparent);
+  color: var(--ink);
+  opacity: 1;
+}
+/* Delete uses the same red-tinted hover treatment as .msg-retry-badge
+   so destructive actions read consistently across the chat surface. */
+.msg-action-btn.msg-action-delete:hover {
+  background: color-mix(in oklab, var(--bad) 10%, transparent);
+  color: var(--bad);
+}
+
+/* Regenerate in-progress: dim the bubble + show a small spinning
+   indicator. We don't lay a full overlay over the bubble — the
+   action button's disabled state already signals "wait", and a
+   partial-opacity bubble keeps the previous content readable for
+   easy comparison once the new reply lands. */
+.msg.regenerating {
+  opacity: 0.55;
+  position: relative;
+}
+.msg.regenerating::after {
+  content: "";
+  position: absolute;
+  right: 8px;
+  top: 8px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid color-mix(in oklab, var(--accent) 25%, transparent);
+  border-top-color: var(--accent);
+  animation: msgRegenSpin 0.8s linear infinite;
+  pointer-events: none;
+}
+@keyframes msgRegenSpin {
+  to { transform: rotate(360deg); }
+}
+
+/* The .msg-user-failed wrapper now sits INSIDE the .msg-row so the
+   row can host both the wrapper + the .msg-edit-icon trailing sibling
+   + the .msg-actions cluster without the wrapper's flex layout
+   fighting the row's column flex. Reset wrapper's align-self so it
+   doesn't try to anchor itself relative to the row's column axis. */
+.msg-row.user-row .msg-user-failed {
+  align-self: stretch;
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -29,6 +29,11 @@ const LS_PENDING_STREAMS = "wcg.chat.pending_streams";
 // which local-only tail entries are still "in flight" and must be preserved
 // across a coldRefetch that arrives before the server has persisted them.
 const LS_PENDING_LOCALS = "wcg.chat.pending_locals";
+// Pending-delete dedup buffer. Same shape rationale as LS_PENDING_LOCALS but
+// keyed on (sessionId, index, role) rather than content, because delete is
+// the only place where two different messages can share identical text but
+// must be tracked as separate optimistic actions.
+const LS_PENDING_LOCAL_DELETES = "wcg.chat.pending_local_deletes";
 
 const API = "/api/webchat";
 const CHAT_URL = `${API}/chat`;
@@ -40,6 +45,13 @@ const CONV_URL = `${API}/conversations`;
 const EVENTS_URL = `${API}/events`;
 const UPLOAD_URL = `${API}/upload`;
 const FILES_URL = `${API}/files`;
+// Per-message action endpoints. `sid` and `index` are URL-segments — the
+// server's path layout matches cfg.conversations_message_path and
+// cfg.conversations_regenerate_path.
+const messageItemUrl = (sid: string, index: number): string =>
+  `${CONV_URL}/${encodeURIComponent(sid)}/messages/${index}`;
+const regenerateUrl = (sid: string): string =>
+  `${CONV_URL}/${encodeURIComponent(sid)}/regenerate`;
 
 // Upload defaults — overridable from /api/webchat/site at boot so an
 // operator who raises max_attachments_per_message on the server side
@@ -224,6 +236,7 @@ type EventType =
   | "session_meta_updated"
   | "history_cleared"
   | "message_added"
+  | "message_deleted"
   | "stream_started"
   | "stream_ended";
 interface ServerEvent {
@@ -532,6 +545,13 @@ msgs.addEventListener("click", (e: MouseEvent) => {
 // because it's untrusted input echoed back to the same DOM. User bubbles
 // may also include an image grid (1..4 attachments) rendered above the
 // text; clicking any thumbnail opens a lightbox with carousel.
+//
+// Return contract: the inner `<div class="msg">` element. Callers (the
+// streaming pipeline, applyEvent, ingestConversationDetail, etc.) hold
+// the returned reference to mutate the bubble in place (innerHTML swap,
+// classList tweaks, scrolling). The hover-action row + the user-failure
+// chrome are appended as separate siblings inside an outer row wrapper;
+// they MUST NOT change the returned identity.
 function addMessageBubble(
   role: Role,
   text: string,
@@ -577,9 +597,96 @@ function addMessageBubble(
   if (role === "user" && failure) {
     applyUserFailureChrome(div, text, attachments);
   }
-  msgs.appendChild(div);
+  // Wrap user/bot bubbles in a row container so the hover-action chrome
+  // (.msg-actions) can sit as a sibling next to the bubble without
+  // breaking the bubble's existing align-self anchoring. error/notice
+  // are full-width and explicitly don't get actions — they're
+  // client-side statuses, not server-tracked messages, so delete/copy
+  // semantics don't apply.
+  if (role === "user" || role === "bot") {
+    const row = document.createElement("div");
+    row.className = "msg-row " + role + "-row";
+    // If failure chrome wrapped the bubble already, lift the wrapper
+    // into the row instead of the bare bubble; otherwise put the
+    // bubble directly into the row.
+    const wrapper = div.parentElement && div.parentElement.classList.contains("msg-user-failed")
+      ? div.parentElement
+      : null;
+    if (wrapper) {
+      // applyUserFailureChrome appended a sibling .msg-edit-icon after
+      // the wrapper. Move both into the row so they stay glued.
+      const editIcon = wrapper.nextElementSibling;
+      row.appendChild(wrapper);
+      if (editIcon && (editIcon as HTMLElement).classList?.contains("msg-edit-icon")) {
+        row.appendChild(editIcon);
+      }
+    } else {
+      row.appendChild(div);
+    }
+    row.appendChild(buildMessageActions(role, div));
+    msgs.appendChild(row);
+  } else {
+    msgs.appendChild(div);
+  }
   scrollToEnd();
   return div;
+}
+
+// Build the hover-revealed action row that sits next to a user / bot bubble.
+// Buttons:
+//   - 复制 — always visible (the most common action; users expect it without hover)
+//   - 删除 — hover-revealed; both roles
+//   - 重新生成 — hover-revealed; bot only (no semantic meaning for user turns)
+// Click handlers look up the bubble's current position in the rendered
+// history at click time (via indexOfRenderedBubble) so a delete that's
+// preceded by other deletes / inserts doesn't desync the index.
+function buildMessageActions(role: "user" | "bot", bubble: HTMLDivElement): HTMLDivElement {
+  const actions = document.createElement("div");
+  actions.className = "msg-actions";
+  const copyBtn = document.createElement("button");
+  copyBtn.type = "button";
+  copyBtn.className = "msg-action-btn msg-action-copy";
+  copyBtn.setAttribute("aria-label", "复制消息");
+  copyBtn.title = "复制";
+  copyBtn.innerHTML = ICON_COPY;
+  copyBtn.addEventListener("click", () => {
+    // Re-read from the current store at click time. The bubble's text
+    // can change (regenerate) and the simplest source of truth is the
+    // matching history entry. Fall back to DOM text if for some reason
+    // the lookup misses (defensive — shouldn't happen normally).
+    const idx = indexOfRenderedBubble(bubble);
+    const sess = currentSession();
+    const text = idx >= 0 && sess.history[idx]
+      ? sess.history[idx]!.text
+      : bubble.textContent ?? "";
+    void copyMessage(text, copyBtn);
+  });
+  actions.appendChild(copyBtn);
+
+  const delBtn = document.createElement("button");
+  delBtn.type = "button";
+  delBtn.className = "msg-action-btn msg-action-delete";
+  delBtn.setAttribute("aria-label", "删除消息");
+  delBtn.title = "删除";
+  delBtn.innerHTML = ICON_TRASH;
+  delBtn.addEventListener("click", () => {
+    void deleteMessage(bubble);
+  });
+  actions.appendChild(delBtn);
+
+  if (role === "bot") {
+    const regenBtn = document.createElement("button");
+    regenBtn.type = "button";
+    regenBtn.className = "msg-action-btn msg-action-regen";
+    regenBtn.setAttribute("aria-label", "重新生成");
+    regenBtn.title = "重新生成";
+    regenBtn.innerHTML = ICON_REGEN;
+    regenBtn.addEventListener("click", () => {
+      void regenerateMessage(bubble);
+    });
+    actions.appendChild(regenBtn);
+  }
+  return actions;
 }
 
 // Telegram-style red "!" badge on the LEFT of the bubble (click =
@@ -601,6 +708,12 @@ function applyUserFailureChrome(
   if (bubble.parentElement && bubble.parentElement.classList.contains("msg-user-failed")) {
     return;
   }
+  // parent here is either the .msg-row (post-addMessageBubble) or the
+  // raw message list (when called from addMessageBubble itself, before
+  // the row wrap happens). Both cases work: insertBefore writes the
+  // wrapper into the same parent the bubble currently sits in, and
+  // addMessageBubble's lift-into-row code picks up the wrapper either
+  // way via `div.parentElement.classList.contains("msg-user-failed")`.
   const parent = bubble.parentElement;
   const wrapper = document.createElement("div");
   wrapper.className = "msg-user-failed";
@@ -648,12 +761,41 @@ const ICON_PENCIL = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"`
   + `<path d="M17 3a2.85 2.85 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/>`
   + `<path d="m15 5 4 4"/>`
   + `</svg>`;
+// Per-message action icons. Sized via CSS .msg-action-btn svg.
+//   * copy: stacked-cards "copy to clipboard" pictogram (Lucide Copy)
+//   * trash: outline can with two vertical bars (Lucide Trash2)
+//   * regen: circular arrow + small spark hint to read as "redo" without
+//     visually colliding with the failure-state retry badge (which uses
+//     the same RotateCw pictogram but with red coloring)
+const ICON_COPY = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"`
+  + ` stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">`
+  + `<rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>`
+  + `<path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>`
+  + `</svg>`;
+const ICON_TRASH = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"`
+  + ` stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">`
+  + `<path d="M3 6h18"/>`
+  + `<path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>`
+  + `<path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>`
+  + `<path d="M10 11v6"/>`
+  + `<path d="M14 11v6"/>`
+  + `</svg>`;
+const ICON_REGEN = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"`
+  + ` stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">`
+  + `<path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/>`
+  + `<path d="M21 3v5h-5"/>`
+  + `</svg>`;
 
 // Remove a failed user bubble plus the chrome we wrapped it in
 // (parent wrapper + the trailing edit-icon sibling). Used by retry
 // and edit so the "three-DOM-nodes-act-as-one" detail lives in a
 // single place.
 function removeUserBubbleAndFailureChrome(bubble: HTMLDivElement): void {
+  // Newer DOM: bubble lives inside a .msg-row (added by addMessageBubble).
+  // Removing the row also removes the wrapper, edit-icon, and the
+  // .msg-actions sibling in one shot.
+  const row = bubble.closest<HTMLElement>(".msg-row");
+  if (row) { row.remove(); return; }
   const wrapper = bubble.closest<HTMLElement>(".msg-user-failed");
   if (wrapper) {
     const edit = wrapper.nextElementSibling;
@@ -666,6 +808,14 @@ function removeUserBubbleAndFailureChrome(bubble: HTMLDivElement): void {
   // Defensive: not wrapped (shouldn't happen for failed entries, but
   // a transient race could land here). Remove the bare bubble.
   bubble.remove();
+}
+
+// Remove a streaming / regenerate bubble whose parent might be a
+// .msg-row (post-refactor) or msgs itself (defensive, in case an
+// old code path skipped the wrap). Idempotent — safe to call twice.
+function removeBubbleWithRow(bubble: HTMLElement): void {
+  const row = bubble.closest<HTMLElement>(".msg-row");
+  (row ?? bubble).remove();
 }
 
 // Remove a failed user history entry by matching on (text, ts? — actually
@@ -1025,6 +1175,307 @@ function consumeIfDuplicate(
   return false;
 }
 
+// ---------- Pending-delete dedup buffer ----------
+//
+// Same intent as pendingLocals (drop the matching server event that comes
+// back from our own optimistic action), but the match key is different:
+// deletes don't care about content — two distinct messages with identical
+// text are still distinct deletes — so we key on (sessionId, index, role)
+// instead. Role conversion: the server emits "user"|"assistant" per spec
+// (see EVENT_MESSAGE_DELETED in handlers/conversations.py); the buffer
+// stores the wire form to make matching trivial.
+
+interface PendingLocalDelete {
+  sessionId: string;
+  index: number;
+  role: ServerRole;
+  recordedAtSec: number;
+  expiresAt: number;
+}
+// Short TTL is fine here — peer broadcast typically lands within a second
+// or two; the longer LS_PENDING_LOCALS window exists to absorb LLM-pair
+// emission delays, which don't apply to a delete. 60s leaves plenty of
+// slack for a flaky long-poll without leaking stale entries forever.
+const PENDING_DELETE_TTL_MS = 60_000;
+
+function loadPendingLocalDeletes(): PendingLocalDelete[] {
+  let parsed: unknown = null;
+  try { parsed = JSON.parse(localStorage.getItem(LS_PENDING_LOCAL_DELETES) || "null"); } catch {}
+  if (!Array.isArray(parsed)) return [];
+  const now = Date.now();
+  const out: PendingLocalDelete[] = [];
+  for (const v of parsed) {
+    if (!v || typeof v !== "object") continue;
+    const o = v as Record<string, unknown>;
+    if (typeof o.sessionId !== "string") continue;
+    if (typeof o.index !== "number" || !Number.isInteger(o.index)) continue;
+    if (o.role !== "user" && o.role !== "assistant") continue;
+    if (typeof o.recordedAtSec !== "number") continue;
+    if (typeof o.expiresAt !== "number") continue;
+    if (o.expiresAt < now) continue;
+    out.push({
+      sessionId: o.sessionId,
+      index: o.index,
+      role: o.role as ServerRole,
+      recordedAtSec: o.recordedAtSec,
+      expiresAt: o.expiresAt,
+    });
+  }
+  return out;
+}
+
+const pendingLocalDeletes: PendingLocalDelete[] = loadPendingLocalDeletes();
+
+function savePendingLocalDeletes(): void {
+  try {
+    localStorage.setItem(LS_PENDING_LOCAL_DELETES, JSON.stringify(pendingLocalDeletes));
+  } catch {}
+}
+
+function recordPendingDelete(sessionId: string, index: number, role: ServerRole): void {
+  pendingLocalDeletes.push({
+    sessionId,
+    index,
+    role,
+    recordedAtSec: nowSec(),
+    expiresAt: Date.now() + PENDING_DELETE_TTL_MS,
+  });
+  savePendingLocalDeletes();
+}
+
+function consumeIfDeleteDuplicate(sessionId: string, index: number, role: ServerRole): boolean {
+  const now = Date.now();
+  let mutated = false;
+  for (let i = pendingLocalDeletes.length - 1; i >= 0; i--) {
+    if (pendingLocalDeletes[i]!.expiresAt < now) { pendingLocalDeletes.splice(i, 1); mutated = true; }
+  }
+  for (let i = 0; i < pendingLocalDeletes.length; i++) {
+    const p = pendingLocalDeletes[i]!;
+    if (p.sessionId !== sessionId || p.index !== index || p.role !== role) continue;
+    pendingLocalDeletes.splice(i, 1);
+    savePendingLocalDeletes();
+    return true;
+  }
+  if (mutated) savePendingLocalDeletes();
+  return false;
+}
+
+// ---------- Per-message action handlers ----------
+//
+// All three handlers (copy / delete / regenerate) are wired via
+// buildMessageActions and share these contracts:
+//   * They always read the bubble's current rendered-history index at
+//     click time (indexOfRenderedBubble). Caching it at button-build
+//     time would desync after any preceding delete / insert.
+//   * Network paths use fetchWithTimeout + bearer() + same-origin
+//     credentials, matching runNonStreamingSend.
+//   * 401 always routes through handle401; 409 conversation_locked is
+//     surfaced as a soft notice (the user just needs to wait for the
+//     in-flight chat to finish, not a hard error).
+//   * On success they update store.sessions + replayActive (for delete)
+//     or in-place DOM mutation (for regenerate's bubble swap).
+
+// Find the index of `bubble` among rendered user/bot bubbles in the
+// active message list. Matches the server's `message_index` because the
+// server renders user + assistant messages in the same order we do.
+// Returns -1 if not found (defensive — caller treats as no-op).
+function indexOfRenderedBubble(bubble: HTMLDivElement): number {
+  const list = msgs.querySelectorAll<HTMLDivElement>(".msg.user, .msg.bot");
+  for (let i = 0; i < list.length; i++) {
+    if (list[i] === bubble) return i;
+  }
+  return -1;
+}
+
+// Brief visual confirmation on the action button. Restores the original
+// HTML after a short window so subsequent clicks find the icon again.
+function flashActionButton(btn: HTMLButtonElement, kind: "copied" | "ok"): void {
+  btn.classList.add(kind);
+  window.setTimeout(() => { btn.classList.remove(kind); }, 1200);
+}
+
+async function copyMessage(text: string, btn: HTMLButtonElement): Promise<void> {
+  if (!text) { return; }
+  // navigator.clipboard requires a secure context (HTTPS or localhost);
+  // we lose the API in plain-HTTP intranet deployments. Fall back to a
+  // hidden textarea + document.execCommand to keep parity with the
+  // codeblock copy path.
+  let ok = false;
+  if (navigator.clipboard?.writeText) {
+    try { await navigator.clipboard.writeText(text); ok = true; } catch {}
+  }
+  if (!ok) {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+    } catch {}
+  }
+  if (ok) flashActionButton(btn, "copied");
+}
+
+async function deleteMessage(bubble: HTMLDivElement): Promise<void> {
+  const idx = indexOfRenderedBubble(bubble);
+  if (idx < 0) return;
+  const sess = currentSession();
+  if (!sess.history[idx]) return;
+  const sid = sess.id;
+  const role = sess.history[idx]!.role;
+  if (role !== "user" && role !== "bot") return;
+  const wireRole: ServerRole = role === "bot" ? "assistant" : "user";
+  if (!confirm("删除该消息？")) return;
+  let resp: Response;
+  try {
+    resp = await fetchWithTimeout(
+      messageItemUrl(sid, idx),
+      { method: "DELETE", credentials: "same-origin", headers: bearer() },
+      FETCH_TIMEOUT_FAST_MS,
+    );
+  } catch {
+    addMessageBubble("error", "删除失败，请检查网络。");
+    return;
+  }
+  let payload: Record<string, unknown> = {};
+  try { payload = await resp.json(); } catch {}
+  if (resp.status === 401) { handle401(); return; }
+  if (resp.status === 409 && (payload.error as string) === "conversation_locked") {
+    addMessageBubble("notice", "正在处理中，稍候。");
+    return;
+  }
+  if (resp.status === 404) {
+    // The message is already gone on the server (peer device beat us).
+    // Splice locally + replay so the UI matches what the server believes.
+    const sNow = store.sessions[sid];
+    if (sNow && sNow.history[idx]) {
+      sNow.history.splice(idx, 1);
+      sNow.lastActiveAt = Date.now();
+      saveStore();
+      if (sid === store.activeId) replayActive();
+      renderSessionList();
+    }
+    return;
+  }
+  if (!resp.ok) {
+    addMessageBubble("error", `删除失败 (${resp.status})。`);
+    return;
+  }
+  // Optimistic local splice + dedup record. We splice BEFORE the server's
+  // message_deleted event lands (it'll come back through long-poll and
+  // get dropped by consumeIfDeleteDuplicate). replayActive re-renders
+  // the whole list so all subsequent message_index references stay
+  // aligned with the new history; this is the same pattern as
+  // history_cleared and is cheap relative to a single fetch round-trip.
+  const sNow = store.sessions[sid];
+  if (sNow && sNow.history[idx]) {
+    sNow.history.splice(idx, 1);
+    sNow.lastActiveAt = Date.now();
+    saveStore();
+    if (sid === store.activeId) replayActive();
+    renderSessionList();
+  }
+  recordPendingDelete(sid, idx, wireRole);
+}
+
+async function regenerateMessage(bubble: HTMLDivElement): Promise<void> {
+  const idx = indexOfRenderedBubble(bubble);
+  if (idx < 0) return;
+  const sess = currentSession();
+  const item = sess.history[idx];
+  if (!item || item.role !== "bot") return;
+  const sid = sess.id;
+  // Race-guard: don't fire if a /chat/stream is already in flight for
+  // this session (server would 409 us, but failing fast is friendlier).
+  if (sync.streamAbort) {
+    addMessageBubble("notice", "正在处理中，稍候。");
+    return;
+  }
+  bubble.classList.add("regenerating");
+  // Disable the action buttons inside this row so the user can't fire
+  // a second regenerate / delete while the first is pending.
+  const row = bubble.closest<HTMLElement>(".msg-row");
+  const actionBtns = row
+    ? Array.from(row.querySelectorAll<HTMLButtonElement>(".msg-action-btn"))
+    : [];
+  for (const b of actionBtns) b.disabled = true;
+  let resp: Response;
+  try {
+    resp = await fetchWithTimeout(
+      regenerateUrl(sid),
+      {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json", ...bearer() },
+        body: JSON.stringify({ message_index: idx }),
+      },
+      FETCH_TIMEOUT_CHAT_MS,
+    );
+  } catch {
+    bubble.classList.remove("regenerating");
+    for (const b of actionBtns) b.disabled = false;
+    addMessageBubble("error", "重新生成失败，请检查网络。");
+    return;
+  }
+  let payload: Record<string, unknown> = {};
+  try { payload = await resp.json(); } catch {}
+  bubble.classList.remove("regenerating");
+  for (const b of actionBtns) b.disabled = false;
+  if (resp.status === 401) { handle401(); return; }
+  if (resp.status === 409 && (payload.error as string) === "conversation_locked") {
+    addMessageBubble("notice", "正在处理中，稍候。");
+    return;
+  }
+  if (resp.status === 429 && (payload.error as string) === "quota_exceeded") {
+    setBadge(0, payload.daily_quota as number);
+    addMessageBubble("notice", "今日额度已用完，明日 0 点重置。");
+    return;
+  }
+  if (resp.status === 404) {
+    addMessageBubble("error", "原消息已不存在。");
+    return;
+  }
+  if (resp.status === 502 || resp.status === 504) {
+    const code = (payload.error as string) || "";
+    addMessageBubble("error", streamErrorCopy(code));
+    return;
+  }
+  if (!resp.ok) {
+    const code = (payload.error as string) || `http_${resp.status}`;
+    addMessageBubble("error", `重新生成失败: ${code}`);
+    return;
+  }
+  const reply = (payload.reply as string) || "(空回复)";
+  setBadge(payload.remaining as number, payload.daily_quota as number);
+  // The server truncates raw history to [0, message_index) then appends
+  // the new reply, so mirror locally: drop everything from idx onward
+  // and push the new bot entry at idx. For the common case (regenerate
+  // the LAST bot reply) this is identical to an in-place swap; for the
+  // mid-conversation case (rare — user kept chatting past this bot
+  // turn, then went back to regenerate) it keeps history aligned with
+  // what the server now believes. Either way we replayActive so the
+  // DOM reflects the new shape.
+  const sNow = store.sessions[sid];
+  if (sNow) {
+    sNow.history.length = idx;
+    sNow.history.push({
+      role: "bot",
+      text: reply,
+      ts: Date.now(),
+    });
+    sNow.lastActiveAt = Date.now();
+    saveStore();
+    if (sid === store.activeId) replayActive();
+  }
+  recordOptimistic(sid, "assistant", reply);
+  recordPendingDelete(sid, idx, "assistant");
+  renderSessionList();
+}
+
 // ---------- Apply events ----------
 
 function applyEvent(ev: ServerEvent): void {
@@ -1190,13 +1641,48 @@ function applyEvent(ev: ServerEvent): void {
         if (role === "assistant") {
           const streamingBubble = msgs.querySelector(".msg.bot.streaming");
           if (streamingBubble) {
-            streamingBubble.remove();
+            // streamingBubble lives inside .msg-row (wrapped by
+            // attachStreamingBubble). Remove the row so the action
+            // chrome doesn't orphan.
+            const row = streamingBubble.closest(".msg-row");
+            (row ?? streamingBubble).remove();
             sync.streamFinalizeSuppressed[sid] = true;
           }
         }
         addMessageBubble(localRole, content, item.attachments);
         if (item.incomplete) appendIncompleteNoticeToLastBubble();
       }
+      break;
+    }
+    case "message_deleted": {
+      const rawIndex = payload["index"];
+      const rawRole = payload["role"];
+      if (typeof rawIndex !== "number" || !Number.isInteger(rawIndex) || rawIndex < 0) break;
+      if (rawRole !== "user" && rawRole !== "assistant") break;
+      // Dedup: this device just issued the delete (via deleteMessage or
+      // regenerate's truncate). Bump lastActiveAt for sidebar ordering
+      // but skip the splice + replay — replayActive already ran when
+      // the optimistic delete completed.
+      if (consumeIfDeleteDuplicate(sid, rawIndex, rawRole as ServerRole)) {
+        const s = store.sessions[sid];
+        if (s) s.lastActiveAt = Math.max(s.lastActiveAt, ev.ts * 1000);
+        break;
+      }
+      const sess = store.sessions[sid];
+      if (!sess) break;
+      // The peer device deleted the message; mirror locally.
+      // Defensive bounds + role check: a stale long-poll batch from
+      // before a cold refetch could carry an index that's out of range
+      // for our current view of history (already trimmed on this device).
+      // Treat that as a no-op rather than crashing or silently splicing
+      // the wrong message.
+      const target = sess.history[rawIndex];
+      if (!target) break;
+      const expectedLocalRole: Role = rawRole === "assistant" ? "bot" : "user";
+      if (target.role !== expectedLocalRole) break;
+      sess.history.splice(rawIndex, 1);
+      sess.lastActiveAt = ev.ts * 1000;
+      if (sid === store.activeId) replayActive();
       break;
     }
     case "stream_started": {
@@ -1463,6 +1949,10 @@ function handle401(): void {
   // legitimate message_added on the new login.
   localStorage.removeItem(LS_PENDING_LOCALS);
   pendingLocals.length = 0;
+  // Pending-delete dedup entries are also keyed on the old token's
+  // session indices; clear them so the new login starts clean.
+  localStorage.removeItem(LS_PENDING_LOCAL_DELETES);
+  pendingLocalDeletes.length = 0;
   location.replace("/login");
 }
 
@@ -2867,7 +3357,14 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
   caretSpan.setAttribute("aria-hidden", "true");
   bubble.appendChild(streamTextNode);
   bubble.appendChild(caretSpan);
-  msgs.appendChild(bubble);
+  // Wrap in a .msg-row from the start so the hover-action chrome is
+  // already in place when streaming finishes. CSS hides .msg-actions
+  // while the bubble carries the .streaming class — see styles.css.
+  const streamRow = document.createElement("div");
+  streamRow.className = "msg-row bot-row";
+  streamRow.appendChild(bubble);
+  streamRow.appendChild(buildMessageActions("bot", bubble));
+  msgs.appendChild(streamRow);
   scrollToEnd();
 
   // Resume-from-refresh seed: the user already saw `initialText` rendered
@@ -3021,7 +3518,7 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
     // relying on Date.now() vs server ts comparisons.
     if (sync.streamFinalizeSuppressed[sid]) {
       delete sync.streamFinalizeSuppressed[sid];
-      bubble.remove();
+      removeBubbleWithRow(bubble);
       return;
     }
     flushRender();
@@ -3054,7 +3551,7 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
         (h) => h.role === "bot" && h.text === snapshot.pending && (Date.now() - h.ts) < 30_000,
       );
       if (echoedByEvent) {
-        bubble.remove();
+        removeBubbleWithRow(bubble);
         return;
       }
       const item: HistoryItem = { role: "bot", text: snapshot.pending, ts: Date.now() };
@@ -3080,7 +3577,7 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
   // pre-first-chunk and we're falling back to /chat.
   const discardBubble = (): void => {
     cancelRender();
-    bubble.remove();
+    removeBubbleWithRow(bubble);
     clearPending();
   };
 

@@ -149,6 +149,7 @@ class WebChatGatewayPlugin(Star):
                 cm=self.context.conversation_manager,
                 file_store=file_store,
                 concurrency=concurrency,
+                llm_bridge=llm_bridge,
             )
 
             # Streaming buffer + registry. Redis backend is opt-in via

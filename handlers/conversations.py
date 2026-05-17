@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,7 @@ from ..core.event_bus import EventBus
 from ..core.file_lifecycle import release_files_safely
 from ..core.file_store import FileStore
 from ..core.ip_guard import IpGuard
+from ..core.llm_bridge import LlmBridge
 from ..core.ratelimit import PerTokenConcurrency
 from ..storage.base import (
     _UNSET,
@@ -72,6 +74,7 @@ _MAX_LONG_POLL_PER_TOKEN = 8
 EVENT_SESSION_CREATED = "session_created"
 EVENT_SESSION_META_UPDATED = "session_meta_updated"
 EVENT_MESSAGE_ADDED = "message_added"
+EVENT_MESSAGE_DELETED = "message_deleted"
 EVENT_HISTORY_CLEARED = "history_cleared"
 EVENT_STREAM_STARTED = "stream_started"
 EVENT_STREAM_ENDED = "stream_ended"
@@ -134,6 +137,16 @@ class EventsResult:
     last_pts: int
     has_more: bool
     too_far: bool = False
+
+
+@dataclass(frozen=True)
+class RegenerateResult:
+    """Outcome of `regenerate_assistant_message` — the new assistant text
+    plus the quota state the HTTP layer surfaces to the client."""
+
+    reply: str
+    remaining: int
+    daily_quota: int
 
 
 # ----- helpers -----
@@ -268,6 +281,7 @@ class ConversationService:
         cm: Any,
         file_store: FileStore,
         concurrency: PerTokenConcurrency | None = None,
+        llm_bridge: LlmBridge | None = None,
     ) -> None:
         self._storage = storage
         self._audit = audit
@@ -278,10 +292,97 @@ class ConversationService:
         # while a /chat/stream is in flight for the same token. See
         # ConversationDeps.concurrency for the race rationale.
         self._concurrency = concurrency
+        # Optional — required by regenerate_assistant_message. None is
+        # allowed so tests that don't exercise regenerate can construct
+        # the service without spinning up an AstrBot context.
+        self._llm_bridge = llm_bridge
 
     @staticmethod
     def _now() -> int:
         return int(time.time())
+
+    async def _cm_history_raw(
+        self, *, token_name: str, session_id: str
+    ) -> tuple[list[Any], str | None]:
+        """Return the raw CM history list (NOT `_normalize_history`'d) and
+        the conversation_id. Returns `([], None)` if no conversation exists
+        and `([], cid)` if the conversation exists but has no history.
+
+        The raw list is the canonical wire format CM stores: each item is
+        a dict like `{"role": "user", "content": [...segments...]}` where
+        `content` may be a string or a list of segment dicts. The
+        delete/regenerate paths need this unfiltered shape so they can
+        splice a single entry out and write the resulting list back via
+        `update_conversation(history=<list>)` without disturbing any
+        system / tool-call entries that `_normalize_history` would have
+        dropped from the user-facing rendering.
+        """
+        umo = _umo(token_name, session_id)
+        try:
+            cid = await self._cm.get_curr_conversation_id(umo)
+        except Exception:
+            logger.exception(
+                "[WebChatGateway] CM.get_curr_conversation_id failed"
+            )
+            return [], None
+        if not cid:
+            return [], None
+        try:
+            conv = await self._cm.get_conversation(umo, cid)
+        except Exception:
+            logger.exception("[WebChatGateway] CM.get_conversation failed")
+            return [], cid
+        if not conv:
+            return [], cid
+        history_raw = getattr(conv, "history", None)
+        if isinstance(history_raw, str):
+            try:
+                parsed = json.loads(history_raw or "[]")
+            except (TypeError, ValueError):
+                parsed = []
+        else:
+            parsed = history_raw or []
+        if not isinstance(parsed, list):
+            return [], cid
+        return parsed, cid
+
+    @staticmethod
+    def _render_to_raw_indices(raw: list[Any]) -> list[int]:
+        """Map rendered-history indices (what the client sees) to raw-CM
+        indices.
+
+        `_normalize_history` filters the raw CM list by dropping non-
+        user/assistant roles and empty-content assistant turns. The
+        delete/regenerate endpoints accept a `message_index` that is
+        0-based into the RENDERED list (because that's what the client
+        actually sees and can point at). To splice the raw CM list, we
+        need the inverse mapping.
+
+        Returns a list where `out[rendered_idx] == raw_idx`. If a
+        rendered index has no surviving entry the list is shorter than
+        the rendered history — callers should bounds-check on
+        `len(out)`, which equals the size of `_normalize_history(raw)`.
+        """
+        out: list[int] = []
+        for i, item in enumerate(raw):
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "").strip().lower()
+            if role not in ("user", "assistant"):
+                continue
+            text = _extract_text(item.get("content"))
+            file_ids = (
+                _extract_attachment_file_ids(item.get("content"))
+                if role == "user"
+                else []
+            )
+            # Mirror `_normalize_history`'s drop rules verbatim. Empty-text
+            # user messages with no attachments are still preserved (image-
+            # only "look at this" turns); empty assistant messages are dropped.
+            if not text and role != "user" and not file_ids:
+                continue
+            out.append(i)
+        return out
 
     async def _cm_history(
         self, *, token_name: str, session_id: str
@@ -930,6 +1031,516 @@ class ConversationService:
             detail={"session_id": session_id},
         )
         return row
+
+    async def delete_message_by_index(
+        self,
+        *,
+        token_name: str,
+        session_id: str,
+        message_index: int,
+        ip: str | None = None,
+    ) -> SessionMetaRow:
+        """Delete a single message at `message_index` (0-based into the
+        client-visible rendered history) from CM history, release any
+        attachment files no longer referenced by the surviving history,
+        and emit a `message_deleted` event for peers.
+
+        Acquires the per-token concurrency lock; raises
+        `ServiceError("conversation_locked", 409)` on contention (a
+        `/chat/stream` in flight on the same token). Raises
+        `ServiceError("session_not_found", 404)` if the session has no
+        CM conversation or `("message_not_found", 404)` if the index is
+        out of range.
+
+        File release uses the same `release_files_safely` helper as
+        `clear_history`. A file_id is only released when NO surviving
+        message in the truncated history still references it — this
+        protects against the case where a user re-uses an attachment
+        across two messages (rare, but possible via copy-paste). The
+        check walks the spliced raw CM list once after the splice.
+        """
+        if self._concurrency is None:
+            # Defensive: ConversationDeps always wires this in real
+            # deployments. Without the lock a stream race could write a
+            # CM ImageURLPart pointing at a file we're about to release.
+            return await self._delete_message_inner(
+                token_name=token_name,
+                session_id=session_id,
+                message_index=message_index,
+                ip=ip,
+            )
+        async with self._concurrency.acquire(token_name) as acquired:
+            if not acquired:
+                raise ServiceError("conversation_locked", status=409)
+            return await self._delete_message_inner(
+                token_name=token_name,
+                session_id=session_id,
+                message_index=message_index,
+                ip=ip,
+            )
+
+    async def _delete_message_inner(
+        self,
+        *,
+        token_name: str,
+        session_id: str,
+        message_index: int,
+        ip: str | None,
+    ) -> SessionMetaRow:
+        raw_history, cid = await self._cm_history_raw(
+            token_name=token_name, session_id=session_id
+        )
+        if not cid or not raw_history:
+            raise ServiceError("session_not_found", status=404)
+        rendered_to_raw = self._render_to_raw_indices(raw_history)
+        if (
+            message_index < 0
+            or message_index >= len(rendered_to_raw)
+        ):
+            raise ServiceError("message_not_found", status=404)
+        raw_idx = rendered_to_raw[message_index]
+        removed_entry = raw_history[raw_idx]
+        removed_role = (
+            str(removed_entry.get("role") or "").strip().lower()
+            if isinstance(removed_entry, dict)
+            else ""
+        )
+        if removed_role not in ("user", "assistant"):
+            # Defensive: _render_to_raw_indices already filters non-
+            # user/assistant out, but if the raw shape ever drifts we'd
+            # rather 404 than crash here.
+            raise ServiceError("message_not_found", status=404)
+
+        # Splice the raw list in place. Keep all non-rendered entries
+        # (system / tool calls) intact — we only drop the one chosen
+        # by message_index.
+        new_history = list(raw_history)
+        del new_history[raw_idx]
+
+        try:
+            await self._cm.update_conversation(
+                unified_msg_origin=_umo(token_name, session_id),
+                conversation_id=cid,
+                history=new_history,
+            )
+        except Exception:
+            logger.exception(
+                "[WebChatGateway] CM.update_conversation(delete) failed"
+            )
+            raise ServiceError("delete_failed", status=500) from None
+
+        # File release: only drop files that are NO LONGER referenced
+        # by any surviving message. Walk the spliced raw list once and
+        # subtract surviving file_ids from `removed_file_ids` to keep
+        # the cross-message-reuse case correct.
+        removed_file_ids: set[str] = set()
+        if removed_role == "user" and isinstance(removed_entry, dict):
+            for fid in _extract_attachment_file_ids(removed_entry.get("content")):
+                removed_file_ids.add(fid)
+        if removed_file_ids:
+            still_referenced: set[str] = set()
+            for surviving in new_history:
+                if not isinstance(surviving, dict):
+                    continue
+                if (
+                    str(surviving.get("role") or "").strip().lower()
+                    != "user"
+                ):
+                    continue
+                for fid in _extract_attachment_file_ids(
+                    surviving.get("content")
+                ):
+                    still_referenced.add(fid)
+            to_release_ids = removed_file_ids - still_referenced
+            if to_release_ids:
+                try:
+                    session_files = (
+                        await self._storage.list_files_for_session(
+                            token_name=token_name, session_id=session_id
+                        )
+                    )
+                except Exception:
+                    logger.exception(
+                        "[WebChatGateway] list_files_for_session during "
+                        "message delete failed"
+                    )
+                    session_files = []
+                rows_to_release = [
+                    r for r in session_files if r.file_id in to_release_ids
+                ]
+                if rows_to_release:
+                    await release_files_safely(
+                        storage=self._storage,
+                        file_store=self._file_store,
+                        rows=rows_to_release,
+                        log_label="delete_message_by_index",
+                    )
+
+        # Recompute message_count + preview from the new rendered view
+        # so peer `list_conversations` calls reflect the deletion. The
+        # delete event itself does NOT carry count/preview — the client
+        # recomputes locally; the meta cache is for cold sidebar loads.
+        new_rendered = _normalize_history(new_history)
+        new_count = len(new_rendered)
+        preview_text = (
+            _extract_text(new_history[-1].get("content"))
+            if new_history
+            and isinstance(new_history[-1], dict)
+            else ""
+        )
+        # If the trailing raw entry is non-renderable (e.g. tool call),
+        # walk back to the last user/assistant text for a meaningful
+        # sidebar preview. Empty preview falls through harmlessly.
+        if not preview_text and new_rendered:
+            preview_text = new_rendered[-1].get("content") or ""
+        now = self._now()
+        row = await self._storage.upsert_session_meta(
+            token_name=token_name,
+            session_id=session_id,
+            message_count=new_count,
+            preview=preview_text[:_PREVIEW_CHARS],
+            now=now,
+        )
+        await self._storage.append_updates(
+            token_name=token_name,
+            events=[
+                NewEvent(
+                    event_type=EVENT_MESSAGE_DELETED,
+                    session_id=session_id,
+                    payload=json.dumps(
+                        {"index": message_index, "role": removed_role},
+                        ensure_ascii=False,
+                    ),
+                )
+            ],
+            now=now,
+        )
+        await self._event_bus.notify(token_name)
+        await self._audit.write(
+            "conv_message_deleted",
+            name=token_name,
+            ip=ip,
+            detail={
+                "session_id": session_id,
+                "index": message_index,
+                "role": removed_role,
+            },
+        )
+        return row
+
+    async def regenerate_assistant_message(
+        self,
+        *,
+        token_name: str,
+        session_id: str,
+        message_index: int,
+        username: str = "WebUser",
+        token_daily_quota: int,
+        ip: str | None = None,
+    ) -> RegenerateResult:
+        """Drop the assistant message at `message_index` (0-based into the
+        rendered history), truncate CM history to `[0, message_index)`, run
+        the non-streaming LLM call on the truncated context, append the new
+        assistant reply, and emit `message_deleted` + `message_added` events.
+
+        Acquires the per-token concurrency lock; raises
+        `ServiceError("conversation_locked", 409)` on contention.
+
+        Raises `ServiceError("session_not_found", 404)` if no conversation
+        exists for the session; `("message_not_found", 404)` if the index
+        is out of range OR the message at that index isn't an assistant
+        turn; `("quota_exceeded", 429)` if the token's daily quota is hit;
+        propagates `("llm_timeout", 504)` / `("empty_reply", 502)` /
+        `("llm_call_failed", 500)` for upstream LLM failures (file release
+        on failure is documented inline). `token_daily_quota` is the
+        TokenRow's `daily_quota` — passed in rather than re-fetched here
+        so the handler can keep auth and service concerns separate.
+
+        `username` is passed through to `LlmBridge.generate_reply` so the
+        provider's prompt builder uses the same `[Current User Message]`
+        framing as the original /chat call. Defaults to "WebUser" to
+        match the chat handler's default when the client doesn't supply
+        one.
+        """
+        if self._llm_bridge is None:
+            # Defensive — main.py always wires this. A missing bridge
+            # is a deployment bug, not a runtime condition the user
+            # should see.
+            raise ServiceError("internal_error", status=500)
+        if self._concurrency is None:
+            return await self._regenerate_inner(
+                token_name=token_name,
+                session_id=session_id,
+                message_index=message_index,
+                username=username,
+                token_daily_quota=token_daily_quota,
+                ip=ip,
+            )
+        async with self._concurrency.acquire(token_name) as acquired:
+            if not acquired:
+                raise ServiceError("conversation_locked", status=409)
+            return await self._regenerate_inner(
+                token_name=token_name,
+                session_id=session_id,
+                message_index=message_index,
+                username=username,
+                token_daily_quota=token_daily_quota,
+                ip=ip,
+            )
+
+    async def _regenerate_inner(
+        self,
+        *,
+        token_name: str,
+        session_id: str,
+        message_index: int,
+        username: str,
+        token_daily_quota: int,
+        ip: str | None,
+    ) -> RegenerateResult:
+        raw_history, cid = await self._cm_history_raw(
+            token_name=token_name, session_id=session_id
+        )
+        if not cid or not raw_history:
+            raise ServiceError("session_not_found", status=404)
+        rendered_to_raw = self._render_to_raw_indices(raw_history)
+        if (
+            message_index < 0
+            or message_index >= len(rendered_to_raw)
+        ):
+            raise ServiceError("message_not_found", status=404)
+        target_raw_idx = rendered_to_raw[message_index]
+        target_entry = raw_history[target_raw_idx]
+        target_role = (
+            str(target_entry.get("role") or "").strip().lower()
+            if isinstance(target_entry, dict)
+            else ""
+        )
+        if target_role != "assistant":
+            # Per spec: only assistant messages can be regenerated. The
+            # preceding user turn stays in place and is fed back to the
+            # LLM as fresh context.
+            raise ServiceError("message_not_found", status=404)
+
+        # Recover the most recent user message text from the surviving
+        # rendered history. LlmBridge.generate_reply requires a
+        # `message` kwarg — it's framed as `[Current User Message]` in
+        # the prompt. The user that prompted this assistant reply is
+        # the last user entry in raw_history[:target_raw_idx]; if none
+        # exists (rare — assistant at the start of the conversation,
+        # possible via tool-call only context) we 404 since there's no
+        # message to regenerate from.
+        last_user_text = ""
+        for entry in reversed(raw_history[:target_raw_idx]):
+            if not isinstance(entry, dict):
+                continue
+            if (
+                str(entry.get("role") or "").strip().lower()
+                == "user"
+            ):
+                last_user_text = _extract_text(entry.get("content"))
+                break
+        if not last_user_text:
+            raise ServiceError("message_not_found", status=404)
+
+        # Truncate CM history to [0, target_raw_idx) and persist BEFORE
+        # the LLM call. LlmBridge.generate_reply reads from CM via
+        # `_history_text`; with the truncated history in place the
+        # provider sees the right context.
+        truncated_history = raw_history[:target_raw_idx]
+        umo = _umo(token_name, session_id)
+        try:
+            await self._cm.update_conversation(
+                unified_msg_origin=umo,
+                conversation_id=cid,
+                history=truncated_history,
+            )
+        except Exception:
+            logger.exception(
+                "[WebChatGateway] CM.update_conversation(regenerate truncate)"
+                " failed"
+            )
+            raise ServiceError("regenerate_failed", status=500) from None
+
+        # Quota check + LLM call. Quota is read-then-increment; the
+        # per-token concurrency lock we're holding makes that safe
+        # (single-flight per token).
+        today = date.today()
+        try:
+            today_count = await self._storage.get_today_usage(
+                token_name, day=today
+            )
+        except Exception:
+            logger.exception(
+                "[WebChatGateway] get_today_usage during regenerate failed"
+            )
+            today_count = 0
+        if today_count >= token_daily_quota:
+            await self._audit.write(
+                "quota_exceeded",
+                name=token_name,
+                ip=ip,
+                detail={
+                    "today_count": today_count,
+                    "quota": token_daily_quota,
+                    "operation": "regenerate",
+                },
+            )
+            raise ServiceError("quota_exceeded", status=429)
+
+        try:
+            reply = await self._llm_bridge.generate_reply(
+                token_name=token_name,
+                session_id=session_id,
+                username=username,
+                message=last_user_text,
+                image_urls=None,
+            )
+        except RuntimeError as exc:
+            code = str(exc)
+            if code == "llm_timeout":
+                await self._audit.write(
+                    "llm_timeout",
+                    name=token_name,
+                    ip=ip,
+                    detail={"operation": "regenerate"},
+                )
+                raise ServiceError("llm_timeout", status=504) from None
+            if code == "empty_reply":
+                await self._audit.write(
+                    "chat_empty_reply",
+                    name=token_name,
+                    ip=ip,
+                    detail={"operation": "regenerate"},
+                )
+                raise ServiceError("empty_reply", status=502) from None
+            logger.exception(
+                "[WebChatGateway] regenerate LLM call failed"
+            )
+            await self._audit.write(
+                "chat_error",
+                name=token_name,
+                ip=ip,
+                detail={
+                    "operation": "regenerate",
+                    "error": code[:200],
+                },
+            )
+            raise ServiceError("llm_call_failed", status=500) from None
+        except Exception as exc:
+            logger.exception(
+                "[WebChatGateway] regenerate LLM call failed"
+            )
+            await self._audit.write(
+                "chat_error",
+                name=token_name,
+                ip=ip,
+                detail={
+                    "operation": "regenerate",
+                    "error": str(exc)[:200],
+                },
+            )
+            raise ServiceError("llm_call_failed", status=500) from None
+
+        # LLM succeeded — append the new assistant reply to the
+        # truncated history. We build a CM-shaped entry directly
+        # (matching `_cm_persist_pair`'s `AssistantMessageSegment(
+        # content=[TextPart(text=...)])` wire format) and write the
+        # full list back. Using `update_conversation` rather than
+        # `add_message_pair` avoids appending a phantom empty user
+        # turn (the existing user is already at target_raw_idx-1).
+        new_assistant_entry: dict[str, Any] = {
+            "role": "assistant",
+            "content": [{"type": "text", "text": reply}],
+        }
+        final_history = truncated_history + [new_assistant_entry]
+        try:
+            await self._cm.update_conversation(
+                unified_msg_origin=umo,
+                conversation_id=cid,
+                history=final_history,
+            )
+        except Exception:
+            logger.exception(
+                "[WebChatGateway] CM.update_conversation(regenerate write)"
+                " failed"
+            )
+            raise ServiceError("regenerate_failed", status=500) from None
+
+        # Increment quota AFTER the CM write succeeds — matches /chat
+        # ordering (LLM → CM → usage → audit). A crash between LLM
+        # and usage-increment leaves the user with a regenerated
+        # reply persisted but not counted; that's strictly preferable
+        # to the inverse (charged for a reply that was never persisted).
+        try:
+            new_count = await self._storage.increment_daily_usage(
+                token_name, day=today
+            )
+        except Exception:
+            logger.exception(
+                "[WebChatGateway] increment_daily_usage during regenerate failed"
+            )
+            new_count = today_count + 1
+        remaining = max(0, token_daily_quota - new_count)
+
+        # Update session meta — net message count is unchanged (delete 1,
+        # add 1) but updated_at + preview need to refresh. The new
+        # rendered history is recomputed so a non-renderable trailing
+        # entry doesn't desync the count cache.
+        new_rendered = _normalize_history(final_history)
+        new_meta_count = len(new_rendered)
+        preview_text = reply[:_PREVIEW_CHARS]
+        now = self._now()
+        await self._storage.upsert_session_meta(
+            token_name=token_name,
+            session_id=session_id,
+            message_count=new_meta_count,
+            preview=preview_text,
+            now=now,
+        )
+
+        # Emit message_deleted FIRST then message_added — peers apply
+        # the splice before the insertion so the new assistant lands
+        # at the same `message_index` slot the old one occupied.
+        await self._storage.append_updates(
+            token_name=token_name,
+            events=[
+                NewEvent(
+                    event_type=EVENT_MESSAGE_DELETED,
+                    session_id=session_id,
+                    payload=json.dumps(
+                        {"index": message_index, "role": "assistant"},
+                        ensure_ascii=False,
+                    ),
+                ),
+                NewEvent(
+                    event_type=EVENT_MESSAGE_ADDED,
+                    session_id=session_id,
+                    payload=json.dumps(
+                        {"role": "assistant", "content": reply},
+                        ensure_ascii=False,
+                    ),
+                ),
+            ],
+            now=now,
+        )
+        await self._event_bus.notify(token_name)
+        await self._audit.write(
+            "conv_message_regenerated",
+            name=token_name,
+            ip=ip,
+            detail={
+                "session_id": session_id,
+                "index": message_index,
+                "reply_len": len(reply),
+                "remaining": remaining,
+            },
+        )
+        return RegenerateResult(
+            reply=reply,
+            remaining=remaining,
+            daily_quota=token_daily_quota,
+        )
 
     async def record_chat_pair(
         self,
@@ -1703,6 +2314,140 @@ def make_conversation_handlers(
             extra_headers={"Cache-Control": "no-store"},
         )
 
+    async def delete_message(request: web.Request) -> web.Response:
+        """DELETE {prefix}/conversations/{session_id}/messages/{message_index}
+
+        Splices a single message at `message_index` (0-based into the
+        rendered history) out of CM history. Releases attachment files no
+        longer referenced by the surviving messages. Emits a
+        `message_deleted` event for peers.
+
+        Responses:
+          200 `{ok: true}` — deleted.
+          400 `{error: "invalid_payload"}` — bad session_id or index.
+          401 — auth gate.
+          404 `{error: "session_not_found"|"message_not_found"}`.
+          409 `{error: "conversation_locked"}` — stream in-flight.
+          500 `{error: "internal_error"|"delete_failed"}`.
+        """
+        gated = await gate_request(request, deps)
+        if isinstance(gated, web.Response):
+            return gated
+        session_id = (request.match_info.get("session_id") or "").strip()[:128]
+        if not session_id:
+            return _err(
+                request, gated.origin, ServiceError("invalid_payload", status=400)
+            )
+        raw_index = request.match_info.get("message_index") or ""
+        try:
+            message_index = int(raw_index)
+        except (TypeError, ValueError):
+            return _err(
+                request, gated.origin, ServiceError("invalid_payload", status=400)
+            )
+        try:
+            await service.delete_message_by_index(
+                token_name=gated.token.name,
+                session_id=session_id,
+                message_index=message_index,
+                ip=gated.ip,
+            )
+        except ServiceError as exc:
+            return _err(request, gated.origin, exc)
+        except Exception:
+            logger.exception("[WebChatGateway] delete_message failed")
+            return _err(
+                request, gated.origin, ServiceError("internal_error", status=500)
+            )
+        return json_response(
+            {"ok": True},
+            origin=gated.origin,
+            allowed_origins=gated.allowed,
+            same_origin_host=gated.same_host,
+        )
+
+    async def regenerate_message(request: web.Request) -> web.Response:
+        """POST {prefix}/conversations/{session_id}/regenerate
+
+        Body: `{"message_index": int}` — index of the assistant message
+        to regenerate. The user message preceding it stays. The endpoint
+        truncates CM history to `[0, message_index)`, runs the
+        non-streaming LLM call, appends the new assistant reply, and
+        emits `message_deleted` + `message_added` events for peers.
+
+        Responses:
+          200 `{ok: true, reply: str, remaining: int, daily_quota: int}`.
+          400 `{error: "invalid_payload"|"invalid_json"}`.
+          401 — auth gate.
+          404 `{error: "session_not_found"|"message_not_found"}`.
+          409 `{error: "conversation_locked"}` — another in-flight op.
+          429 `{error: "quota_exceeded"}` — daily quota hit.
+          502 `{error: "empty_reply"}` — provider returned no tokens.
+          504 `{error: "llm_timeout"}` — provider stalled.
+          500 `{error: "llm_call_failed"|"regenerate_failed"|"internal_error"}`.
+        """
+        gated = await gate_request(request, deps)
+        if isinstance(gated, web.Response):
+            return gated
+        session_id = (request.match_info.get("session_id") or "").strip()[:128]
+        if not session_id:
+            return _err(
+                request, gated.origin, ServiceError("invalid_payload", status=400)
+            )
+        try:
+            body = await request.json()
+        except web.HTTPRequestEntityTooLarge:
+            return _err(
+                request, gated.origin, ServiceError("payload_too_large", status=413)
+            )
+        except (json.JSONDecodeError, ValueError):
+            return _err(
+                request, gated.origin, ServiceError("invalid_json", status=400)
+            )
+        except Exception:
+            logger.exception("[WebChatGateway] regenerate parse failed")
+            return _err(
+                request, gated.origin, ServiceError("invalid_json", status=400)
+            )
+        if not isinstance(body, dict):
+            return _err(
+                request, gated.origin, ServiceError("invalid_payload", status=400)
+            )
+        raw_index = body.get("message_index")
+        if not isinstance(raw_index, int) or isinstance(raw_index, bool):
+            # Reject bool (json would parse `true` as a number-like value
+            # in some loose checks) AND non-int. Negative indices are
+            # caught downstream as message_not_found.
+            return _err(
+                request, gated.origin, ServiceError("invalid_payload", status=400)
+            )
+        try:
+            result = await service.regenerate_assistant_message(
+                token_name=gated.token.name,
+                session_id=session_id,
+                message_index=raw_index,
+                token_daily_quota=gated.token.daily_quota,
+                ip=gated.ip,
+            )
+        except ServiceError as exc:
+            return _err(request, gated.origin, exc)
+        except Exception:
+            logger.exception("[WebChatGateway] regenerate_message failed")
+            return _err(
+                request, gated.origin, ServiceError("internal_error", status=500)
+            )
+        return json_response(
+            {
+                "ok": True,
+                "reply": result.reply,
+                "remaining": result.remaining,
+                "daily_quota": result.daily_quota,
+            },
+            origin=gated.origin,
+            allowed_origins=gated.allowed,
+            same_origin_host=gated.same_host,
+        )
+
     async def preflight(request: web.Request) -> web.Response:
         return preflight_response(
             origin=extract_origin(request, trust_referer_as_origin=trust_referer),
@@ -1715,6 +2460,8 @@ def make_conversation_handlers(
         "get": get_conversation,
         "patch": patch_conversation,
         "clear": clear_conversation,
+        "delete_message": delete_message,
+        "regenerate_message": regenerate_message,
         "events": get_events,
         "preflight": preflight,
     }

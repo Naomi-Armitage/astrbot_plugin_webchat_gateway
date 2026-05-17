@@ -255,6 +255,21 @@ class ConfigView:
         return f"{self.conversations_item_path}/clear"
 
     @property
+    def conversations_message_path(self) -> str:
+        """DELETE-able per-message URL — 0-based index into the rendered
+        history surfaced by GET /conversations/{session_id}. The
+        message-delete endpoint splices the matching CM entry out and
+        emits a `message_deleted` event."""
+        return f"{self.conversations_item_path}/messages/{{message_index}}"
+
+    @property
+    def conversations_regenerate_path(self) -> str:
+        """POST endpoint that drops the assistant message at
+        `body.message_index` and re-runs the non-streaming LLM call on
+        the truncated history."""
+        return f"{self.conversations_item_path}/regenerate"
+
+    @property
     def events_path(self) -> str:
         return f"{self.endpoint_prefix}/events"
 
