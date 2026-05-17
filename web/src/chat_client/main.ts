@@ -1043,12 +1043,45 @@ function applyEvent(ev: ServerEvent): void {
         }
         break;
       }
+      const localRole: Role = serverRoleToLocal(role as ServerRole);
+      // Fallback dedup. The pendingLocals path above can miss in narrow
+      // races (a stray double-delivery consumed the entry before the
+      // legitimate event arrived; attachments key drifted between the
+      // optimistic record and the server event; clock skew exceeded
+      // DEDUP_TS_WINDOW_S). Without this guard, a missed match falls
+      // through to the render+push below and produces a duplicate
+      // bubble that survives only in DOM until the next replayActive.
+      // Match the same role+content+attachments key against the tail
+      // of sess.history and require the local entry's ts to be within
+      // 60s of the event ts — narrow enough that a deliberate repeat
+      // send minutes later still goes through, wide enough to absorb
+      // typical clock skew + LLM-pair emission delay.
+      const aKey = attachmentsKeyFromRefs(attachments);
+      const fallbackSess = store.sessions[sid];
+      if (fallbackSess) {
+        const evTsMs = ev.ts * 1000;
+        const tailStart = Math.max(0, fallbackSess.history.length - 4);
+        let hit = false;
+        for (let i = fallbackSess.history.length - 1; i >= tailStart; i--) {
+          const h = fallbackSess.history[i]!;
+          if (h.role !== localRole) continue;
+          if (h.text !== content) continue;
+          if (attachmentsKeyFromRefs(h.attachments) !== aKey) continue;
+          if (Math.abs(evTsMs - h.ts) > 60_000) continue;
+          if (attachments && localRole === "user" && !h.attachments) {
+            h.attachments = attachments;
+          }
+          fallbackSess.lastActiveAt = Math.max(fallbackSess.lastActiveAt, evTsMs);
+          hit = true;
+          break;
+        }
+        if (hit) break;
+      }
       let sess = store.sessions[sid];
       if (!sess) {
         sess = blankSession(sid);
         store.sessions[sid] = sess;
       }
-      const localRole: Role = serverRoleToLocal(role as ServerRole);
       const item: HistoryItem = { role: localRole, text: content, ts: ev.ts * 1000 };
       if (incomplete && role === "assistant") item.incomplete = true;
       if (attachments && localRole === "user") item.attachments = attachments;
@@ -1111,9 +1144,18 @@ function applyEvent(ev: ServerEvent): void {
 
 function applyEvents(events: ServerEvent[]): void {
   if (!events.length) return;
-  for (const ev of events) applyEvent(ev);
-  saveStore();
-  renderSessionList();
+  // try/finally so a thrown event handler doesn't strand the DOM
+  // updates from earlier successful events in localStorage-disagreement
+  // limbo: without this, a refresh after a mid-batch throw would replay
+  // a stale store and silently drop the bubbles the user already saw.
+  // On the next long-poll the same events arrive again and the
+  // pendingLocals + tail-history dedup paths above suppress duplicates.
+  try {
+    for (const ev of events) applyEvent(ev);
+  } finally {
+    saveStore();
+    renderSessionList();
+  }
 }
 
 // ---------- Cold refetch ----------
