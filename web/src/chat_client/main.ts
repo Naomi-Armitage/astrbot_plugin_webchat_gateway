@@ -793,6 +793,16 @@ interface SyncState {
   // implied by peerStreamsBySession but kept explicit so renderSessionList
   // can dot the entry without re-checking activeResumeAborts.
   sidebarTypingFor: Set<string>;
+  // Per-session handoff flag set by applyEvent when a message_added
+  // (assistant) lands while a streaming bubble for that session is
+  // still in the DOM. Causes the matching attachStreamingBubble's
+  // finalize to drop its bubble + skip the history push regardless
+  // of finalizeBubble's race-guard window. Targets the
+  // "user backgrounded the tab → SSE done frame throttled → long-poll
+  // wins the race after returning" path, where the event's
+  // server-stamped ts can be more than 30s old by the time finalize
+  // runs and the existing time-window check would miss.
+  streamFinalizeSuppressed: Record<string, true>;
 }
 
 const sync: SyncState = {
@@ -813,6 +823,7 @@ const sync: SyncState = {
   activeResumeAborts: {},
   peerStreamsBySession: {},
   sidebarTypingFor: new Set(),
+  streamFinalizeSuppressed: {},
 };
 setSyncStatus("live");
 
@@ -1091,6 +1102,21 @@ function applyEvent(ev: ServerEvent): void {
         sess.title = deriveTitle(sess.history);
       }
       if (sid === store.activeId) {
+        // Race-guard handoff. If the streaming bubble is still in DOM
+        // for this session, long-poll's message_added beat the SSE done
+        // frame (typical when the tab was backgrounded during the stream
+        // and the SSE delivery was throttled while events GET resumed
+        // on visibility-return). Drop the streaming bubble now and flag
+        // the in-flight finalize to short-circuit — the bubble we're
+        // about to add carries the server's complete text and replaces
+        // the partial streaming view both visually and in history.
+        if (role === "assistant") {
+          const streamingBubble = msgs.querySelector(".msg.bot.streaming");
+          if (streamingBubble) {
+            streamingBubble.remove();
+            sync.streamFinalizeSuppressed[sid] = true;
+          }
+        }
         addMessageBubble(localRole, content, item.attachments);
         if (item.incomplete) appendIncompleteNoticeToLastBubble();
       }
@@ -2908,6 +2934,19 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
     noticeKind: "" | "incomplete" | "interrupted" | "error",
   ): void => {
     cancelRender();
+    // Suppression handoff from applyEvent message_added(assistant). If
+    // long-poll won the race and already rendered the server's full
+    // text into a sibling bubble + pushed it to history, drop our
+    // streaming bubble and skip the push — the history is already
+    // correct and pushing a second entry would duplicate. Independent
+    // of the tail-history race-guard below (whose ts-window check the
+    // backgrounded-tab path can outrun); the explicit flag avoids
+    // relying on Date.now() vs server ts comparisons.
+    if (sync.streamFinalizeSuppressed[sid]) {
+      delete sync.streamFinalizeSuppressed[sid];
+      bubble.remove();
+      return;
+    }
     flushRender();
     bubble.classList.remove("streaming");
     if (noticeKind) {
