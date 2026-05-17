@@ -1315,7 +1315,8 @@ body.lightbox-open { overflow: hidden; }
 }
 /* Reveal the full row on bubble hover OR keyboard focus within. */
 .msg-row:hover .msg-action-btn,
-.msg-row:focus-within .msg-action-btn { opacity: 1; }
+.msg-row:focus-within .msg-action-btn,
+.msg-row.actions-revealed .msg-action-btn { opacity: 1; }
 /* Streaming bubble → suppress chrome entirely. The bubble is still
    morphing; copy / delete / regenerate aren't meaningful yet. */
 .msg-row:has(.msg.streaming) .msg-actions { display: none; }

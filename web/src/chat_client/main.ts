@@ -558,8 +558,96 @@ msgs.addEventListener("click", (e: MouseEvent) => {
     copyText(line.textContent ?? "");
     line.classList.add("copied");
     window.setTimeout(() => { line.classList.remove("copied"); }, 600);
+    return;
+  }
+  // Per-message action buttons. Each carries a data-action of
+  // "copy" / "delete" / "regen"; we dispatch via the closest .msg-row
+  // → .msg bubble. Replaces three closure-bound per-button listeners
+  // per bubble with a single delegated handler.
+  const actionBtn = target.closest<HTMLButtonElement>(".msg-action-btn");
+  if (!actionBtn) return;
+  const row = actionBtn.closest<HTMLElement>(".msg-row");
+  const bubble = row?.querySelector<HTMLDivElement>(".msg");
+  if (!bubble) return;
+  switch (actionBtn.dataset.action) {
+    case "copy": {
+      const idx = indexOfRenderedBubble(bubble);
+      const sess = currentSession();
+      const text = idx >= 0 && sess.history[idx]
+        ? sess.history[idx]!.text
+        : bubble.textContent ?? "";
+      void copyMessage(text, actionBtn);
+      return;
+    }
+    case "delete":
+      void deleteMessage(bubble);
+      return;
+    case "regen":
+      void regenerateMessage(bubble);
+      return;
   }
 });
+
+// Long-press to reveal action chrome on touch devices. Desktop already
+// uses :hover; mobile has no hover state, so without this the
+// delete/regen buttons effectively don't exist on phones. 350ms hold
+// + 10px move tolerance matches Telegram's bubble-menu interaction.
+// A pointerdown outside any revealed row closes it (tap-out dismiss).
+const LONG_PRESS_MS = 350;
+const LONG_PRESS_MOVE_TOL_SQ = 100; // 10px squared
+let lpTimer: number | null = null;
+let lpStartXY: [number, number] | null = null;
+let lpRow: HTMLElement | null = null;
+function cancelLongPress(): void {
+  if (lpTimer !== null) { window.clearTimeout(lpTimer); lpTimer = null; }
+  lpStartXY = null;
+  lpRow = null;
+}
+function closeAllRevealedActions(except?: Element | null): void {
+  msgs.querySelectorAll<HTMLElement>(".msg-row.actions-revealed").forEach((r) => {
+    if (r !== except) r.classList.remove("actions-revealed");
+  });
+}
+msgs.addEventListener("touchstart", (e: TouchEvent) => {
+  // Don't treat a tap on the action buttons themselves as a long-press
+  // candidate — that would re-trigger reveal on a row that's already
+  // open and feel laggy.
+  const target = e.target as Element | null;
+  if (!target || target.closest(".msg-action-btn")) return;
+  const row = target.closest<HTMLElement>(".msg-row");
+  if (!row) return;
+  const t = e.touches[0];
+  if (!t) return;
+  lpRow = row;
+  lpStartXY = [t.clientX, t.clientY];
+  lpTimer = window.setTimeout(() => {
+    if (lpRow) {
+      closeAllRevealedActions(lpRow);
+      lpRow.classList.add("actions-revealed");
+    }
+    lpTimer = null;
+  }, LONG_PRESS_MS);
+}, { passive: true });
+msgs.addEventListener("touchmove", (e: TouchEvent) => {
+  if (lpTimer === null || !lpStartXY) return;
+  const t = e.touches[0];
+  if (!t) return;
+  const dx = t.clientX - lpStartXY[0];
+  const dy = t.clientY - lpStartXY[1];
+  if (dx * dx + dy * dy > LONG_PRESS_MOVE_TOL_SQ) cancelLongPress();
+}, { passive: true });
+msgs.addEventListener("touchend", cancelLongPress, { passive: true });
+msgs.addEventListener("touchcancel", cancelLongPress, { passive: true });
+document.addEventListener("pointerdown", (e: PointerEvent) => {
+  const target = e.target as Element | null;
+  if (!target) return;
+  // A pointerdown inside a revealed row's actions is a button press —
+  // let the click resolve, don't pre-emptively close. Anywhere else
+  // dismisses all revealed rows.
+  if (target.closest(".msg-action-btn")) return;
+  const insideRevealed = target.closest(".msg-row.actions-revealed");
+  closeAllRevealedActions(insideRevealed);
+}, { passive: true });
 
 // Append a chat bubble. `text` is the raw content as stored in history;
 // for the bot role we render markdown (sanitized), everything else stays
@@ -662,7 +750,7 @@ function addMessageBubble(
 // Click handlers look up the bubble's current position in the rendered
 // history at click time (via indexOfRenderedBubble) so a delete that's
 // preceded by other deletes / inserts doesn't desync the index.
-function buildMessageActions(role: "user" | "bot", bubble: HTMLDivElement): HTMLDivElement {
+function buildMessageActions(role: "user" | "bot", _bubble: HTMLDivElement): HTMLDivElement {
   const actions = document.createElement("div");
   actions.className = "msg-actions";
   const copyBtn = document.createElement("button");
@@ -670,19 +758,8 @@ function buildMessageActions(role: "user" | "bot", bubble: HTMLDivElement): HTML
   copyBtn.className = "msg-action-btn msg-action-copy";
   copyBtn.setAttribute("aria-label", "复制消息");
   copyBtn.title = "复制";
+  copyBtn.dataset.action = "copy";
   copyBtn.innerHTML = ICON_COPY;
-  copyBtn.addEventListener("click", () => {
-    // Re-read from the current store at click time. The bubble's text
-    // can change (regenerate) and the simplest source of truth is the
-    // matching history entry. Fall back to DOM text if for some reason
-    // the lookup misses (defensive — shouldn't happen normally).
-    const idx = indexOfRenderedBubble(bubble);
-    const sess = currentSession();
-    const text = idx >= 0 && sess.history[idx]
-      ? sess.history[idx]!.text
-      : bubble.textContent ?? "";
-    void copyMessage(text, copyBtn);
-  });
   actions.appendChild(copyBtn);
 
   const delBtn = document.createElement("button");
@@ -690,10 +767,8 @@ function buildMessageActions(role: "user" | "bot", bubble: HTMLDivElement): HTML
   delBtn.className = "msg-action-btn msg-action-delete";
   delBtn.setAttribute("aria-label", "删除消息");
   delBtn.title = "删除";
+  delBtn.dataset.action = "delete";
   delBtn.innerHTML = ICON_TRASH;
-  delBtn.addEventListener("click", () => {
-    void deleteMessage(bubble);
-  });
   actions.appendChild(delBtn);
 
   if (role === "bot") {
@@ -702,10 +777,8 @@ function buildMessageActions(role: "user" | "bot", bubble: HTMLDivElement): HTML
     regenBtn.className = "msg-action-btn msg-action-regen";
     regenBtn.setAttribute("aria-label", "重新生成");
     regenBtn.title = "重新生成";
+    regenBtn.dataset.action = "regen";
     regenBtn.innerHTML = ICON_REGEN;
-    regenBtn.addEventListener("click", () => {
-      void regenerateMessage(bubble);
-    });
     actions.appendChild(regenBtn);
   }
   return actions;
