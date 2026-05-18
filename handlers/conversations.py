@@ -32,7 +32,7 @@ except ImportError as _e:
     raise ImportError(
         "[WebChatGateway] Cannot import AssistantMessageSegment/TextPart/ImageURLPart/"
         "UserMessageSegment from astrbot.core.agent.message. This plugin requires "
-        f"AstrBot >= 3.4 with multimodal support. Original error: {_e}"
+        f"AstrBot >= 4.17.0 with multimodal support. Original error: {_e}"
     ) from _e
 
 from ..core.audit import AuditLogger

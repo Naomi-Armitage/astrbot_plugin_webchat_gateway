@@ -3,6 +3,49 @@
 记录本插件的可见变化。版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)，
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/)。
 
+## Unreleased
+
+### Added — UI 操作 / 多设备 / 流式
+- 聊天页每条消息加 hover 三按钮：**复制 / 删除 / 重新生成**（最后一个仅 bot）。delete 调 `DELETE {prefix}/conversations/{sid}/messages/{idx}`，regenerate 调 `POST {prefix}/conversations/{sid}/regenerate`。移动端长按 350ms 触发同样的菜单（10px 移动容差当滚动取消）
+- Markdown 代码块换成 Telegram 风：等宽（系统栈 `ui-monospace, SFMono-Regular, Menlo, Consolas`）+ 标题行 lang 标签 + 右上"复制全部"按钮（成功后 1.2s 显示"已复制"）+ 每行可单独点击复制（0.6s flash）
+- 新增 `DELETE {prefix}/conversations/{sid}/messages/{idx}`：按渲染索引删单条消息，对端通过 `message_deleted` 事件同步。释放仅被该条引用的附件
+- 新增 `POST {prefix}/conversations/{sid}/regenerate` body `{message_index}`：重新生成指定 assistant 回复。**会把 message_index 之后的所有 turn 一并 truncate**（对端逐条 `message_deleted` 事件），然后追加新 assistant。和 `/chat/stream` 互斥（共用 PerTokenConcurrency 锁）
+- 新增 `EVENT_MESSAGE_DELETED = "message_deleted"` 事件类型，payload `{index, role}`
+
+### Changed
+- README API 参考补全 ~13 个之前未文档化的端点（`/chat/stream/*` 系列、`/conversations/*` 多设备同步、`/me`、`/title`、`/events`、admin session 等）
+- `storage.mysql_pool_max` 配置项暴露（默认 5、范围 1-100），不再写死 maxsize=5
+- 后台 prune 周期从 24h 缩到 6h，让 `_UPLOAD_ORPHAN_RETENTION_SECONDS=3600` 真正在 1-2 倍窗口内回收，避免孤儿上传占额度长达 25h
+- regenerate 调 LlmBridge 时正确传 `image_urls`（重新解析 user 附件→storage→local path），不再把多模态轮重生成降级为纯文本
+- 新 endpoint 锁竞争 429 写 `concurrent_block` audit（和 `/chat` 一致），观测性补齐
+- `ChatDeps.conv_service` / `StreamRegistry.__init__` 用 `TYPE_CHECKING` 还原真实类型（之前为 `Any`），方法重命名能在 type-check 时报错
+
+### Fixed
+- **schema-version 降级 bug**：SQLite + MySQL migration ladder 之前无条件 `UPDATE _schema_meta SET value = CURRENT`，older binary 启动 newer DB 时会悄悄降级。改成 `if stored == CURRENT_SCHEMA_VERSION` 才写
+- **plugin 静默启动失败**：`_start` 在 mysql 缺 DSN / storage init 失败时只 log + return，AstrBot 误以为 ready 后所有命令返回"插件未就绪"。改成 raise → AstrBot 显示"plugin failed to load"
+- **logout endpoint 是 timing oracle**：cookie 在 HMAC 验证前就用 `peek_name` 查 DB，timing 差异可枚举 token name。新增 IP guard + `record_failure` 让探测在 brute-force 阈值后被锁
+- **shutdown race**：`_stop` 关 storage 前没 cancel stream driver tasks，长轮询/流式 mid-LLM-call 撞 storage close 返回 500 而不是干净下线。新增 `StreamRegistry.cancel_all_drivers()` + 10s drain timeout
+- **regenerate 中间 bot 让对端永久残留**：之前只 emit 一个 `message_deleted(target)` 但服务端 truncate 整个 tail，对端 splice 后多余消息永远不消失直到 cold refetch。改为逐条逆序 emit
+- **regenerate 在 quota check 前 truncate**：429 quota_exceeded 时 CM 已 truncate、附件已释放、无事件发出，所有设备永久 desync。改为 quota check 优先
+- **markdown 渲染允许注入假按钮**：DOMPurify 默认 allow list 含 `<button>` + `data-action`，恶意/幻觉 bot 回复可塞 `<button class="msg-action-btn" data-action="delete">领奖</button>` 触发真删除。改为 FORBID button + data-action，marked code renderer 输出 sentinel 由 JS post-sanitize 构造真按钮
+- `make_me_handler` 和 admin `/me` 漏 `allow_missing=deps.allow_missing_origin` kwarg，导致 `allow_missing_origin=false` 时仍接受无 Origin 请求
+- `regenerate_assistant_message` 取附件没 re-verify `row.token_name == token_name && row.session_id == session_id`，每个其他 call site 都有
+- `release_files_safely` 的 `file_store=None` test fallback 改为 `raise` 而非静默删 DB 行（违反 storage-first 不变量）
+- 长轮询事件批处理 `applyEvents` 包 try/finally，单事件抛错时仍 saveStore + renderSessionList
+- streaming bubble 在 visibility 切换/SSE done 帧节流时和长轮询的 `message_added` 竞态，对端可能出现重复气泡。新增 `streamFinalizeSuppressed` 接力 + history-tail fallback dedup
+- pendingLocals dedup 增加 history-tail 兜底（60s 窗口），抵御 stray double-delivery 已消费 dedup entry 的边界情形
+- delete/regenerate 客户端补 `429 ip_blocked` + `403 forbidden_origin` 专门分支
+- `_prune_task` cancel 时 `except (CancelledError, Exception): pass` 改为只静默 cancellation，真异常 `logger.exception`
+
+### Internal — bounded data structures
+- `CookieLogoutTracker._thresholds`、`EventBus._conds`、`R2FileStore._key_locks` 都新增 `prune_*` 方法在每轮 prune loop 里调，避免 token 删除后内存条目永久留存
+- `ip_failures` 表加 `prune_ip_failures(before_ts)`，每轮 prune 删 24h 以上无失败的行
+
+### Refactor
+- 抽 `core.llm_bridge.map_llm_error(exc) → (code, status, audit_event)` 收敛 LLM 错误 → HTTP 映射（chat 非流式 + regenerate 共用）
+- 抽 `core.file_lifecycle.commit_attachments_or_release` 收敛 `mark_files_committed → 失败 release` 信封
+- 抽 `ConversationService._with_concurrency` `asynccontextmanager` 收敛 `acquire → 429 / inner` + `concurrent_block` audit（clear_history / delete / regenerate 三处共用）
+
 ## v0.3.0 — 2026-05-11
 
 ### Added — 图片上传 / 多模态附件

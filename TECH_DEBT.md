@@ -76,8 +76,14 @@ workers continue accepting the old cookie until natural expiry
 (default 24h) or admin `regenerate_token`.
 
 **Current workaround**: documented in README §"已知限制". Operators
-who run multi-worker can mitigate via sticky session, lower
-`file_cookie_ttl_seconds`, or `regenerate_token` for hard kicks.
+who run multi-worker can mitigate via sticky session, or use
+`regenerate_token` for hard kicks (rotates `token_hash`, which is
+folded into the cookie HMAC, so all workers reject simultaneously).
+Cookie TTL is currently hard-coded at 24h (`core/file_cookie.py:
+DEFAULT_TTL_SECONDS`); exposing it as config so ops could shorten
+the worst-case staleness window is a sub-issue worth tracking but
+not blocking — the `regenerate_token` workaround already provides
+the immediate-invalidation escape hatch.
 
 **Proposed long-term fix**: persist the logout threshold in a
 shared store (DB row on the token, or Redis if available) so all
