@@ -438,7 +438,13 @@ marked.use({
         if (m) return { type: "mark", raw: m[0], text: m[1]! };
         return undefined;
       },
-      renderer(token) { return `<mark>${(token as unknown as { text: string }).text}</mark>`; },
+      renderer(token) {
+        // Pre-escape the captured text. DOMPurify is the real safety
+        // net but layering the escape here keeps the mark extension
+        // safe even if the sanitize config ever drifts.
+        const text = (token as unknown as { text: string }).text;
+        return `<mark>${escapeCodeHtml(text)}</mark>`;
+      },
     },
   ],
 });
@@ -578,9 +584,6 @@ async function writeClipboard(text: string): Promise<boolean> {
     return false;
   }
 }
-function copyText(s: string): void {
-  void writeClipboard(s);
-}
 function gatherBlockText(block: Element): string {
   const lineEls = block.querySelectorAll<HTMLElement>(".codeblock-line");
   const lines: string[] = [];
@@ -594,21 +597,25 @@ msgs.addEventListener("click", (e: MouseEvent) => {
   if (copyBtn) {
     const block = copyBtn.closest(".codeblock");
     if (!block) return;
-    copyText(gatherBlockText(block));
-    const orig = copyBtn.textContent ?? "复制";
-    copyBtn.textContent = "已复制";
-    copyBtn.classList.add("copied");
-    window.setTimeout(() => {
-      copyBtn.textContent = orig;
-      copyBtn.classList.remove("copied");
-    }, 1200);
+    void writeClipboard(gatherBlockText(block)).then((ok) => {
+      if (!ok) return;
+      const orig = copyBtn.textContent ?? "复制";
+      copyBtn.textContent = "已复制";
+      copyBtn.classList.add("copied");
+      window.setTimeout(() => {
+        copyBtn.textContent = orig;
+        copyBtn.classList.remove("copied");
+      }, 1200);
+    });
     return;
   }
   const line = target.closest<HTMLElement>(".codeblock-line");
   if (line) {
-    copyText(line.textContent ?? "");
-    line.classList.add("copied");
-    window.setTimeout(() => { line.classList.remove("copied"); }, 600);
+    void writeClipboard(line.textContent ?? "").then((ok) => {
+      if (!ok) return;
+      line.classList.add("copied");
+      window.setTimeout(() => { line.classList.remove("copied"); }, 600);
+    });
     return;
   }
   // Per-message action buttons. Each carries a data-action of
@@ -667,6 +674,11 @@ msgs.addEventListener("touchstart", (e: TouchEvent) => {
   if (!target || target.closest(".msg-action-btn")) return;
   const row = target.closest<HTMLElement>(".msg-row");
   if (!row) return;
+  // Streaming bubble: actions are hidden via CSS while .streaming is
+  // present, but if we set actions-revealed during streaming the class
+  // would still be set after streaming finishes and actions would pop
+  // visible without the user re-pressing. Skip long-press on streaming.
+  if (row.querySelector(".msg.streaming")) return;
   const t = e.touches[0];
   if (!t) return;
   lpRow = row;
@@ -690,6 +702,10 @@ msgs.addEventListener("touchmove", (e: TouchEvent) => {
 msgs.addEventListener("touchend", cancelLongPress, { passive: true });
 msgs.addEventListener("touchcancel", cancelLongPress, { passive: true });
 document.addEventListener("pointerdown", (e: PointerEvent) => {
+  // Fast path: no revealed rows means nothing to close. Skips the
+  // closest() walk on every pointerdown when long-press isn't active
+  // (the common case on desktop).
+  if (!msgs.querySelector(".msg-row.actions-revealed")) return;
   const target = e.target as Element | null;
   if (!target) return;
   // A pointerdown inside a revealed row's actions is a button press —
@@ -1078,6 +1094,10 @@ const clearMsgList = (): void => {
   // .msg-edit-icon; matching only .msg would leave those orphans
   // behind on replayActive / history_cleared.
   msgs.replaceChildren();
+  // Any pending long-press refers to a row we just detached. Drop the
+  // module-level state so the 350ms timer doesn't fire against a
+  // ghost node.
+  cancelLongPress();
 };
 
 // Append a "（回复未完整）" notice to the most recently rendered bot bubble
@@ -1434,14 +1454,14 @@ function indexOfRenderedBubble(bubble: HTMLDivElement): number {
 
 // Brief visual confirmation on the action button. Restores the original
 // HTML after a short window so subsequent clicks find the icon again.
-function flashActionButton(btn: HTMLButtonElement, kind: "copied" | "ok"): void {
-  btn.classList.add(kind);
-  window.setTimeout(() => { btn.classList.remove(kind); }, 1200);
+function flashActionButton(btn: HTMLButtonElement): void {
+  btn.classList.add("copied");
+  window.setTimeout(() => { btn.classList.remove("copied"); }, 1200);
 }
 
 async function copyMessage(text: string, btn: HTMLButtonElement): Promise<void> {
   if (!text) return;
-  if (await writeClipboard(text)) flashActionButton(btn, "copied");
+  if (await writeClipboard(text)) flashActionButton(btn);
 }
 
 async function deleteMessage(bubble: HTMLDivElement): Promise<void> {
@@ -1470,6 +1490,15 @@ async function deleteMessage(bubble: HTMLDivElement): Promise<void> {
   if (resp.status === 401) { handle401(); return; }
   if (resp.status === 429 && (payload.error as string) === "concurrent_request") {
     addMessageBubble("notice", "正在处理中，稍候。");
+    return;
+  }
+  if (resp.status === 429 && (payload.error as string) === "ip_blocked") {
+    const retry = resp.headers.get("Retry-After") || payload.retry_after || "?";
+    addMessageBubble("error", `请求过于频繁，已暂时封禁，${retry} 秒后重试。`);
+    return;
+  }
+  if (resp.status === 403 && (payload.error as string) === "forbidden_origin") {
+    addMessageBubble("error", "页面来源未在 allowed_origins 中。");
     return;
   }
   if (resp.status === 404) {
@@ -3698,6 +3727,11 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
   // pre-first-chunk and we're falling back to /chat.
   const discardBubble = (): void => {
     cancelRender();
+    // Clear any pending finalize-suppression flag so a future stream
+    // for this session doesn't pick up stale state. finalizeBubble's
+    // suppression path consumes-and-deletes, but discardBubble is its
+    // sibling exit and was missing the cleanup.
+    delete sync.streamFinalizeSuppressed[sid];
     removeBubbleWithRow(bubble);
     clearPending();
   };

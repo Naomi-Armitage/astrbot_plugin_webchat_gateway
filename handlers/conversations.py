@@ -934,6 +934,12 @@ class ConversationService:
         if self._concurrency is not None:
             async with self._concurrency.acquire(token_name) as acquired:
                 if not acquired:
+                    await self._audit.write(
+                        "concurrent_block",
+                        name=token_name,
+                        ip=ip,
+                        detail={"operation": "clear_history", "session_id": session_id},
+                    )
                     raise ServiceError("concurrent_request", status=429)
                 return await self._clear_history_inner(
                     token_name=token_name, session_id=session_id, ip=ip
@@ -1083,8 +1089,13 @@ class ConversationService:
         any file_id still referenced by `surviving_history` (cross-message
         attachment reuse is rare but legal — copy-pasted images, retry of
         the same turn, etc.). The diff goes through `release_files_safely`.
-        Failure to list session files degrades silently to "release nothing"
-        rather than crashing the caller — the orphan sweep will catch it.
+
+        If `list_files_for_session` itself fails (rare DB hiccup), we
+        degrade to "release nothing" rather than crash the caller. These
+        leaked files stay at `committed=1` so the periodic uncommitted-
+        orphan sweep WON'T catch them; they're cleaned up only on the
+        next successful `clear_history` for the session, or by the 90-
+        day session cascade.
         """
         removed_file_ids: set[str] = set()
         for entry in removed_entries:
@@ -1167,6 +1178,12 @@ class ConversationService:
             )
         async with self._concurrency.acquire(token_name) as acquired:
             if not acquired:
+                await self._audit.write(
+                    "concurrent_block",
+                    name=token_name,
+                    ip=ip,
+                    detail={"operation": "delete_message", "session_id": session_id},
+                )
                 raise ServiceError("concurrent_request", status=429)
             return await self._delete_message_inner(
                 token_name=token_name,
@@ -1319,6 +1336,12 @@ class ConversationService:
             )
         async with self._concurrency.acquire(token_name) as acquired:
             if not acquired:
+                await self._audit.write(
+                    "concurrent_block",
+                    name=token_name,
+                    ip=ip,
+                    detail={"operation": "regenerate", "session_id": session_id},
+                )
                 raise ServiceError("concurrent_request", status=429)
             return await self._regenerate_inner(
                 token_name=token_name,
@@ -1352,25 +1375,26 @@ class ConversationService:
             # fresh context.
             raise ServiceError("message_not_found", status=404)
 
-        # Recover the most recent user message text from the surviving
-        # rendered history. LlmBridge.generate_reply requires a
-        # `message` kwarg — it's framed as `[Current User Message]` in
-        # the prompt. The user that prompted this assistant reply is
-        # the last user entry in raw_history[:target_raw_idx]; if none
-        # exists (rare — assistant at the start of the conversation,
-        # possible via tool-call only context) we 404 since there's no
-        # message to regenerate from.
+        # Recover the most recent user message (text + image refs) from
+        # the surviving rendered history. LlmBridge.generate_reply needs
+        # both: `message=` for the textual prompt and `image_urls=` so a
+        # multimodal turn doesn't silently degrade to text-only on
+        # regeneration. Walk back from target_raw_idx to the closest
+        # user entry. If none exists (rare — assistant at the start of
+        # the conversation, possible via tool-call only context) we 404.
         last_user_text = ""
+        last_user_file_ids: list[str] = []
         for entry in reversed(raw_history[:target_raw_idx]):
             if not isinstance(entry, dict):
                 continue
-            if (
-                str(entry.get("role") or "").strip().lower()
-                == "user"
-            ):
-                last_user_text = _extract_text(entry.get("content"))
-                break
-        if not last_user_text:
+            if str(entry.get("role") or "").strip().lower() != "user":
+                continue
+            last_user_text = _extract_text(entry.get("content"))
+            last_user_file_ids = list(
+                _extract_attachment_file_ids(entry.get("content"))
+            )
+            break
+        if not last_user_text and not last_user_file_ids:
             raise ServiceError("message_not_found", status=404)
 
         # Quota check BEFORE any side effect. A 429 here must not leave
@@ -1397,6 +1421,37 @@ class ConversationService:
                 },
             )
             raise ServiceError("quota_exceeded", status=429)
+
+        # Resolve attachments to provider-visible local paths so the
+        # regenerate sees the same multimodal context the original /chat
+        # call did. Done AFTER the quota gate so a quota-blocked
+        # regenerate doesn't probe the file store.
+        image_urls: list[str] = []
+        for fid in last_user_file_ids:
+            try:
+                row = await self._storage.get_file(fid)
+            except Exception:
+                logger.exception(
+                    "[WebChatGateway] get_file during regenerate failed "
+                    "file_id=%s",
+                    fid,
+                )
+                continue
+            if row is None:
+                continue
+            try:
+                local_path = await self._file_store.open_local_path(
+                    storage_key=row.storage_key
+                )
+            except Exception:
+                logger.exception(
+                    "[WebChatGateway] open_local_path during regenerate "
+                    "failed key=%s",
+                    row.storage_key,
+                )
+                continue
+            if local_path:
+                image_urls.append(local_path)
 
         # Truncate CM history to [0, target_raw_idx) and persist BEFORE
         # the LLM call. LlmBridge.generate_reply reads from CM via
@@ -1435,7 +1490,7 @@ class ConversationService:
                 session_id=session_id,
                 username=username,
                 message=last_user_text,
-                image_urls=None,
+                image_urls=image_urls or None,
             )
         except RuntimeError as exc:
             code = str(exc)
@@ -1484,16 +1539,17 @@ class ConversationService:
             raise ServiceError("llm_call_failed", status=500) from None
 
         # LLM succeeded — append the new assistant reply to the
-        # truncated history. We build a CM-shaped entry directly
-        # (matching `_cm_persist_pair`'s `AssistantMessageSegment(
-        # content=[TextPart(text=...)])` wire format) and write the
-        # full list back. Using `update_conversation` rather than
-        # `add_message_pair` avoids appending a phantom empty user
-        # turn (the existing user is already at target_raw_idx-1).
-        new_assistant_entry: dict[str, Any] = {
-            "role": "assistant",
-            "content": [{"type": "text", "text": reply}],
-        }
+        # truncated history. We use `AssistantMessageSegment` /
+        # `TextPart` (the same shape `_cm_persist_pair` writes via
+        # `add_message_pair`) so the regenerated entry's wire format
+        # stays uniform with the rest of CM history. `model_dump()`
+        # yields the dict CM stores; using `update_conversation`
+        # rather than `add_message_pair` avoids appending a phantom
+        # empty user turn (the existing user is already at
+        # target_raw_idx-1).
+        new_assistant_entry = AssistantMessageSegment(
+            content=[TextPart(text=reply)]
+        ).model_dump()
         final_history = truncated_history + [new_assistant_entry]
         try:
             await self._cm.update_conversation(
@@ -2382,7 +2438,9 @@ def make_conversation_handlers(
         `message_deleted` event for peers.
 
         Responses:
-          200 `{ok: true}` — deleted.
+          200 `{ok: true, session_id, title, ..., message_count, preview}`
+              — deleted; payload includes the refreshed session meta so
+              the client can update its sidebar entry inline.
           400 `{error: "invalid_payload"}` — bad session_id or index.
           401 — auth gate.
           404 `{error: "session_not_found"|"message_not_found"}`.
@@ -2405,7 +2463,7 @@ def make_conversation_handlers(
                 request, gated.origin, ServiceError("invalid_payload", status=400)
             )
         try:
-            await service.delete_message_by_index(
+            row = await service.delete_message_by_index(
                 token_name=gated.token.name,
                 session_id=session_id,
                 message_index=message_index,
@@ -2419,7 +2477,7 @@ def make_conversation_handlers(
                 request, gated.origin, ServiceError("internal_error", status=500)
             )
         return json_response(
-            {"ok": True},
+            {"ok": True, **_meta_payload(row)},
             origin=gated.origin,
             allowed_origins=gated.allowed,
             same_origin_host=gated.same_host,
