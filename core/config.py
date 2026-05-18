@@ -97,6 +97,7 @@ class StorageConfig:
     driver: str
     sqlite_path: str
     mysql_dsn: str
+    mysql_pool_max: int
 
 
 @dataclass(frozen=True)
@@ -356,6 +357,13 @@ class ConfigView:
             _get(raw_storage, "sqlite_path") or "data/webchat_gateway.db"
         ).strip()
         mysql_dsn = str(_get(raw_storage, "mysql_dsn") or "").strip()
+        # MySQL connection pool cap. Default 5 fits friends-list scale;
+        # larger gateways should raise to 20-50.
+        try:
+            mysql_pool_max = int(_get(raw_storage, "mysql_pool_max") or 5)
+        except (TypeError, ValueError):
+            mysql_pool_max = 5
+        mysql_pool_max = max(1, min(mysql_pool_max, 100))
 
         raw_streaming = _get(cfg, "streaming", {}) or {}
         redis_dsn_raw = str(_get(raw_streaming, "redis_dsn") or "").strip()
@@ -481,6 +489,7 @@ class ConfigView:
                 driver=driver,
                 sqlite_path=sqlite_path,
                 mysql_dsn=mysql_dsn,
+                mysql_pool_max=mysql_pool_max,
             ),
             streaming=StreamingConfig(
                 redis_dsn=redis_dsn_raw,

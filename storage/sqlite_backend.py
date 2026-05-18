@@ -118,11 +118,20 @@ class SqliteStorage(AbstractStorage):
                 for stmt in V4_TO_V5_SQLITE:
                     await self._conn.execute(stmt)
                 stored = "5"
-            await self._conn.execute(
-                "UPDATE _schema_meta SET value = ? WHERE key = 'schema_version'",
-                (CURRENT_SCHEMA_VERSION,),
-            )
-        # stored == CURRENT_SCHEMA_VERSION (or any future version): no-op.
+            # Only write CURRENT_SCHEMA_VERSION when stored matches it.
+            # A worker booting an older binary against a newer DB (mid-
+            # rollout, or rollback) must NOT downgrade the marker —
+            # subsequent forward rolls would then re-run an already-
+            # completed migration ladder against partial state.
+            if stored == CURRENT_SCHEMA_VERSION:
+                await self._conn.execute(
+                    "UPDATE _schema_meta SET value = ? WHERE key = 'schema_version'",
+                    (CURRENT_SCHEMA_VERSION,),
+                )
+        # stored != CURRENT_SCHEMA_VERSION (newer): leave alone. The
+        # newer schema is forward-compatible for our reads/writes; if
+        # it isn't, we want to crash on a column-not-found error
+        # rather than silently rewrite the marker.
         await self._conn.commit()
 
     async def close(self) -> None:

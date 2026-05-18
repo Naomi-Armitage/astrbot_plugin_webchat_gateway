@@ -156,6 +156,12 @@
         "description": "MySQL DSN",
         "hint": "格式 mysql://user:pass@host:3306/dbname（也支持 mariadb://）；driver=mysql 时必填。",
         "default": ""
+      },
+      "mysql_pool_max": {
+        "type": "int",
+        "description": "MySQL 连接池上限",
+        "hint": "aiomysql 同时活跃的连接数上限。friends-list 部署 5 够用；5+ 并发用户或暴露给小团队的网关建议 20-50。范围 1-100。",
+        "default": 5
       }
     }
   },

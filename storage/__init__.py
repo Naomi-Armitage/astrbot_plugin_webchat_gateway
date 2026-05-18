@@ -15,7 +15,13 @@ from .base import (
 )
 
 
-def get_storage(driver: str, *, sqlite_path: str = "", mysql_dsn: str = "") -> AbstractStorage:
+def get_storage(
+    driver: str,
+    *,
+    sqlite_path: str = "",
+    mysql_dsn: str = "",
+    mysql_pool_max: int = 5,
+) -> AbstractStorage:
     if driver == "sqlite":
         from .sqlite_backend import SqliteStorage
 
@@ -34,7 +40,7 @@ def get_storage(driver: str, *, sqlite_path: str = "", mysql_dsn: str = "") -> A
 
         if not mysql_dsn:
             raise ValueError("mysql_dsn is required for mysql driver")
-        return MysqlStorage(mysql_dsn)
+        return MysqlStorage(mysql_dsn, pool_max=mysql_pool_max)
 
     raise ValueError(f"unknown storage driver: {driver}")
 

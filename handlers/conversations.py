@@ -1439,6 +1439,22 @@ class ConversationService:
                 continue
             if row is None:
                 continue
+            # Defense-in-depth ownership recheck. The file_id came from
+            # CM history under this token's session and should already
+            # be owned — every other resolve site (chat.py:377,
+            # _cm_persist_pair, _release_attached_files) verifies the
+            # same. Skipping here would, on any future CM-corruption
+            # path, let regenerate leak another token's bytes into
+            # this LLM call.
+            if row.token_name != token_name or row.session_id != session_id:
+                logger.warning(
+                    "[WebChatGateway] regenerate skipped cross-scope "
+                    "attachment token=%s session=%s file=%s",
+                    token_name,
+                    session_id,
+                    fid,
+                )
+                continue
             try:
                 local_path = await self._file_store.open_local_path(
                     storage_key=row.storage_key

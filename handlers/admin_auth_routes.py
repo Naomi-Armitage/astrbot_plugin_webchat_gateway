@@ -193,7 +193,10 @@ def make_auth_handlers(deps: AuthRouteDeps):
         origin = _origin(request)
         ip = client_ip(request, trust_forwarded_for=deps.trust_forwarded_for)
         if not is_origin_allowed(
-            origin, allowed, same_origin_host=request.host
+            origin,
+            allowed,
+            same_origin_host=request.host,
+            allow_missing=deps.allow_missing_origin,
         ):
             return _err(request, origin, ServiceError("forbidden_origin", status=403))
         if not deps.master_admin_key:

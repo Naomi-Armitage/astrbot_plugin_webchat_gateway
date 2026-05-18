@@ -71,6 +71,7 @@ class WebChatGatewayPlugin(Star):
         self._audit: AuditLogger | None = None
         self._file_store: FileStore | None = None
         self._prune_task: asyncio.Task[None] | None = None
+        self._registry: StreamRegistry | None = None
 
     async def initialize(self) -> None:
         await self._start()
@@ -83,21 +84,27 @@ class WebChatGatewayPlugin(Star):
         self._cfg = cfg
 
         if cfg.storage.driver == "mysql" and not cfg.storage.mysql_dsn:
-            logger.error(
-                "[WebChatGateway] mysql driver requires mysql_dsn; aborting startup"
+            # Fail fast on irrecoverable config — better to let AstrBot
+            # surface "plugin failed to load" than to register the
+            # /webchat command group as healthy while the HTTP server
+            # never binds and every command returns "插件未就绪".
+            raise RuntimeError(
+                "WebChatGateway: mysql driver requires mysql_dsn"
             )
-            return
 
         try:
             storage = get_storage(
                 cfg.storage.driver,
                 sqlite_path=cfg.storage.sqlite_path,
                 mysql_dsn=cfg.storage.mysql_dsn,
+                mysql_pool_max=cfg.storage.mysql_pool_max,
             )
             await storage.initialize()
-        except Exception:
+        except Exception as exc:
             logger.exception("[WebChatGateway] storage init failed; aborting startup")
-            return
+            raise RuntimeError(
+                f"WebChatGateway: storage init failed: {exc}"
+            ) from exc
         self._storage = storage
 
         try:
@@ -211,6 +218,7 @@ class WebChatGatewayPlugin(Star):
                 storage=storage,
                 file_store=file_store,
             )
+            self._registry = registry
 
             # HMAC secret for the /files-auth cookie. Rotates per
             # plugin restart (cookie invalidation is operationally
@@ -322,12 +330,14 @@ class WebChatGatewayPlugin(Star):
             app = build_app(server_deps)
 
             await self._lifecycle.start(app, host=cfg.host, port=cfg.port)
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "[WebChatGateway] startup failed after storage init; tearing down"
             )
             await self._stop()
-            return
+            raise RuntimeError(
+                f"WebChatGateway: startup failed after storage init: {exc}"
+            ) from exc
 
         # Background retention prune. Drops chat-sync events past the
         # retention window and physically removes long-soft-deleted session
@@ -541,9 +551,39 @@ class WebChatGatewayPlugin(Star):
             self._prune_task.cancel()
             try:
                 await self._prune_task
-            except (asyncio.CancelledError, Exception):
+            except asyncio.CancelledError:
                 pass
+            except Exception:
+                # Surface unexpected crashes during prune-loop cleanup
+                # — silent-pass here would mask real bugs in the loop's
+                # finally / teardown path.
+                logger.exception(
+                    "[WebChatGateway] prune_task drain raised on shutdown"
+                )
             self._prune_task = None
+        # Cancel in-flight stream drivers BEFORE storage closes. A
+        # long-poll request parked in event_bus.wait() (≤25s) or a
+        # streaming response mid-LLM-call (≤llm_timeout) would
+        # otherwise try a storage call after close() and return 500
+        # instead of a clean abort.
+        if self._registry is not None:
+            try:
+                pending = self._registry.cancel_all_drivers()
+                if pending:
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.gather(*pending, return_exceptions=True),
+                            timeout=10.0,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "[WebChatGateway] %d driver(s) didn't drain in 10s",
+                            len(pending),
+                        )
+            except Exception:
+                logger.exception(
+                    "[WebChatGateway] driver cancel-all raised on shutdown"
+                )
         await self._lifecycle.stop()
         if self._storage is not None:
             try:
@@ -554,6 +594,7 @@ class WebChatGatewayPlugin(Star):
         self._token_service = None
         self._audit = None
         self._file_store = None
+        self._registry = None
 
     # ----- AstrBot in-bot admin commands -----
 

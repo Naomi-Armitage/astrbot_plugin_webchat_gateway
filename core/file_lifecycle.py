@@ -58,18 +58,17 @@ async def release_files_safely(
     if not rows_list:
         return 0
     if file_store is None:
-        # Test fallback — delete DB rows unconditionally. Real call sites
-        # always pass a file_store.
-        try:
-            await storage.delete_files_by_ids(
-                [r.file_id for r in rows_list]
-            )
-        except Exception:
-            logger.exception(
-                "[WebChatGateway] %s: delete_files_by_ids (test path) failed",
-                log_label,
-            )
-        return len(rows_list)
+        # Production paths always wire a FileStore (main.py constructs
+        # one unconditionally). A None here means a test harness
+        # forgot to pass one; refuse to delete DB rows rather than
+        # silently bypass the "storage-first, DB-second" invariant
+        # that protects against partial-failure orphan creation.
+        raise RuntimeError(
+            f"{log_label}: release_files_safely called without a "
+            "FileStore — refusing to delete DB rows. Wire a FileStore "
+            "(LocalFileStore is the simplest test choice) or skip the "
+            "release in this test path."
+        )
     storage_deleted_ids: list[str] = []
     for row in rows_list:
         try:

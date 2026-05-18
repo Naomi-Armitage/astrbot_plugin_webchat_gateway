@@ -37,13 +37,18 @@ import re
 import secrets
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from astrbot.api import logger
 
 from .audit import AuditLogger
 from .ratelimit import PerTokenConcurrency
 from .stream_buffer import BufferFullError, StreamBuffer, StreamBufferEntry
+
+if TYPE_CHECKING:
+    from ..handlers.conversations import ConversationService
+    from ..storage.base import AbstractStorage
+    from .file_store import FileStore
 
 
 # Validation regex shared between registry (id construction) and the
@@ -115,9 +120,9 @@ class StreamRegistry:
         buffer: StreamBuffer,
         concurrency: PerTokenConcurrency,
         audit: AuditLogger,
-        conv_service: Any,
-        storage: Any = None,
-        file_store: Any = None,
+        conv_service: ConversationService,
+        storage: AbstractStorage | None = None,
+        file_store: FileStore | None = None,
     ) -> None:
         self._buffer = buffer
         self._concurrency = concurrency
@@ -160,6 +165,23 @@ class StreamRegistry:
         no-op cancel to a Task that may already be gc'd or reused.
         """
         self._drivers.pop(stream_id, None)
+
+    def cancel_all_drivers(self) -> list[asyncio.Task]:
+        """Cancel every registered driver task and return them.
+
+        Used by plugin shutdown: in-flight `/chat/stream` handlers
+        parked in `reader.read()` or LLM await must be cancelled
+        BEFORE storage closes, otherwise their next storage call
+        raises `RuntimeError("not initialized")` and the handler
+        returns 500 instead of a clean abort. Caller awaits the
+        returned tasks (with a bounded timeout) to drain.
+        """
+        tasks: list[asyncio.Task] = []
+        for _token, task in self._drivers.values():
+            if not task.done():
+                task.cancel()
+                tasks.append(task)
+        return tasks
 
     def cancel(self, *, stream_id: str, token_name: str) -> bool:
         """Cancel the driver task for `stream_id` if it belongs to `token_name`.

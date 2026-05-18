@@ -66,9 +66,13 @@ def _parse_dsn(dsn: str) -> dict:
 class MysqlStorage(AbstractStorage):
     """MySQL/MariaDB storage using aiomysql connection pool."""
 
-    def __init__(self, dsn: str) -> None:
+    def __init__(self, dsn: str, *, pool_max: int = 5) -> None:
         self._kwargs = _parse_dsn(dsn)
         self._pool: aiomysql.Pool | None = None
+        # `pool_max` is the upper bound on concurrent connections to MySQL.
+        # The default of 5 is sized for a friends-list deployment; busy
+        # gateways should raise it via `storage.mysql_pool_max` config.
+        self._pool_max = max(1, pool_max)
 
     async def initialize(self) -> None:
         # CLIENT.FOUND_ROWS switches MySQL's UPDATE rowcount semantics from
@@ -82,7 +86,7 @@ class MysqlStorage(AbstractStorage):
         # "did we transition" semantic is unaffected by this flag.
         self._pool = await aiomysql.create_pool(
             minsize=1,
-            maxsize=5,
+            maxsize=self._pool_max,
             pool_recycle=3600,
             client_flag=_MYSQL_CLIENT_FLAGS.FOUND_ROWS,
             **self._kwargs,
@@ -145,11 +149,21 @@ class MysqlStorage(AbstractStorage):
                         for stmt in V4_TO_V5_MYSQL:
                             await cur.execute(stmt)
                         stored = "5"
-                    await cur.execute(
-                        "UPDATE _schema_meta SET value = %s WHERE `key` = 'schema_version'",
-                        (CURRENT_SCHEMA_VERSION,),
-                    )
-                # stored == CURRENT_SCHEMA_VERSION (or any future version): no-op.
+                    # Only rewrite the marker when stored matches
+                    # CURRENT_SCHEMA_VERSION. A worker booting an
+                    # older binary against a newer DB must NOT
+                    # downgrade — subsequent forward rolls would
+                    # re-run an already-completed migration ladder
+                    # against partial state.
+                    if stored == CURRENT_SCHEMA_VERSION:
+                        await cur.execute(
+                            "UPDATE _schema_meta SET value = %s WHERE `key` = 'schema_version'",
+                            (CURRENT_SCHEMA_VERSION,),
+                        )
+                # stored newer than CURRENT_SCHEMA_VERSION: leave
+                # alone; reads/writes are forward-compatible for our
+                # surface, and a column-not-found error here is the
+                # preferred failure mode over silent downgrade.
 
     async def close(self) -> None:
         if self._pool is not None:

@@ -20,7 +20,7 @@ import json
 import time
 from dataclasses import dataclass
 from datetime import date
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
 
@@ -52,6 +52,9 @@ from .common import (
     preflight_response,
 )
 
+if TYPE_CHECKING:
+    from .conversations import ConversationService
+
 
 _HEARTBEAT_INTERVAL = 20.0
 
@@ -67,7 +70,7 @@ class ChatDeps:
     ip_guard: IpGuard
     concurrency: PerTokenConcurrency
     llm_bridge: LlmBridge
-    conv_service: Any  # handlers.conversations.ConversationService — avoid import cycle
+    conv_service: ConversationService
     registry: StreamRegistry
     file_store: FileStore
     allowed_origins: set[str]
@@ -1788,7 +1791,12 @@ def make_me_handler(deps: ChatDeps):
         allowed = deps.allowed_origins
         same_host = request.host
 
-        if not is_origin_allowed(origin, allowed, same_origin_host=same_host):
+        if not is_origin_allowed(
+            origin,
+            allowed,
+            same_origin_host=same_host,
+            allow_missing=deps.allow_missing_origin,
+        ):
             return json_response(
                 {"error": "forbidden_origin"},
                 status=403,
@@ -1923,6 +1931,20 @@ def make_logout_handler(deps: ChatDeps):
                 allowed_origins=allowed,
                 same_origin_host=same_host,
             )
+        # IP-guard BEFORE peeking into the cookie. The cookie's
+        # `peek_name` (pre-HMAC) feeds a DB lookup that's otherwise an
+        # unauthenticated timing oracle for token-name existence —
+        # rate-limiting via the shared brute-force tracker forces an
+        # attacker through the same ip-block cadence as a /chat
+        # bearer-guess campaign.
+        ip = client_ip(request, trust_forwarded_for=deps.trust_forwarded_for)
+        blocked, retry_after = await deps.ip_guard.is_blocked(ip)
+        if blocked:
+            headers = build_cors_headers(
+                origin, allowed, same_origin_host=same_host
+            )
+            headers["Retry-After"] = str(retry_after)
+            return web.Response(status=429, headers=headers)
         # Identify the token: prefer bearer (CLI / fetch keepalive),
         # fall back to cookie (sendBeacon). The cookie's HMAC is
         # verified against the CURRENT token_hash so a stolen cookie
@@ -1967,16 +1989,29 @@ def make_logout_handler(deps: ChatDeps):
         if token_name is None:
             # No auth — still 204 (clears browser cookie) but log that
             # server-side invalidation didn't fire so operators can
-            # spot misconfigured frontends.
+            # spot misconfigured frontends. Also bump the IP failure
+            # counter so a logout-endpoint enumeration campaign (no
+            # bearer + cookies with forged peek-names) burns through
+            # the brute-force budget the same way a /chat bearer-
+            # guess does — kills the timing oracle that would
+            # otherwise be readable across the cookie peek-name DB
+            # lookup.
+            try:
+                await deps.ip_guard.record_failure(ip)
+            except Exception:
+                logger.exception(
+                    "[WebChatGateway] logout ip_guard.record_failure failed"
+                )
             try:
                 await deps.audit.write(
                     "logout_no_auth",
-                    ip=client_ip(request, trust_forwarded_for=deps.trust_forwarded_for),
+                    ip=ip,
                     detail={},
                 )
             except Exception:
                 pass
             return web.Response(status=204, headers=headers)
+        await deps.ip_guard.reset(ip)
         if deps.cookie_logout_tracker is not None:
             try:
                 deps.cookie_logout_tracker.record(token_name)
