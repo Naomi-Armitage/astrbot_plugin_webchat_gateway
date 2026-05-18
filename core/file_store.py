@@ -37,8 +37,6 @@ from urllib.parse import urlparse
 
 from astrbot.api import logger
 
-from .image_util import ALLOWED_MIME_TO_EXT
-
 
 class FileStore(Protocol):
     """Storage-driver-agnostic surface for image files.

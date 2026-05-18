@@ -543,7 +543,7 @@ def make_serve_handler(deps: UploadDeps):
                                 token_row.name, exp_ts=_exp
                             )
                         ):
-                            token_name_via_cookie = None
+                            pass  # fall through to 401
                         else:
                             token = token_row
                             # Cookie attests the token_name but does NOT

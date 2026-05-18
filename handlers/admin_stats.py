@@ -15,6 +15,7 @@ from ..storage.base import _UNSET, AbstractStorage
 from .admin_tokens import ServiceError, TokenService, gate_admin
 from .common import (
     client_ip,
+    error_response,
     extract_origin,
     is_origin_allowed,
     json_response,
@@ -63,17 +64,7 @@ def make_admin_handlers(deps: AdminDeps):
         return extract_origin(request, trust_referer_as_origin=trust_referer)
 
     def _err(request: web.Request, origin, exc: ServiceError) -> web.Response:
-        extra = None
-        if exc.code == "ip_blocked" and str(exc):
-            extra = {"Retry-After": str(exc)}
-        return json_response(
-            {"error": exc.code, "detail": str(exc) if str(exc) != exc.code else ""},
-            status=exc.status,
-            origin=origin,
-            allowed_origins=allowed,
-            extra_headers=extra,
-            same_origin_host=request.host,
-        )
+        return error_response(request, origin=origin, allowed=allowed, exc=exc)
 
     async def _gate(
         request: web.Request,

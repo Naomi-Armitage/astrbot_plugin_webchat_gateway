@@ -286,3 +286,37 @@ async def gate_request(
     return GatePass(
         token=token, ip=ip, origin=origin, allowed=allowed, same_host=same_host
     )
+
+
+def error_response(
+    request: web.Request,
+    *,
+    origin: str | None,
+    allowed: set[str],
+    exc: Any,
+) -> web.Response:
+    """Serialise a `ServiceError` into a CORS-aware JSON error response.
+
+    Three handler factories (admin_auth_routes, admin_stats,
+    conversations) had identical per-factory `_err` closures around
+    this body. The duplication was small (~12 LOC each) but a future
+    change to the error shape would have to land at three call sites.
+    Lift here; callers wrap as `_err = partial(error_response,
+    allowed=allowed)` or just call directly.
+
+    `exc` is typed `Any` so we don't import handlers.admin_tokens here
+    (would invert the dependency); duck-typed on `.code` / `.status` /
+    `str(exc)` matches the ServiceError contract.
+    """
+    extra = None
+    if exc.code == "ip_blocked" and str(exc):
+        extra = {"Retry-After": str(exc)}
+    detail = str(exc) if str(exc) != exc.code else ""
+    return json_response(
+        {"error": exc.code, "detail": detail},
+        status=exc.status,
+        origin=origin,
+        allowed_origins=allowed,
+        extra_headers=extra,
+        same_origin_host=request.host,
+    )

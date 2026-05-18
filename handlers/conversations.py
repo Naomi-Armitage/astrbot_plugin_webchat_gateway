@@ -51,7 +51,7 @@ from ..storage.base import (
 )
 from .admin_tokens import ServiceError
 from .common import (
-    client_ip,
+    error_response,
     extract_origin,
     gate_request,
     json_response,
@@ -2232,18 +2232,7 @@ def make_conversation_handlers(
     trust_referer = deps.trust_referer_as_origin
 
     def _err(request: web.Request, origin, exc: ServiceError) -> web.Response:
-        extra = None
-        if exc.code == "ip_blocked" and str(exc):
-            extra = {"Retry-After": str(exc)}
-        detail = str(exc) if str(exc) != exc.code else ""
-        return json_response(
-            {"error": exc.code, "detail": detail},
-            status=exc.status,
-            origin=origin,
-            allowed_origins=allowed,
-            extra_headers=extra,
-            same_origin_host=request.host,
-        )
+        return error_response(request, origin=origin, allowed=allowed, exc=exc)
 
     async def list_conversations(request: web.Request) -> web.Response:
         gated = await gate_request(request, deps)
