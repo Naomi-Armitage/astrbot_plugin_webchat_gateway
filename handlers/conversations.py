@@ -1373,6 +1373,31 @@ class ConversationService:
         if not last_user_text:
             raise ServiceError("message_not_found", status=404)
 
+        # Quota check BEFORE any side effect. A 429 here must not leave
+        # CM truncated or attachments released; ordering matches /chat.
+        today = date.today()
+        try:
+            today_count = await self._storage.get_today_usage(
+                token_name, day=today
+            )
+        except Exception:
+            logger.exception(
+                "[WebChatGateway] get_today_usage during regenerate failed"
+            )
+            today_count = 0
+        if today_count >= token_daily_quota:
+            await self._audit.write(
+                "quota_exceeded",
+                name=token_name,
+                ip=ip,
+                detail={
+                    "today_count": today_count,
+                    "quota": token_daily_quota,
+                    "operation": "regenerate",
+                },
+            )
+            raise ServiceError("quota_exceeded", status=429)
+
         # Truncate CM history to [0, target_raw_idx) and persist BEFORE
         # the LLM call. LlmBridge.generate_reply reads from CM via
         # `_history_text`; with the truncated history in place the
@@ -1403,32 +1428,6 @@ class ConversationService:
             surviving_history=truncated_history,
             log_label="regenerate_assistant_message",
         )
-
-        # Quota check + LLM call. Quota is read-then-increment; the
-        # per-token concurrency lock we're holding makes that safe
-        # (single-flight per token).
-        today = date.today()
-        try:
-            today_count = await self._storage.get_today_usage(
-                token_name, day=today
-            )
-        except Exception:
-            logger.exception(
-                "[WebChatGateway] get_today_usage during regenerate failed"
-            )
-            today_count = 0
-        if today_count >= token_daily_quota:
-            await self._audit.write(
-                "quota_exceeded",
-                name=token_name,
-                ip=ip,
-                detail={
-                    "today_count": today_count,
-                    "quota": token_daily_quota,
-                    "operation": "regenerate",
-                },
-            )
-            raise ServiceError("quota_exceeded", status=429)
 
         try:
             reply = await self._llm_bridge.generate_reply(
@@ -1541,29 +1540,47 @@ class ConversationService:
             now=now,
         )
 
-        # Emit message_deleted FIRST then message_added — peers apply
-        # the splice before the insertion so the new assistant lands
-        # at the same `message_index` slot the old one occupied.
-        await self._storage.append_updates(
-            token_name=token_name,
-            events=[
+        # Build per-tail deletion events. Mid-history regenerate also
+        # drops every rendered entry after the target (the LLM context
+        # only includes [0, target) and we just persisted that). Emit
+        # one message_deleted for each dropped rendered index in
+        # DESCENDING order so peers splicing head-to-tail don't see
+        # indices shift between events. Then message_added lands at
+        # the slot the target used to occupy.
+        rendered_to_raw = self._render_to_raw_indices(raw_history)
+        deletion_events: list[NewEvent] = []
+        for r in range(len(rendered_to_raw) - 1, message_index - 1, -1):
+            raw_i = rendered_to_raw[r]
+            if raw_i >= len(raw_history) or not isinstance(raw_history[raw_i], dict):
+                continue
+            dropped_role = str(
+                raw_history[raw_i].get("role") or ""
+            ).strip().lower()
+            if dropped_role not in ("user", "assistant"):
+                continue
+            deletion_events.append(
                 NewEvent(
                     event_type=EVENT_MESSAGE_DELETED,
                     session_id=session_id,
                     payload=json.dumps(
-                        {"index": message_index, "role": "assistant"},
+                        {"index": r, "role": dropped_role},
                         ensure_ascii=False,
                     ),
+                )
+            )
+        deletion_events.append(
+            NewEvent(
+                event_type=EVENT_MESSAGE_ADDED,
+                session_id=session_id,
+                payload=json.dumps(
+                    {"role": "assistant", "content": reply},
+                    ensure_ascii=False,
                 ),
-                NewEvent(
-                    event_type=EVENT_MESSAGE_ADDED,
-                    session_id=session_id,
-                    payload=json.dumps(
-                        {"role": "assistant", "content": reply},
-                        ensure_ascii=False,
-                    ),
-                ),
-            ],
+            )
+        )
+        await self._storage.append_updates(
+            token_name=token_name,
+            events=deletion_events,
             now=now,
         )
         await self._event_bus.notify(token_name)

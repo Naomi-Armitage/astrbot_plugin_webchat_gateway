@@ -444,10 +444,16 @@ marked.use({
 });
 
 // Telegram-style fenced code blocks: header (lang + copy-all button) +
-// per-line clickable spans. We replace marked's default `<pre><code>` with
-// a `.codeblock` div so we can attach the header and wrap each line; the
-// click handlers themselves live in a single delegated listener on the
-// message list (DOMPurify strips inline event handlers).
+// per-line clickable spans. The marked renderer only emits a SAFE
+// sentinel — `<pre class="codeblock-raw" data-codeblock-lang="...">
+// <code>{escaped code}</code></pre>` — which survives DOMPurify
+// unchanged. `decorateCodeblocks` then walks the sanitized DOM and
+// replaces each sentinel with the full chrome (`.codeblock` wrapper,
+// header, real <button>, per-line <span>s). This keeps the trusted
+// JS as the only source of buttons/data-action — a malicious assistant
+// reply can't smuggle an actionable button through markdown because
+// the renderMarkdown FORBID_TAGS/FORBID_ATTR config below also strips
+// <button> and data-action from the rendered HTML.
 function escapeCodeHtml(s: string): string {
   return s
     .replace(/&/g, "&amp;")
@@ -459,27 +465,64 @@ function escapeCodeHtml(s: string): string {
 marked.use({
   renderer: {
     code({ text, lang }) {
-      // Strip a single trailing newline so the last line isn't an empty span.
-      const body = text.replace(/\n$/, "");
-      const lines = body.split("\n");
-      const escapedLines = lines
-        .map((ln) => `<span class="codeblock-line">${escapeCodeHtml(ln) || "&#8203;"}</span>`)
-        .join("\n");
       const langLabel = (lang || "").trim();
-      const langHtml = langLabel
-        ? `<span class="codeblock-lang">${escapeCodeHtml(langLabel)}</span>`
-        : `<span class="codeblock-lang codeblock-lang-empty"></span>`;
+      const body = text.replace(/\n$/, "");
+      const langAttr = langLabel
+        ? ` data-codeblock-lang="${escapeCodeHtml(langLabel)}"`
+        : "";
       return (
-        `<div class="codeblock">`
-        + `<div class="codeblock-header">${langHtml}`
-        + `<button class="codeblock-copy" type="button" aria-label="复制全部">复制</button>`
-        + `</div>`
-        + `<pre class="codeblock-pre"><code class="codeblock-code">${escapedLines}</code></pre>`
-        + `</div>`
+        `<pre class="codeblock-raw"${langAttr}>`
+        + `<code>${escapeCodeHtml(body)}</code>`
+        + `</pre>`
       );
     },
   },
 });
+
+function decorateCodeblocks(root: Element): void {
+  const sentinels = root.querySelectorAll<HTMLElement>("pre.codeblock-raw");
+  sentinels.forEach((pre) => {
+    const codeEl = pre.querySelector("code");
+    if (!codeEl) return;
+    const text = codeEl.textContent ?? "";
+    const lang = pre.dataset.codeblockLang ?? "";
+    const wrapper = document.createElement("div");
+    wrapper.className = "codeblock";
+    const header = document.createElement("div");
+    header.className = "codeblock-header";
+    const langSpan = document.createElement("span");
+    if (lang) {
+      langSpan.className = "codeblock-lang";
+      langSpan.textContent = lang;
+    } else {
+      langSpan.className = "codeblock-lang codeblock-lang-empty";
+    }
+    const copyBtn = document.createElement("button");
+    copyBtn.type = "button";
+    copyBtn.className = "codeblock-copy";
+    copyBtn.setAttribute("aria-label", "复制全部");
+    copyBtn.textContent = "复制";
+    header.appendChild(langSpan);
+    header.appendChild(copyBtn);
+    const newPre = document.createElement("pre");
+    newPre.className = "codeblock-pre";
+    const newCode = document.createElement("code");
+    newCode.className = "codeblock-code";
+    const lines = text.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]!;
+      const span = document.createElement("span");
+      span.className = "codeblock-line";
+      span.textContent = line.length > 0 ? line : "​";
+      newCode.appendChild(span);
+      if (i < lines.length - 1) newCode.appendChild(document.createTextNode("\n"));
+    }
+    newPre.appendChild(newCode);
+    wrapper.appendChild(header);
+    wrapper.appendChild(newPre);
+    pre.replaceWith(wrapper);
+  });
+}
 
 // Open every link in a new tab with safe rel. DOMPurify lets attributes
 // like target/rel through but doesn't add them — that's a separate hook.
@@ -496,8 +539,16 @@ function renderMarkdown(text: string): string {
   // sync via the parse-as-string options.
   const html = marked.parse(text, { async: false }) as string;
   return DOMPurify.sanitize(html, {
-    FORBID_TAGS: ["style", "script", "iframe", "object", "embed", "form"],
-    FORBID_ATTR: ["formaction"],
+    // FORBID_TAGS includes `button` and FORBID_ATTR includes
+    // `data-action` so a malicious / hallucinated assistant reply can't
+    // smuggle a clickable `<button class="msg-action-btn"
+    // data-action="delete">` past sanitize — DOMPurify's default
+    // allow-list permits both, and our delegated handler dispatches on
+    // those exact selectors. Our trusted JS-built buttons (codeblock
+    // copy, per-message actions) are constructed via createElement
+    // after sanitize and bypass this filter entirely.
+    FORBID_TAGS: ["style", "script", "iframe", "object", "embed", "form", "button"],
+    FORBID_ATTR: ["formaction", "data-action"],
   });
 }
 
@@ -693,7 +744,10 @@ function addMessageBubble(
   }
   if (role === "bot") {
     div.classList.add("md");
-    if (text) div.innerHTML = renderMarkdown(text);
+    if (text) {
+      div.innerHTML = renderMarkdown(text);
+      decorateCodeblocks(div);
+    }
   } else if (text) {
     if (hasImages) {
       const span = document.createElement("div");
@@ -3512,6 +3566,7 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
     }
     displayedLength = pending.length;
     bubble.innerHTML = renderMarkdown(pending);
+    decorateCodeblocks(bubble);
     scrollToEnd();
   };
   const cancelRender = (): void => {
