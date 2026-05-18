@@ -35,10 +35,13 @@ from ..core.file_cookie import (
     build_set_cookie_value,
     verify as verify_file_cookie,
 )
-from ..core.file_lifecycle import release_files_safely
+from ..core.file_lifecycle import (
+    commit_attachments_or_release,
+    release_files_safely,
+)
 from ..core.file_store import FileStore
 from ..core.ip_guard import IpGuard
-from ..core.llm_bridge import LlmBridge
+from ..core.llm_bridge import LlmBridge, map_llm_error
 from ..core.ratelimit import PerTokenConcurrency
 from ..core.stream_registry import STREAM_ID_PATTERN, StreamRegistry
 from ..storage.base import AbstractStorage, FileRow, TokenRow
@@ -441,37 +444,15 @@ def make_chat_handler(deps: ChatDeps):
                 # so a transient timeout doesn't permanently consume the
                 # user's storage quota for a turn that produced no CM
                 # record (the orphan GC only sweeps committed=0 rows).
-                now_commit = int(time.time())
-                try:
-                    await deps.storage.mark_files_committed(
-                        [r.file_id for r in attachment_rows], now=now_commit
-                    )
-                    attachment_committed = True
-                except Exception:
-                    # FATAL: commit failure used to be silently swallowed,
-                    # which let the LLM call proceed and record_chat_pair
-                    # eventually write a CM ImageURLPart pointing at a
-                    # committed=0 file → the orphan GC would later delete
-                    # the file and the next history fetch would render a
-                    # broken thumbnail. Better to surface 500 here so
-                    # the user retries vs. silently corrupt CM state.
-                    logger.exception(
-                        "[WebChatGateway] mark_files_committed failed (non-stream)"
-                    )
-                    # Release any files that may have partially-committed
-                    # so the user's quota isn't pinned by a turn that
-                    # never reached the LLM.
-                    try:
-                        await release_files_safely(
-                            storage=deps.storage,
-                            file_store=deps.file_store,
-                            rows=attachment_rows,
-                            log_label="non_stream_chat_commit_fail",
-                        )
-                    except Exception:
-                        logger.exception(
-                            "[WebChatGateway] release on commit-fail raised"
-                        )
+                if not await commit_attachments_or_release(
+                    storage=deps.storage,
+                    file_store=deps.file_store,
+                    rows=attachment_rows,
+                    log_label="non_stream_chat",
+                ):
+                    # Commit failed AND the release attempt completed.
+                    # 500 the request so the user retries; CM stays
+                    # clean (no half-attached message_added).
                     return json_response(
                         {"error": "internal_error"},
                         status=500,
@@ -479,6 +460,7 @@ def make_chat_handler(deps: ChatDeps):
                         allowed_origins=allowed,
                         same_origin_host=same_host,
                     )
+                attachment_committed = True
                 for row in attachment_rows:
                     try:
                         local_path = await deps.file_store.open_local_path(
@@ -508,67 +490,27 @@ def make_chat_handler(deps: ChatDeps):
                         image_urls=image_urls or None,
                     )
                     llm_succeeded = True
-                except RuntimeError as exc:
-                    if str(exc) == "llm_timeout":
-                        await deps.audit.write(
-                            "llm_timeout",
-                            name=token.name,
-                            ip=ip,
-                            detail={"msg_len": len(data.message)},
-                        )
-                        return json_response(
-                            {"error": "llm_timeout"},
-                            status=504,
-                            origin=origin,
-                            allowed_origins=allowed,
-                            same_origin_host=same_host,
-                        )
-                    if str(exc) == "empty_reply":
-                        # Upstream returned finish_reason=stop with zero tokens.
-                        # Surface the specific code so the frontend can render
-                        # actionable copy ("model produced nothing — try again or
-                        # rephrase") rather than the generic llm_call_failed.
-                        await deps.audit.write(
-                            "chat_empty_reply",
-                            name=token.name,
-                            ip=ip,
-                            detail={"msg_len": len(data.message)},
-                        )
-                        return json_response(
-                            {"error": "empty_reply"},
-                            status=502,
-                            origin=origin,
-                            allowed_origins=allowed,
-                            same_origin_host=same_host,
-                        )
-                    # Internal exception text may leak provider names, paths, or
-                    # context near credentials — keep it in audit/log only and
-                    # return a stable error code to the caller.
-                    logger.exception("[WebChatGateway] LLM call failed")
-                    await deps.audit.write(
-                        "chat_error",
-                        name=token.name,
-                        ip=ip,
-                        detail={"error": str(exc)[:200]},
-                    )
-                    return json_response(
-                        {"error": "llm_call_failed"},
-                        status=500,
-                        origin=origin,
-                        allowed_origins=allowed,
-                        same_origin_host=same_host,
-                    )
                 except Exception as exc:
-                    logger.exception("[WebChatGateway] LLM call failed")
+                    code, status, audit_event = map_llm_error(exc)
+                    if status == 500:
+                        # Internal exception text may leak provider
+                        # names, paths, or context near credentials —
+                        # keep in audit/log only and return a stable
+                        # error code to the caller.
+                        logger.exception("[WebChatGateway] LLM call failed")
                     await deps.audit.write(
-                        "chat_error",
+                        audit_event,
                         name=token.name,
                         ip=ip,
-                        detail={"error": str(exc)[:200]},
+                        detail=(
+                            {"error": str(exc)[:200]}
+                            if status == 500
+                            else {"msg_len": len(data.message)}
+                        ),
                     )
                     return json_response(
-                        {"error": "llm_call_failed"},
-                        status=500,
+                        {"error": code},
+                        status=status,
                         origin=origin,
                         allowed_origins=allowed,
                         same_origin_host=same_host,

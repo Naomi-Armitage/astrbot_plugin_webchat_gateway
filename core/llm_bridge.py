@@ -25,6 +25,28 @@ except ImportError:  # pragma: no cover
         """Fallback shim when AstrBot doesn't export the real class."""
 
 
+def map_llm_error(exc: BaseException) -> tuple[str, int, str]:
+    """Map an LLM call exception to `(code, http_status, audit_event)`.
+
+    Centralised so /chat (non-stream), /chat/stream, and regenerate
+    all produce the same wire-level error taxonomy without re-spelling
+    the ladder. The internal exception text is NOT returned — callers
+    log it themselves; the caller-supplied audit detail is what
+    surfaces to operators.
+
+    * `RuntimeError("llm_timeout")` → `("llm_timeout", 504, "llm_timeout")`.
+    * `RuntimeError("empty_reply")` → `("empty_reply", 502, "chat_empty_reply")`.
+    * anything else → `("llm_call_failed", 500, "chat_error")`.
+    """
+    if isinstance(exc, RuntimeError):
+        code = str(exc)
+        if code == "llm_timeout":
+            return ("llm_timeout", 504, "llm_timeout")
+        if code == "empty_reply":
+            return ("empty_reply", 502, "chat_empty_reply")
+    return ("llm_call_failed", 500, "chat_error")
+
+
 class LlmBridge:
     """Wraps AstrBot LLM/persona/conversation calls for the WebChat pipeline."""
 

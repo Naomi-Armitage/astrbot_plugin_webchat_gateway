@@ -25,12 +25,64 @@ history, prune) on a flaky storage step.
 
 from __future__ import annotations
 
+import time
 from typing import Any, Iterable
 
 from astrbot.api import logger
 
 from ..storage.base import FileRow
 from .file_store import FileStore
+
+
+async def commit_attachments_or_release(
+    *,
+    storage: Any,
+    file_store: FileStore,
+    rows: list[FileRow],
+    log_label: str,
+) -> bool:
+    """Mark `rows` as committed=1. On failure, release files and return False.
+
+    Three /chat call sites (non-stream commit, stream-handshake commit,
+    regenerate-with-attachments) used to repeat the same envelope:
+    `mark_files_committed → try/except → release_files_safely → return
+    500`. Failing to release on commit-failure leaks the user's storage
+    quota (the orphan GC only sweeps committed=0 rows; a partial commit
+    that flips some rows to committed=1 with no CM record creates rows
+    no sweep ever revisits).
+
+    `True` means commit succeeded and the caller should continue.
+    `False` means commit failed AND the release attempt completed (best
+    effort) — the caller should surface an error response. Either way,
+    files in `rows` end up in a consistent state from the user's
+    quota perspective.
+    """
+    if not rows:
+        return True
+    now = int(time.time())
+    try:
+        await storage.mark_files_committed(
+            [r.file_id for r in rows], now=now
+        )
+        return True
+    except Exception:
+        logger.exception(
+            "[WebChatGateway] %s: mark_files_committed failed",
+            log_label,
+        )
+        try:
+            await release_files_safely(
+                storage=storage,
+                file_store=file_store,
+                rows=rows,
+                log_label=f"{log_label}_commit_fail",
+            )
+        except Exception:
+            logger.exception(
+                "[WebChatGateway] %s: release on commit-fail raised",
+                log_label,
+            )
+        return False
 
 
 async def release_files_safely(
@@ -94,4 +146,4 @@ async def release_files_safely(
     return len(storage_deleted_ids)
 
 
-__all__ = ["release_files_safely"]
+__all__ = ["release_files_safely", "commit_attachments_or_release"]

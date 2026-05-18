@@ -334,6 +334,19 @@ class ConfigView:
         trust_ref = _parse_bool(_get(cfg, "trust_referer_as_origin"), default=False)
         allow_missing = _parse_bool(_get(cfg, "allow_missing_origin"), default=False)
         admin_key = str(_get(cfg, "master_admin_key") or "").strip()
+        # Hard floor enforced here so the rest of the codebase never
+        # sees a too-short key. constant_time_eq + IP guard cover the
+        # online attack but a sub-16-char key is offline-crackable
+        # in minutes if logs ever leak. Clear the key so admin
+        # endpoints behave exactly as if it were unset; the warning
+        # is logged once at parse time.
+        if admin_key and len(admin_key) < 16:
+            logger.error(
+                "[WebChatGateway] master_admin_key MUST be >= 16 chars; "
+                "current length=%d. Admin endpoints DISABLED until rotated.",
+                len(admin_key),
+            )
+            admin_key = ""
         llm_timeout = _clamp_int(
             _get(cfg, "llm_timeout_seconds"), default=60, lo=5, hi=600
         )

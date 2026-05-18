@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING, Any
 from astrbot.api import logger
 
 from .audit import AuditLogger
+from .file_lifecycle import release_files_safely
 from .ratelimit import PerTokenConcurrency
 from .stream_buffer import BufferFullError, StreamBuffer, StreamBufferEntry
 
@@ -592,10 +593,6 @@ class StreamRegistry:
             rows.append(row)
         if not rows:
             return
-        # Import locally to avoid a circular import with core.file_lifecycle
-        # (which itself imports from storage.base — module load order).
-        from .file_lifecycle import release_files_safely
-
         await release_files_safely(
             storage=self._storage,
             file_store=self._file_store,

@@ -32,7 +32,7 @@ web/
 npm install
 ```
 
-不提交 `package-lock.json`；本地装完即可。
+`package-lock.json` 提交进仓 —— CI 用 `npm ci` 锁版本，本地 `npm install` 也会自动更新它，请把改动一并提交。
 
 ## 构建
 

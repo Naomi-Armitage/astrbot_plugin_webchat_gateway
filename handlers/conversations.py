@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import json
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 
 from aiohttp import web
 
@@ -39,7 +40,7 @@ from ..core.event_bus import EventBus
 from ..core.file_lifecycle import release_files_safely
 from ..core.file_store import FileStore
 from ..core.ip_guard import IpGuard
-from ..core.llm_bridge import LlmBridge
+from ..core.llm_bridge import LlmBridge, map_llm_error
 from ..core.ratelimit import PerTokenConcurrency
 from ..storage.base import (
     _UNSET,
@@ -210,6 +211,41 @@ def _extract_attachment_file_ids(content: Any) -> list[str]:
     return file_ids
 
 
+def _renderable_entry(item: Any) -> tuple[str, str, list[str]] | None:
+    """Return `(role, text, file_ids)` if the CM entry should render, else None.
+
+    Single source of truth for the rules `_normalize_history` and
+    `_render_to_raw_indices` both apply — without this they had two
+    independent walks of the same drop logic, and a future rule
+    change touching one but not the other would silently desync the
+    rendered-index ↔ raw-index mapping that delete/regenerate rely
+    on (the splice would target the wrong row).
+
+    Kept entries:
+      * role is "user" or "assistant" (lowercased)
+      * NOT an empty-text assistant with no attachments (we never
+        emit those, so they're stale noise)
+      * Empty-text user messages WITH no attachments are STILL kept
+        — `content=""` carries the "image-only look at this" turn
+        whose attachments live in the chat-sync overlay layer; the
+        normalize pass then attaches them via _build_history_overlay.
+    """
+    if not isinstance(item, dict):
+        return None
+    role = str(item.get("role") or "").strip().lower()
+    if role not in ("user", "assistant"):
+        return None
+    text = _extract_text(item.get("content"))
+    file_ids = (
+        list(_extract_attachment_file_ids(item.get("content")))
+        if role == "user"
+        else []
+    )
+    if not text and role != "user" and not file_ids:
+        return None
+    return role, text, file_ids
+
+
 def _normalize_history(raw: Any) -> list[dict]:
     """CM history is JSON; render it as `[{role, content, attachments?}, ...]`.
     Tool calls, system messages, anything we can't flatten to text are
@@ -236,19 +272,10 @@ def _normalize_history(raw: Any) -> list[dict]:
         return []
     out: list[dict] = []
     for item in raw:
-        if not isinstance(item, dict):
+        kept = _renderable_entry(item)
+        if kept is None:
             continue
-        role = str(item.get("role") or "").strip().lower()
-        if role not in ("user", "assistant"):
-            continue
-        text = _extract_text(item.get("content"))
-        file_ids = (
-            _extract_attachment_file_ids(item.get("content"))
-            if role == "user"
-            else []
-        )
-        if not text and role != "user" and not file_ids:
-            continue
+        role, text, file_ids = kept
         entry: dict[str, Any] = {"role": role, "content": text}
         if file_ids:
             # Mime is filled in by the caller via a batched lookup.
@@ -300,6 +327,39 @@ class ConversationService:
     @staticmethod
     def _now() -> int:
         return int(time.time())
+
+    @asynccontextmanager
+    async def _with_concurrency(
+        self,
+        *,
+        token_name: str,
+        operation: str,
+        session_id: str,
+        ip: str | None,
+    ) -> AsyncIterator[None]:
+        """Serialise the wrapped block against the per-token lock.
+
+        Three CM-mutating endpoints (clear_history, delete_message_by_index,
+        regenerate_assistant_message) need the same envelope: acquire the
+        token's `PerTokenConcurrency` lock, surface contention as 429
+        concurrent_request, and write a `concurrent_block` audit row so
+        operators can correlate user-visible retries with lock contention.
+        Tests construct the service without a concurrency manager — in
+        that case we yield through.
+        """
+        if self._concurrency is None:
+            yield
+            return
+        async with self._concurrency.acquire(token_name) as acquired:
+            if not acquired:
+                await self._audit.write(
+                    "concurrent_block",
+                    name=token_name,
+                    ip=ip,
+                    detail={"operation": operation, "session_id": session_id},
+                )
+                raise ServiceError("concurrent_request", status=429)
+            yield
 
     async def _cm_history_raw(
         self, *, token_name: str, session_id: str
@@ -362,26 +422,15 @@ class ConversationService:
         rendered index has no surviving entry the list is shorter than
         the rendered history — callers should bounds-check on
         `len(out)`, which equals the size of `_normalize_history(raw)`.
+
+        Shares the keep-predicate `_renderable_entry` with
+        `_normalize_history` so a future rule change can't desync
+        the index mapping from the rendered output.
         """
         out: list[int] = []
         for i, item in enumerate(raw):
-            if not isinstance(item, dict):
-                continue
-            role = str(item.get("role") or "").strip().lower()
-            if role not in ("user", "assistant"):
-                continue
-            text = _extract_text(item.get("content"))
-            file_ids = (
-                _extract_attachment_file_ids(item.get("content"))
-                if role == "user"
-                else []
-            )
-            # Mirror `_normalize_history`'s drop rules verbatim. Empty-text
-            # user messages with no attachments are still preserved (image-
-            # only "look at this" turns); empty assistant messages are dropped.
-            if not text and role != "user" and not file_ids:
-                continue
-            out.append(i)
+            if _renderable_entry(item) is not None:
+                out.append(i)
         return out
 
     async def _cm_history(
@@ -931,22 +980,15 @@ class ConversationService:
         # that as 429 concurrent_request so the user retries once the
         # stream finishes, consistent with /chat's own contention
         # behavior on the same token.
-        if self._concurrency is not None:
-            async with self._concurrency.acquire(token_name) as acquired:
-                if not acquired:
-                    await self._audit.write(
-                        "concurrent_block",
-                        name=token_name,
-                        ip=ip,
-                        detail={"operation": "clear_history", "session_id": session_id},
-                    )
-                    raise ServiceError("concurrent_request", status=429)
-                return await self._clear_history_inner(
-                    token_name=token_name, session_id=session_id, ip=ip
-                )
-        return await self._clear_history_inner(
-            token_name=token_name, session_id=session_id, ip=ip
-        )
+        async with self._with_concurrency(
+            token_name=token_name,
+            operation="clear_history",
+            session_id=session_id,
+            ip=ip,
+        ):
+            return await self._clear_history_inner(
+                token_name=token_name, session_id=session_id, ip=ip
+            )
 
     async def _clear_history_inner(
         self,
@@ -1166,25 +1208,12 @@ class ConversationService:
         across two messages (rare, but possible via copy-paste). The
         check walks the spliced raw CM list once after the splice.
         """
-        if self._concurrency is None:
-            # Defensive: ConversationDeps always wires this in real
-            # deployments. Without the lock a stream race could write a
-            # CM ImageURLPart pointing at a file we're about to release.
-            return await self._delete_message_inner(
-                token_name=token_name,
-                session_id=session_id,
-                message_index=message_index,
-                ip=ip,
-            )
-        async with self._concurrency.acquire(token_name) as acquired:
-            if not acquired:
-                await self._audit.write(
-                    "concurrent_block",
-                    name=token_name,
-                    ip=ip,
-                    detail={"operation": "delete_message", "session_id": session_id},
-                )
-                raise ServiceError("concurrent_request", status=429)
+        async with self._with_concurrency(
+            token_name=token_name,
+            operation="delete_message",
+            session_id=session_id,
+            ip=ip,
+        ):
             return await self._delete_message_inner(
                 token_name=token_name,
                 session_id=session_id,
@@ -1325,24 +1354,12 @@ class ConversationService:
             # is a deployment bug, not a runtime condition the user
             # should see.
             raise ServiceError("internal_error", status=500)
-        if self._concurrency is None:
-            return await self._regenerate_inner(
-                token_name=token_name,
-                session_id=session_id,
-                message_index=message_index,
-                username=username,
-                token_daily_quota=token_daily_quota,
-                ip=ip,
-            )
-        async with self._concurrency.acquire(token_name) as acquired:
-            if not acquired:
-                await self._audit.write(
-                    "concurrent_block",
-                    name=token_name,
-                    ip=ip,
-                    detail={"operation": "regenerate", "session_id": session_id},
-                )
-                raise ServiceError("concurrent_request", status=429)
+        async with self._with_concurrency(
+            token_name=token_name,
+            operation="regenerate",
+            session_id=session_id,
+            ip=ip,
+        ):
             return await self._regenerate_inner(
                 token_name=token_name,
                 session_id=session_id,
@@ -1508,51 +1525,22 @@ class ConversationService:
                 message=last_user_text,
                 image_urls=image_urls or None,
             )
-        except RuntimeError as exc:
-            code = str(exc)
-            if code == "llm_timeout":
-                await self._audit.write(
-                    "llm_timeout",
-                    name=token_name,
-                    ip=ip,
-                    detail={"operation": "regenerate"},
-                )
-                raise ServiceError("llm_timeout", status=504) from None
-            if code == "empty_reply":
-                await self._audit.write(
-                    "chat_empty_reply",
-                    name=token_name,
-                    ip=ip,
-                    detail={"operation": "regenerate"},
-                )
-                raise ServiceError("empty_reply", status=502) from None
-            logger.exception(
-                "[WebChatGateway] regenerate LLM call failed"
-            )
-            await self._audit.write(
-                "chat_error",
-                name=token_name,
-                ip=ip,
-                detail={
-                    "operation": "regenerate",
-                    "error": code[:200],
-                },
-            )
-            raise ServiceError("llm_call_failed", status=500) from None
         except Exception as exc:
-            logger.exception(
-                "[WebChatGateway] regenerate LLM call failed"
-            )
+            code, status, audit_event = map_llm_error(exc)
+            if status == 500:
+                logger.exception(
+                    "[WebChatGateway] regenerate LLM call failed"
+                )
             await self._audit.write(
-                "chat_error",
+                audit_event,
                 name=token_name,
                 ip=ip,
                 detail={
                     "operation": "regenerate",
-                    "error": str(exc)[:200],
+                    "error": str(exc)[:200] if status == 500 else "",
                 },
             )
-            raise ServiceError("llm_call_failed", status=500) from None
+            raise ServiceError(code, status=status) from None
 
         # LLM succeeded — append the new assistant reply to the
         # truncated history. We use `AssistantMessageSegment` /
