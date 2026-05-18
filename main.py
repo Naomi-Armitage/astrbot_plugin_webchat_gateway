@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import datetime as _dt
 import random
-import time
 from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
@@ -23,6 +22,7 @@ from .core.event_bus import EventBus
 from .core.file_store import FileStore, make_file_store_from_config
 from .core.ip_guard import IpGuard
 from .core.llm_bridge import LlmBridge
+from .core.prune_orchestrator import PruneOrchestrator, PruneRetentionConfig
 from .core.ratelimit import PerTokenConcurrency, PerTokenUploadGate
 from .core.stream_buffer import InMemoryBuffer, RedisBuffer, StreamBuffer
 from .core.stream_registry import StreamRegistry
@@ -372,231 +372,42 @@ class WebChatGatewayPlugin(Star):
         )
 
     async def _chat_sync_prune_loop(self) -> None:
-        """Periodically prune the event log + soft-deleted session meta
-        + attachment files past retention.
+        """Thin wrapper around `PruneOrchestrator.run_forever`.
 
-        Orchestration (DB-first ordering would leak storage objects on
-        crash — see `release_files_safely` rationale):
-
-            1. List candidate file rows (orphans + cascade) — read-only.
-            2. List sessions about to be physically pruned — read-only.
-            3. Clear AstrBot CM history for each candidate session.
-               Collect (token, session) pairs whose CM clear raised
-               into `cm_failed`.
-            4. Filter the file candidates to exclude any whose
-               (token, session) is in `cm_failed`. This is the
-               symmetry guarantee: a CM-clear failure protects BOTH
-               session_meta AND its cascade files this iteration, so
-               an operator inspecting a stalled retry sees a consistent
-               snapshot (files + meta both still present) rather than
-               "files gone but meta retained" which would be harder
-               to diagnose.
-            5. For each filtered file: `file_store.delete(storage_key)`,
-               then `delete_files_by_ids()` for the ones whose storage
-               delete succeeded (storage-first, DB-second).
-            6. `storage.prune_chat_sync(exclude_sessions=cm_failed)` —
-               drops old events + soft-deleted session_meta. The
-               session_meta DELETE has both a `NOT EXISTS(file)` guard
-               (covers file-delete failures) and a `NOT (token=?
-               AND session=?)` chain for the explicit cm_failed
-               exclusions.
-
-        Next prune iteration re-discovers cm_failed sessions via
-        list_sessions_to_purge and retries CM clear; the cascade
-        files are re-included in step 1 (because their DB rows
-        survived step 5 thanks to the filter), so on success the
-        entire session drains atomically.
-
-        First iteration runs after a short randomised delay (60-120s)
-        so a process that crashed during a prior prune doesn't have to
-        wait a full day for its leftover orphans to be cleaned up.
-        Tolerates errors at each step; the next iteration retries.
+        Orchestration moved to `core.prune_orchestrator` to keep the
+        plugin entry class focused on AstrBot lifecycle. The wrapper
+        constructs the orchestrator lazily (storage / file_store may
+        be None during the boot-delay window if `_start` is still
+        wiring them) and forwards cancellation.
         """
         try:
-            # First run: short randomised delay so committed=0 orphans
-            # left over from a prior process crash don't occupy quota
-            # for a full day. Multi-instance deployments don't sync up.
+            # Boot delay applied here so we can early-return cleanly
+            # if `_start`'s teardown fires before deps are ready.
             first_delay = random.uniform(
                 self._CHAT_SYNC_PRUNE_BOOT_DELAY_MIN_SECONDS,
                 self._CHAT_SYNC_PRUNE_BOOT_DELAY_MAX_SECONDS,
             )
             await asyncio.sleep(first_delay)
             while True:
+                storage = self._storage
+                file_store = self._file_store
+                if storage is None:
+                    return
+                orchestrator = PruneOrchestrator(
+                    storage=storage,
+                    file_store=file_store,
+                    cm=self.context.conversation_manager,
+                    config=PruneRetentionConfig(
+                        interval_seconds=self._CHAT_SYNC_PRUNE_INTERVAL_SECONDS,
+                        events_retention_seconds=self._CHAT_SYNC_EVENTS_RETENTION_SECONDS,
+                        deleted_meta_retention_seconds=self._CHAT_SYNC_DELETED_META_RETENTION_SECONDS,
+                        upload_orphan_retention_seconds=self._UPLOAD_ORPHAN_RETENTION_SECONDS,
+                    ),
+                    cookie_logout_tracker=self._cookie_logout_tracker,
+                    event_bus=self._event_bus,
+                )
                 try:
-                    storage = self._storage
-                    file_store = self._file_store
-                    if storage is None:
-                        return
-                    now = int(time.time())
-
-                    # Step 1: list candidate file rows (read-only).
-                    files_to_delete = await storage.list_files_to_prune(
-                        deleted_meta_before_ts=now
-                        - self._CHAT_SYNC_DELETED_META_RETENTION_SECONDS,
-                        uncommitted_files_before_ts=now
-                        - self._UPLOAD_ORPHAN_RETENTION_SECONDS,
-                    )
-
-                    # Step 2: list sessions about to be pruned (read-only).
-                    sessions_to_purge = (
-                        await storage.list_sessions_to_purge(
-                            deleted_before_ts=now
-                            - self._CHAT_SYNC_DELETED_META_RETENTION_SECONDS,
-                        )
-                    )
-
-                    # Step 3: CM clear, collect failures. The CM call
-                    # runs BEFORE file deletion so a failure can
-                    # protect the session's cascade files in step 4 —
-                    # without this ordering the files would be gone
-                    # before we knew CM was stuck, and the asymmetric
-                    # state ("files deleted, meta retained, CM stale")
-                    # would be harder to recover from.
-                    sessions_purged = 0
-                    cm_failed: list[tuple[str, str]] = []
-                    cm = self.context.conversation_manager
-                    for token_name, session_id in sessions_to_purge:
-                        umo = f"webchat_gateway:{token_name}:{session_id}"
-                        try:
-                            cid = await cm.get_curr_conversation_id(umo)
-                            if cid:
-                                await cm.update_conversation(
-                                    unified_msg_origin=umo,
-                                    conversation_id=cid,
-                                    history=[],
-                                )
-                            # "Purged" counts both "cleared CM content"
-                            # and "no CM conversation to clear" — both
-                            # are successful outcomes from the
-                            # cleanup's perspective. Only outright
-                            # exceptions count as failures.
-                            sessions_purged += 1
-                        except Exception:
-                            logger.exception(
-                                "[WebChatGateway] CM clear during prune "
-                                "failed token=%s session=%s",
-                                token_name,
-                                session_id,
-                            )
-                            cm_failed.append((token_name, session_id))
-
-                    # Step 4: filter files by cm_failed sessions.
-                    # Symmetric protection: a session whose CM clear
-                    # failed retains its meta (via exclude_sessions in
-                    # step 6) AND its cascade files (via this filter).
-                    # Orphans without a session_meta row are
-                    # unaffected — they're never in cm_failed (the
-                    # source is list_sessions_to_purge).
-                    cm_failed_set = set(cm_failed)
-                    if cm_failed_set:
-                        filtered_files = [
-                            r
-                            for r in files_to_delete
-                            if (r.token_name, r.session_id)
-                            not in cm_failed_set
-                        ]
-                    else:
-                        filtered_files = files_to_delete
-                    files_protected = (
-                        len(files_to_delete) - len(filtered_files)
-                    )
-
-                    # Step 5: storage delete first, then DB rows
-                    # of those that succeeded. Failed-storage-delete
-                    # rows survive and are re-discovered next iter.
-                    files_deleted = 0
-                    if file_store is not None and filtered_files:
-                        from .core.file_lifecycle import release_files_safely
-
-                        files_deleted = await release_files_safely(
-                            storage=storage,
-                            file_store=file_store,
-                            rows=filtered_files,
-                            log_label="prune_loop",
-                        )
-
-                    # Step 6: events + session_meta. session_meta DELETE
-                    # uses NOT EXISTS (file) so any cascade file whose
-                    # storage delete failed in step 5 keeps its
-                    # session_meta around for next iter to retry. The
-                    # `exclude_sessions` list above adds the second
-                    # retry mechanism for CM-clear failures.
-                    result = await storage.prune_chat_sync(
-                        events_before_ts=now
-                        - self._CHAT_SYNC_EVENTS_RETENTION_SECONDS,
-                        deleted_meta_before_ts=now
-                        - self._CHAT_SYNC_DELETED_META_RETENTION_SECONDS,
-                        exclude_sessions=cm_failed or None,
-                    )
-                    events_pruned, meta_pruned = result
-                    if (
-                        events_pruned
-                        or meta_pruned
-                        or files_to_delete
-                        or sessions_purged
-                        or cm_failed
-                    ):
-                        logger.info(
-                            "[WebChatGateway] chat-sync prune: events=%d "
-                            "meta=%d files=%d/%d cm_cleared=%d "
-                            "cm_failed=%d files_protected=%d",
-                            events_pruned,
-                            meta_pruned,
-                            files_deleted,
-                            len(filtered_files),
-                            sessions_purged,
-                            len(cm_failed),
-                            files_protected,
-                        )
-                    # In-memory bookkeeping for cookie-invalidation
-                    # tracker. Bounded by token-name cardinality, but
-                    # tokens deleted via admin actions leave entries
-                    # here permanently without a periodic prune.
-                    if self._cookie_logout_tracker is not None:
-                        try:
-                            self._cookie_logout_tracker.prune_expired()
-                        except Exception:
-                            logger.exception(
-                                "[WebChatGateway] cookie_logout_tracker prune failed"
-                            )
-                    # ip_failures rows accumulate one per distinct
-                    # probing IP and only get DELETEd on the rare
-                    # `reset` path (successful auth from the same
-                    # IP). Drop anything not touched in the last
-                    # 24h — `is_blocked`'s read path already returns
-                    # False once `blocked_until < now`, so a stale
-                    # row beyond that window is effectively dead.
-                    try:
-                        await storage.prune_ip_failures(
-                            before_ts=now - 24 * 3600,
-                        )
-                    except Exception:
-                        logger.exception(
-                            "[WebChatGateway] prune_ip_failures failed"
-                        )
-                    # EventBus accumulates one cond+counter per
-                    # distinct token name awaited on; deleted tokens
-                    # never get reaped. Drop entries with zero
-                    # waiters.
-                    if self._event_bus is not None:
-                        try:
-                            await self._event_bus.prune_idle()
-                        except Exception:
-                            logger.exception(
-                                "[WebChatGateway] event_bus prune_idle failed"
-                            )
-                    # R2FileStore caches one asyncio.Lock per
-                    # storage_key ever fetched. Drop the idle ones
-                    # (LocalFileStore doesn't have this attribute).
-                    if file_store is not None and hasattr(
-                        file_store, "prune_idle_key_locks"
-                    ):
-                        try:
-                            await file_store.prune_idle_key_locks()
-                        except Exception:
-                            logger.exception(
-                                "[WebChatGateway] file_store key-lock prune failed"
-                            )
+                    await orchestrator.run_iteration()
                 except asyncio.CancelledError:
                     raise
                 except Exception:

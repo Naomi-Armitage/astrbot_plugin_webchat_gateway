@@ -219,85 +219,19 @@ async def _parse_chat_body(
 
 def make_chat_handler(deps: ChatDeps):
     async def handle(request: web.Request) -> web.Response:
-        origin = extract_origin(
-            request, trust_referer_as_origin=deps.trust_referer_as_origin
-        )
-        allowed = deps.allowed_origins
-        same_host = request.host
+        # Origin allow-list → IP brute-force → bearer auth, all in one
+        # shared helper so the non-stream /chat path can't drift from
+        # the streaming sibling or any /conversations endpoint.
+        gated = await gate_request(request, deps)
+        if isinstance(gated, web.Response):
+            return gated
+        origin = gated.origin
+        allowed = gated.allowed
+        same_host = gated.same_host
+        ip = gated.ip
+        token = gated.token
 
-        # 1. Origin allow-list
-        if not is_origin_allowed(
-            origin,
-            allowed,
-            same_origin_host=same_host,
-            allow_missing=deps.allow_missing_origin,
-        ):
-            return json_response(
-                {"error": "forbidden_origin"},
-                status=403,
-                origin=origin,
-                allowed_origins=allowed,
-                same_origin_host=same_host,
-            )
-
-        ip = client_ip(request, trust_forwarded_for=deps.trust_forwarded_for)
-
-        # 2. IP brute-force gate
-        blocked, retry_after = await deps.ip_guard.is_blocked(ip)
-        if blocked:
-            return json_response(
-                {"error": "ip_blocked", "retry_after": retry_after},
-                status=429,
-                origin=origin,
-                allowed_origins=allowed,
-                extra_headers={"Retry-After": str(retry_after)},
-                same_origin_host=same_host,
-            )
-
-        # 3. Auth
-        presented = extract_bearer(request)
-        if not presented:
-            await deps.ip_guard.record_failure(ip)
-            await deps.audit.write("auth_fail", ip=ip, detail={"reason": "no_token"})
-            return json_response(
-                {"error": "unauthorized"},
-                status=401,
-                origin=origin,
-                allowed_origins=allowed,
-                same_origin_host=same_host,
-            )
-        token = await deps.storage.get_token_by_hash(hash_token(presented))
-        now_ts = int(time.time())
-        expired = token is not None and _is_expired(token, now_ts)
-        if token is None or token.revoked_at is not None or expired:
-            # Only blind probing (token not found) counts toward IP brute-force.
-            # A friend retrying a freshly revoked OR expired token is
-            # misconfiguration, not an attacker — penalising their IP would
-            # lock them out for ip_brute_force_block_seconds with no recourse.
-            if token is None:
-                await deps.ip_guard.record_failure(ip)
-            if token is None:
-                reason = "invalid"
-            elif token.revoked_at is not None:
-                reason = "revoked"
-            else:
-                reason = "expired"
-            await deps.audit.write(
-                "auth_fail",
-                ip=ip,
-                detail={"reason": reason},
-            )
-            return json_response(
-                {"error": "unauthorized"},
-                status=401,
-                origin=origin,
-                allowed_origins=allowed,
-                same_origin_host=same_host,
-            )
-        # Valid auth — clear failures for this IP.
-        await deps.ip_guard.reset(ip)
-
-        # 4. Parse + length check (before taking the per-token lock so a slow
+        # Parse + length check (before taking the per-token lock so a slow
         # body cannot pin the slot).
         try:
             payload = await request.json()
