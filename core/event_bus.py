@@ -85,5 +85,25 @@ class EventBus:
         async with cond:
             cond.notify_all()
 
+    async def prune_idle(self) -> int:
+        """Drop `_conds` entries for tokens with zero active waiters.
+
+        Without this the dict grows by distinct token name forever
+        (a deleted token's entry never gets reaped). Safe to call
+        concurrently with `wait` / `notify` — we hold `_dict_lock`
+        while reading `_waiter_counts` and only drop conds whose
+        counter is 0 or missing. Returns the number dropped.
+        """
+        async with self._dict_lock:
+            idle = [
+                token
+                for token in self._conds
+                if self._waiter_counts.get(token, 0) <= 0
+            ]
+            for token in idle:
+                self._conds.pop(token, None)
+                self._waiter_counts.pop(token, None)
+        return len(idle)
+
 
 __all__ = ["EventBus"]

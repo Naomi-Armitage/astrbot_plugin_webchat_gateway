@@ -310,6 +310,24 @@ class R2FileStore:
                 self._key_locks[storage_key] = lock
             return lock
 
+    async def prune_idle_key_locks(self) -> int:
+        """Drop `_key_locks` entries that aren't currently held.
+
+        Without this the dict grows by storage_key over the lifetime
+        of the process (one entry per file ever fetched into cache).
+        Safe to call from a periodic GC: holds `_key_locks_lock`
+        while inspecting `Lock.locked()` and only removes idle
+        entries.
+        """
+        async with self._key_locks_lock:
+            idle = [
+                key for key, lock in self._key_locks.items()
+                if not lock.locked()
+            ]
+            for key in idle:
+                del self._key_locks[key]
+        return len(idle)
+
     async def _ensure_cache_dir(self) -> Path:
         if self._cache_dir is not None:
             return self._cache_dir

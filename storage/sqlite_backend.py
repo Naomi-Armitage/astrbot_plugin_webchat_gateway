@@ -455,6 +455,16 @@ class SqliteStorage(AbstractStorage):
             await self._db.execute("DELETE FROM ip_failures WHERE ip = ?", (ip,))
             await self._db.commit()
 
+    async def prune_ip_failures(self, *, before_ts: int) -> int:
+        async with self._write_lock:
+            cur = await self._db.execute(
+                "DELETE FROM ip_failures WHERE last_fail_ts < ?",
+                (before_ts,),
+            )
+            count = cur.rowcount or 0
+            await self._db.commit()
+        return count
+
     # ----- audit -----
     async def write_audit(
         self,

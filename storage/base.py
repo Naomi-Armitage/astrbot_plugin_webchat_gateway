@@ -211,6 +211,17 @@ class AbstractStorage(ABC):
     @abstractmethod
     async def reset_ip_failures(self, ip: str) -> None: ...
 
+    @abstractmethod
+    async def prune_ip_failures(self, *, before_ts: int) -> int:
+        """Delete stale ip_failures rows whose `last_fail_ts < before_ts`.
+
+        Without this, the table grows unbounded with attacker-controlled
+        cardinality — every distinct probe IP leaves a row that never
+        gets reset (the `reset_ip_failures` path only fires on
+        successful auth from the SAME ip). Returns the row count
+        actually deleted.
+        """
+
     # ----- audit -----
     @abstractmethod
     async def write_audit(

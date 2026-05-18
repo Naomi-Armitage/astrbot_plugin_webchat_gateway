@@ -84,5 +84,30 @@ class CookieLogoutTracker:
             return False
         return exp_ts <= threshold
 
+    def prune_expired(self, *, now: int | None = None) -> int:
+        """Drop tracker entries whose threshold can no longer
+        invalidate any live cookie. Returns the number of entries
+        dropped.
+
+        An entry's invalidation predicate `exp_ts <= threshold` can
+        only fire while a cookie with `exp_ts <= threshold` still
+        exists. The longest-lived live cookie was issued just
+        before the most recent `record(...)` call, so its `exp_ts`
+        is at most `threshold + ttl`. Once wall-clock advances past
+        `threshold + ttl`, no live cookie can match — drop the
+        entry to bound memory.
+
+        Called from the daily retention-prune loop; safe to call
+        more often (idempotent).
+        """
+        ts = int(time.time()) if now is None else int(now)
+        cutoff = ts - self._default_ttl
+        dropped = 0
+        for name in list(self._thresholds.keys()):
+            if self._thresholds[name] <= cutoff:
+                del self._thresholds[name]
+                dropped += 1
+        return dropped
+
 
 __all__ = ["CookieLogoutTracker"]

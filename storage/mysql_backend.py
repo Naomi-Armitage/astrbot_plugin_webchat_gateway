@@ -541,6 +541,15 @@ class MysqlStorage(AbstractStorage):
             async with conn.cursor() as cur:
                 await cur.execute("DELETE FROM ip_failures WHERE ip = %s", (ip,))
 
+    async def prune_ip_failures(self, *, before_ts: int) -> int:
+        async with self._write_tx() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "DELETE FROM ip_failures WHERE last_fail_ts < %s",
+                    (before_ts,),
+                )
+                return cur.rowcount or 0
+
     # ----- audit -----
     async def write_audit(
         self,

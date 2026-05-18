@@ -45,7 +45,15 @@ class WebChatGatewayPlugin(Star):
     # rows older than the deleted-meta cutoff are physically removed.
     # Uncommitted file uploads older than the file-orphan cutoff are
     # collected in the same pass — tab-close abandonment.
-    _CHAT_SYNC_PRUNE_INTERVAL_SECONDS = 24 * 3600
+    # Periodic retention prune. Cadence is short enough that
+    # `_UPLOAD_ORPHAN_RETENTION_SECONDS` (1h) actually fires within
+    # 1-2× that window — the original 24h cadence let uncommitted
+    # uploads occupy `per_token_storage_mb` for up to 25 hours after
+    # tab-close abandonment. The heavy DELETEs are bounded by the
+    # expired-row count (NOT table size — indices cover the WHERE),
+    # so 4× per day costs roughly the same total work as 1× per day,
+    # just amortized.
+    _CHAT_SYNC_PRUNE_INTERVAL_SECONDS = 6 * 3600
     _CHAT_SYNC_EVENTS_RETENTION_SECONDS = 14 * 86400
     _CHAT_SYNC_DELETED_META_RETENTION_SECONDS = 90 * 86400
     _UPLOAD_ORPHAN_RETENTION_SECONDS = 3600
@@ -72,6 +80,8 @@ class WebChatGatewayPlugin(Star):
         self._file_store: FileStore | None = None
         self._prune_task: asyncio.Task[None] | None = None
         self._registry: StreamRegistry | None = None
+        self._cookie_logout_tracker: CookieLogoutTracker | None = None
+        self._event_bus: EventBus | None = None
 
     async def initialize(self) -> None:
         await self._start()
@@ -132,6 +142,7 @@ class WebChatGatewayPlugin(Star):
             )
 
             event_bus = EventBus()
+            self._event_bus = event_bus
 
             # FileStore (image uploads). Always constructed even when
             # `uploads.enabled=False` — the conversations layer needs a
@@ -238,6 +249,7 @@ class WebChatGatewayPlugin(Star):
             cookie_logout_tracker = CookieLogoutTracker(
                 default_ttl_seconds=DEFAULT_TTL_SECONDS,
             )
+            self._cookie_logout_tracker = cookie_logout_tracker
 
             chat_deps = ChatDeps(
                 storage=storage,
@@ -536,6 +548,55 @@ class WebChatGatewayPlugin(Star):
                             len(cm_failed),
                             files_protected,
                         )
+                    # In-memory bookkeeping for cookie-invalidation
+                    # tracker. Bounded by token-name cardinality, but
+                    # tokens deleted via admin actions leave entries
+                    # here permanently without a periodic prune.
+                    if self._cookie_logout_tracker is not None:
+                        try:
+                            self._cookie_logout_tracker.prune_expired()
+                        except Exception:
+                            logger.exception(
+                                "[WebChatGateway] cookie_logout_tracker prune failed"
+                            )
+                    # ip_failures rows accumulate one per distinct
+                    # probing IP and only get DELETEd on the rare
+                    # `reset` path (successful auth from the same
+                    # IP). Drop anything not touched in the last
+                    # 24h — `is_blocked`'s read path already returns
+                    # False once `blocked_until < now`, so a stale
+                    # row beyond that window is effectively dead.
+                    try:
+                        await storage.prune_ip_failures(
+                            before_ts=now - 24 * 3600,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[WebChatGateway] prune_ip_failures failed"
+                        )
+                    # EventBus accumulates one cond+counter per
+                    # distinct token name awaited on; deleted tokens
+                    # never get reaped. Drop entries with zero
+                    # waiters.
+                    if self._event_bus is not None:
+                        try:
+                            await self._event_bus.prune_idle()
+                        except Exception:
+                            logger.exception(
+                                "[WebChatGateway] event_bus prune_idle failed"
+                            )
+                    # R2FileStore caches one asyncio.Lock per
+                    # storage_key ever fetched. Drop the idle ones
+                    # (LocalFileStore doesn't have this attribute).
+                    if file_store is not None and hasattr(
+                        file_store, "prune_idle_key_locks"
+                    ):
+                        try:
+                            await file_store.prune_idle_key_locks()
+                        except Exception:
+                            logger.exception(
+                                "[WebChatGateway] file_store key-lock prune failed"
+                            )
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -595,6 +656,8 @@ class WebChatGatewayPlugin(Star):
         self._audit = None
         self._file_store = None
         self._registry = None
+        self._cookie_logout_tracker = None
+        self._event_bus = None
 
     # ----- AstrBot in-bot admin commands -----
 
