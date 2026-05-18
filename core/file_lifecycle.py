@@ -96,9 +96,11 @@ async def release_files_safely(
     whose storage delete succeeded. Returns the count of rows fully
     cleaned up (storage + DB both gone).
 
-    ``file_store`` may be None in test scenarios — in that case we skip
-    the storage step entirely and just delete the DB rows for the given
-    file_ids.
+    ``file_store`` is required in production. The previous test
+    fallback (delete DB rows alone) violated the "storage first,
+    DB second" invariant that protects against partial-failure
+    orphan creation; the helper now raises `RuntimeError` instead
+    so a misconfigured test path fails loudly.
 
     Per-row exceptions are caught + logged with ``log_label`` as a
     prefix so operators tailing the audit log can correlate failures

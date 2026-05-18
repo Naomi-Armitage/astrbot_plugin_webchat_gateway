@@ -6,7 +6,9 @@ under ~600 lines and so the orchestration can be exercised in
 isolation (the dependencies are now explicit constructor args, not
 `self._XXX` reaches).
 
-What runs every `interval_seconds`:
+`run_iteration` performs one sweep. The caller (`main.py`) owns the
+loop + sleep + boot-delay so the lifecycle bits live next to the
+plugin's `_start`/`_stop`. Each sweep:
 
     1. List candidate file rows (orphans + cascade) — read-only.
     2. List sessions about to be physically pruned — read-only.
@@ -28,17 +30,14 @@ What runs every `interval_seconds`:
     7. In-memory housekeeping for unbounded caches: cookie-logout
        tracker, IP-failures table, EventBus condvars, R2 per-key
        locks. Each is best-effort and a failure here is logged but
-       doesn't block the next iteration.
-
-First iteration runs after a short randomised delay (defaults
-60-120s) so a process that crashed mid-prune doesn't have to wait
-the full interval for its leftover orphans.
+       doesn't block the next iteration. Critically, step 7 ALWAYS
+       runs even if steps 1-6 raised — otherwise a transient DB
+       hiccup would let the unbounded caches grow for the full
+       interval.
 """
 
 from __future__ import annotations
 
-import asyncio
-import random
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
@@ -70,15 +69,17 @@ class _CMLike(Protocol):
 
 @dataclass(frozen=True)
 class PruneRetentionConfig:
-    """Cadence + cutoffs governing what the prune loop deletes."""
+    """Retention cutoffs the orchestrator applies on each sweep.
 
-    interval_seconds: int = 6 * 3600
+    Cadence and boot-delay are intentionally NOT here — the caller
+    (`main.py`) owns the loop lifecycle so the `_stop` teardown can
+    cancel cleanly without going through the orchestrator.
+    """
+
     events_retention_seconds: int = 14 * 86400
     deleted_meta_retention_seconds: int = 90 * 86400
     upload_orphan_retention_seconds: int = 3600
     ip_failures_retention_seconds: int = 24 * 3600
-    boot_delay_min_seconds: int = 60
-    boot_delay_max_seconds: int = 120
 
 
 class PruneOrchestrator:
@@ -101,30 +102,28 @@ class PruneOrchestrator:
         self._cookie_logout_tracker = cookie_logout_tracker
         self._event_bus = event_bus
 
-    async def run_forever(self) -> None:
-        """Boot-delay → loop. Returns on CancelledError; otherwise infinite."""
-        try:
-            first_delay = random.uniform(
-                self._cfg.boot_delay_min_seconds,
-                self._cfg.boot_delay_max_seconds,
-            )
-            await asyncio.sleep(first_delay)
-            while True:
-                try:
-                    await self.run_iteration()
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.exception(
-                        "[WebChatGateway] chat-sync prune iteration failed"
-                    )
-                await asyncio.sleep(self._cfg.interval_seconds)
-        except asyncio.CancelledError:
-            return
-
     async def run_iteration(self) -> None:
-        """Single sweep. Public for testability."""
+        """Single sweep. Public for testability.
+
+        Data prune (steps 1-6) and bounded-cache housekeeping
+        (step 7) are scoped separately. A failure in steps 1-6 is
+        logged but does NOT skip step 7: the housekeeping bounds
+        ip_failures / EventBus / cookie tracker / R2 key-locks
+        regardless of whether the data prune succeeded, so a
+        transient DB error can't leave the unbounded caches growing
+        for the full interval.
+        """
         now = int(time.time())
+        try:
+            await self._run_data_prune(now)
+        except Exception:
+            logger.exception(
+                "[WebChatGateway] prune data-sweep raised; continuing to housekeeping"
+            )
+        await self._run_housekeeping(now)
+
+    async def _run_data_prune(self, now: int) -> None:
+        """Steps 1-6 — list / CM clear / filter / file delete / DB DELETE."""
         storage = self._storage
         file_store = self._file_store
 
@@ -220,8 +219,15 @@ class PruneOrchestrator:
                 files_protected,
             )
 
-        # Step 7: bounded-cache housekeeping. Each best-effort; a
-        # failure logs but doesn't block the next iteration.
+    async def _run_housekeeping(self, now: int) -> None:
+        """Step 7 — bounded-cache housekeeping.
+
+        Always runs from `run_iteration`, even when the data prune
+        raised. Each individual prune is best-effort and isolated
+        so one failing cache doesn't starve the others.
+        """
+        storage = self._storage
+        file_store = self._file_store
         if self._cookie_logout_tracker is not None:
             try:
                 self._cookie_logout_tracker.prune_expired()

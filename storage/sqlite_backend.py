@@ -65,6 +65,7 @@ class SqliteStorage(AbstractStorage):
         ) as cursor:
             row = await cursor.fetchone()
         stored = row["value"] if row else None
+        stored_pre = stored  # remember pre-ladder value to skip dead UPDATEs
         if stored is None:
             # Fresh install — CREATE TABLE IF NOT EXISTS in SCHEMA_SQLITE
             # already produced every v3 table.
@@ -118,20 +119,18 @@ class SqliteStorage(AbstractStorage):
                 for stmt in V4_TO_V5_SQLITE:
                     await self._conn.execute(stmt)
                 stored = "5"
-            # Only write CURRENT_SCHEMA_VERSION when stored matches it.
-            # A worker booting an older binary against a newer DB (mid-
-            # rollout, or rollback) must NOT downgrade the marker —
-            # subsequent forward rolls would then re-run an already-
-            # completed migration ladder against partial state.
-            if stored == CURRENT_SCHEMA_VERSION:
+            # Persist the marker only when the ladder actually
+            # advanced (`stored != stored_pre`). A boot whose stored
+            # value already matches CURRENT skips the dead UPDATE.
+            # `stored > CURRENT` (older binary on newer DB, mid-
+            # rollout or rollback) leaves the marker alone — we MUST
+            # NOT downgrade, subsequent forward rolls would re-run
+            # an already-completed ladder against partial state.
+            if stored == CURRENT_SCHEMA_VERSION and stored != stored_pre:
                 await self._conn.execute(
                     "UPDATE _schema_meta SET value = ? WHERE key = 'schema_version'",
                     (CURRENT_SCHEMA_VERSION,),
                 )
-        # stored != CURRENT_SCHEMA_VERSION (newer): leave alone. The
-        # newer schema is forward-compatible for our reads/writes; if
-        # it isn't, we want to crash on a column-not-found error
-        # rather than silently rewrite the marker.
         await self._conn.commit()
 
     async def close(self) -> None:

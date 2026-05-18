@@ -1531,14 +1531,19 @@ class ConversationService:
                 logger.exception(
                     "[WebChatGateway] regenerate LLM call failed"
                 )
+            # Audit detail shape matches the pre-helper layout: the
+            # llm_timeout / empty_reply branches carried only
+            # {operation}, the 500 branch added {error: <str(exc)>}.
+            # Audit consumers that key off `"error" in detail` would
+            # otherwise see a new always-present `""` value.
+            detail: dict[str, Any] = {"operation": "regenerate"}
+            if status == 500:
+                detail["error"] = str(exc)[:200]
             await self._audit.write(
                 audit_event,
                 name=token_name,
                 ip=ip,
-                detail={
-                    "operation": "regenerate",
-                    "error": str(exc)[:200] if status == 500 else "",
-                },
+                detail=detail,
             )
             raise ServiceError(code, status=status) from None
 

@@ -31,8 +31,9 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, AsyncIterator, Protocol
 from urllib.parse import urlparse
 
 from astrbot.api import logger
@@ -275,9 +276,14 @@ class R2FileStore:
         # the module loads fine even before AstrBot's data path exists.
         self._cache_dir: Path | None = None
         # Per-key locks to serialize concurrent fetches of the same
-        # object. Keys naturally bounded by the set of in-flight
-        # downloads; we don't reap them — Python dict + tiny entries.
+        # object. `_key_lock_refs` counts how many tasks are CURRENTLY
+        # inside `_serialize_key` for each storage_key — including
+        # those that already hold a reference to the lock but haven't
+        # yet acquired it. `prune_idle_key_locks` reads this counter
+        # instead of `lock.locked()` so it never drops a lock another
+        # task is about to use.
         self._key_locks: dict[str, asyncio.Lock] = {}
+        self._key_lock_refs: dict[str, int] = {}
         self._key_locks_lock = asyncio.Lock()
         # Store-level mutex serialising every `_trim_cache_dir_sync`
         # call. Without this, coroutine A trimming after just writing
@@ -300,30 +306,72 @@ class R2FileStore:
             aws_secret_access_key=self._secret_access_key,
         )
 
-    async def _key_lock(self, storage_key: str) -> asyncio.Lock:
+    @asynccontextmanager
+    async def _serialize_key(self, storage_key: str) -> AsyncIterator[None]:
+        """Serialize concurrent fetches of the same storage_key.
+
+        Refcounted so `prune_idle_key_locks` can drop entries no
+        in-flight task is about to use — without the refcount, a
+        prune that runs between `_key_locks.get(...)` and
+        `async with lock:` would detach the lock and the two tasks
+        end up serialising on different lock objects, defeating the
+        intent.
+
+        The finally-clause decrement is wrapped in `asyncio.shield`
+        so a second `CancelledError` landing on the inner
+        `_key_locks_lock` re-acquire can't strand the refcount —
+        otherwise the entry would leak permanently (prune predicate
+        `refs == 0` never holds again).
+        """
         async with self._key_locks_lock:
             lock = self._key_locks.get(storage_key)
             if lock is None:
                 lock = asyncio.Lock()
                 self._key_locks[storage_key] = lock
-            return lock
+            self._key_lock_refs[storage_key] = (
+                self._key_lock_refs.get(storage_key, 0) + 1
+            )
+        try:
+            async with lock:
+                yield
+        finally:
+            await asyncio.shield(self._release_serialize_key(storage_key))
+
+    async def _release_serialize_key(self, storage_key: str) -> None:
+        """Decrement the refcount for `storage_key`. Called only from
+        `_serialize_key`'s finally; shielded against cancellation so
+        the bookkeeping completes even if the caller is being torn
+        down. We do NOT remove from `_key_locks` here — that's the
+        prune's job, and keeping the lock object around for a
+        quick subsequent fetch avoids a recreate.
+        """
+        async with self._key_locks_lock:
+            remaining = self._key_lock_refs.get(storage_key, 0) - 1
+            if remaining <= 0:
+                self._key_lock_refs.pop(storage_key, None)
+            else:
+                self._key_lock_refs[storage_key] = remaining
 
     async def prune_idle_key_locks(self) -> int:
-        """Drop `_key_locks` entries that aren't currently held.
+        """Drop `_key_locks` entries with zero in-flight users.
 
         Without this the dict grows by storage_key over the lifetime
         of the process (one entry per file ever fetched into cache).
-        Safe to call from a periodic GC: holds `_key_locks_lock`
-        while inspecting `Lock.locked()` and only removes idle
-        entries.
+        Uses `_key_lock_refs` rather than `lock.locked()` to avoid
+        a race where a task has the lock REFERENCE but hasn't yet
+        acquired it — peeking `locked()` would see False and the
+        prune would detach the lock, leaving two tasks to serialise
+        on different lock objects.
         """
         async with self._key_locks_lock:
             idle = [
-                key for key, lock in self._key_locks.items()
-                if not lock.locked()
+                key
+                for key in self._key_locks
+                if self._key_lock_refs.get(key, 0) == 0
             ]
             for key in idle:
                 del self._key_locks[key]
+                self._key_lock_refs.pop(key, None)
         return len(idle)
 
     async def _ensure_cache_dir(self) -> Path:
@@ -403,8 +451,7 @@ class R2FileStore:
             return str(cache_path)
         # Miss path: serialize concurrent fetches for the same key so we
         # don't N-times-GET the same object under load.
-        lock = await self._key_lock(storage_key)
-        async with lock:
+        async with self._serialize_key(storage_key):
             # Recheck after acquiring lock — another waiter may have
             # filled the cache while we were parked.
             if cache_path.is_file():

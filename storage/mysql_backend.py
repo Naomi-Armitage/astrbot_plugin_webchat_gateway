@@ -69,10 +69,11 @@ class MysqlStorage(AbstractStorage):
     def __init__(self, dsn: str, *, pool_max: int = 5) -> None:
         self._kwargs = _parse_dsn(dsn)
         self._pool: aiomysql.Pool | None = None
-        # `pool_max` is the upper bound on concurrent connections to MySQL.
-        # The default of 5 is sized for a friends-list deployment; busy
-        # gateways should raise it via `storage.mysql_pool_max` config.
-        self._pool_max = max(1, pool_max)
+        # `pool_max` is the upper bound on concurrent MySQL connections.
+        # Defence-in-depth clamp 1-100 here too (config-side clamps as
+        # well, but a direct caller — test, future external usage —
+        # could otherwise hand us 10_000).
+        self._pool_max = max(1, min(int(pool_max), 100))
 
     async def initialize(self) -> None:
         # CLIENT.FOUND_ROWS switches MySQL's UPDATE rowcount semantics from
@@ -100,6 +101,7 @@ class MysqlStorage(AbstractStorage):
                 )
                 row = await cur.fetchone()
                 stored = row[0] if row else None
+                stored_pre = stored  # remember pre-ladder value to skip dead UPDATEs
                 if stored is None:
                     await cur.execute(
                         "INSERT INTO _schema_meta(`key`, value) VALUES('schema_version', %s)",
@@ -149,21 +151,19 @@ class MysqlStorage(AbstractStorage):
                         for stmt in V4_TO_V5_MYSQL:
                             await cur.execute(stmt)
                         stored = "5"
-                    # Only rewrite the marker when stored matches
-                    # CURRENT_SCHEMA_VERSION. A worker booting an
-                    # older binary against a newer DB must NOT
-                    # downgrade — subsequent forward rolls would
-                    # re-run an already-completed migration ladder
-                    # against partial state.
-                    if stored == CURRENT_SCHEMA_VERSION:
+                    # Persist the marker only when the ladder
+                    # actually advanced (`stored != stored_pre`). A
+                    # boot whose stored value already matches CURRENT
+                    # skips the dead UPDATE. `stored > CURRENT`
+                    # (older binary on newer DB) leaves the marker
+                    # alone — we MUST NOT downgrade, subsequent
+                    # forward rolls would re-run an already-completed
+                    # ladder against partial state.
+                    if stored == CURRENT_SCHEMA_VERSION and stored != stored_pre:
                         await cur.execute(
                             "UPDATE _schema_meta SET value = %s WHERE `key` = 'schema_version'",
                             (CURRENT_SCHEMA_VERSION,),
                         )
-                # stored newer than CURRENT_SCHEMA_VERSION: leave
-                # alone; reads/writes are forward-compatible for our
-                # surface, and a column-not-found error here is the
-                # preferred failure mode over silent downgrade.
 
     async def close(self) -> None:
         if self._pool is not None:

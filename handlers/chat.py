@@ -1816,6 +1816,14 @@ def make_logout_handler(deps: ChatDeps):
         ip = client_ip(request, trust_forwarded_for=deps.trust_forwarded_for)
         blocked, retry_after = await deps.ip_guard.is_blocked(ip)
         if blocked:
+            # 429 path intentionally does NOT include the
+            # `Set-Cookie: Max-Age=0` directive: a probing attacker
+            # whose IP just got blocked shouldn't get a side-channel
+            # confirming that the request reached the logout handler
+            # (vs. being dropped earlier). Legitimate users whose
+            # IP is shared with a probing attacker will retry from
+            # a different IP or wait out the block; their browser-
+            # side cookie clear can happen via the next /me probe.
             headers = build_cors_headers(
                 origin, allowed, same_origin_host=same_host
             )
@@ -1885,7 +1893,9 @@ def make_logout_handler(deps: ChatDeps):
                     detail={},
                 )
             except Exception:
-                pass
+                logger.exception(
+                    "[WebChatGateway] logout_no_auth audit failed"
+                )
             return web.Response(status=204, headers=headers)
         await deps.ip_guard.reset(ip)
         if deps.cookie_logout_tracker is not None:

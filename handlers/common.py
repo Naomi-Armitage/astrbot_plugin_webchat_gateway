@@ -309,9 +309,16 @@ def error_response(
     `str(exc)` matches the ServiceError contract.
     """
     extra = None
-    if exc.code == "ip_blocked" and str(exc):
-        extra = {"Retry-After": str(exc)}
-    detail = str(exc) if str(exc) != exc.code else ""
+    # Retry-After value is the ServiceError's `message` (a stringified
+    # seconds count) — explicitly distinct from `.code`. The
+    # `!= exc.code` guard rejects the latent case where a caller did
+    # `ServiceError("ip_blocked")` without a `message=` kwarg and the
+    # default `message = code` would otherwise emit `Retry-After:
+    # ip_blocked` (invalid header per RFC 7231).
+    msg = str(exc)
+    if exc.code == "ip_blocked" and msg and msg != exc.code:
+        extra = {"Retry-After": msg}
+    detail = msg if msg != exc.code else ""
     return json_response(
         {"error": exc.code, "detail": detail},
         status=exc.status,

@@ -372,13 +372,16 @@ class WebChatGatewayPlugin(Star):
         )
 
     async def _chat_sync_prune_loop(self) -> None:
-        """Thin wrapper around `PruneOrchestrator.run_forever`.
+        """Drive `PruneOrchestrator.run_iteration` on the configured
+        cadence with a boot-delay jitter.
 
         Orchestration moved to `core.prune_orchestrator` to keep the
-        plugin entry class focused on AstrBot lifecycle. The wrapper
-        constructs the orchestrator lazily (storage / file_store may
-        be None during the boot-delay window if `_start` is still
-        wiring them) and forwards cancellation.
+        plugin entry class focused on AstrBot lifecycle. This wrapper
+        owns the loop semantics (boot delay + interval sleep) and
+        constructs a fresh orchestrator per iteration so storage /
+        file_store reads are always against the live `self._XXX`
+        (which `_stop` clears). Cancellation propagates cleanly via
+        the outer `except asyncio.CancelledError: return`.
         """
         try:
             # Boot delay applied here so we can early-return cleanly
@@ -398,7 +401,6 @@ class WebChatGatewayPlugin(Star):
                     file_store=file_store,
                     cm=self.context.conversation_manager,
                     config=PruneRetentionConfig(
-                        interval_seconds=self._CHAT_SYNC_PRUNE_INTERVAL_SECONDS,
                         events_retention_seconds=self._CHAT_SYNC_EVENTS_RETENTION_SECONDS,
                         deleted_meta_retention_seconds=self._CHAT_SYNC_DELETED_META_RETENTION_SECONDS,
                         upload_orphan_retention_seconds=self._UPLOAD_ORPHAN_RETENTION_SECONDS,
