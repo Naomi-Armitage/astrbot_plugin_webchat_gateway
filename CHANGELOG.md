@@ -6,6 +6,9 @@
 ## Unreleased
 
 ### Added — UI 操作 / 多设备 / 流式
+- 聊天页用户消息加 hover **编辑** 按钮：就地用 textarea 改写后 `POST {prefix}/conversations/{sid}/messages/{idx}/edit`。**非破坏性**——旧 user msg 和它的 bot 回复被服务端标 `folded`、保留在 history 里，新一对插在折叠区之后；下游历史完整保留并继续参与未来 LLM 上下文。客户端把连续 folded 项合并成 `.msg-fold-bar` 可展开组（chevron 90° 旋转）
+- 用户消息 hover **重生成** 按钮：`POST {prefix}/conversations/{sid}/messages/{idx}/regenerate` 重生成紧随的 bot 回复。同样非破坏：旧 bot reply 被 fold，新 reply 插在 fold 之后，downstream 不变。和 `regenerate_assistant_message`（破坏式截尾）显式区分
+- 新增 `EVENT_MESSAGE_FOLDED` / `EVENT_MESSAGE_INSERTED` 事件类型，多设备实时同步折叠状态与插入位置
 - 聊天页每条消息加 hover 三按钮：**复制 / 删除 / 重新生成**（最后一个仅 bot）。delete 调 `DELETE {prefix}/conversations/{sid}/messages/{idx}`，regenerate 调 `POST {prefix}/conversations/{sid}/regenerate`。移动端长按 350ms 触发同样的菜单（10px 移动容差当滚动取消）
 - Markdown 代码块换成 Telegram 风：等宽（系统栈 `ui-monospace, SFMono-Regular, Menlo, Consolas`）+ 标题行 lang 标签 + 右上"复制全部"按钮（成功后 1.2s 显示"已复制"）+ 每行可单独点击复制（0.6s flash）
 - 新增 `DELETE {prefix}/conversations/{sid}/messages/{idx}`：按渲染索引删单条消息，对端通过 `message_deleted` 事件同步。释放仅被该条引用的附件
