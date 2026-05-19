@@ -215,6 +215,28 @@ def _unlink_sync(path: str) -> None:
 _R2_CACHE_SUBDIR = "webchat_uploads_cache"
 
 
+def _is_no_such_key(exc: BaseException) -> bool:
+    """Recognise both shapes botocore uses for the "key missing" error.
+
+    Some botocore versions raise a typed subclass whose class name
+    contains "NoSuchKey"; others raise a plain `ClientError` whose
+    structured response carries `Error.Code == "NoSuchKey"`. Class-name
+    substring matching alone (the previous implementation) misses the
+    second shape and dumps a full `logger.exception` traceback for what
+    is actually the expected-missing path — polluting logs and making
+    "the object really is gone" indistinguishable from a real R2
+    incident at ops-triage time.
+    """
+    if "NoSuchKey" in type(exc).__name__:
+        return True
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        err = response.get("Error")
+        if isinstance(err, dict) and err.get("Code") == "NoSuchKey":
+            return True
+    return False
+
+
 class R2FileStore:
     """Cloudflare R2-backed implementation.
 
@@ -423,12 +445,11 @@ class R2FileStore:
                 async with resp["Body"] as body_stream:
                     return await body_stream.read()
         except Exception as exc:
-            # NoSuchKey is the common-and-expected miss; everything else
-            # is logged. aiobotocore exposes it via the client error
-            # class but checking exc-name pattern keeps us decoupled from
-            # the exact import path.
-            name = type(exc).__name__
-            if "NoSuchKey" in name or "404" in str(exc):
+            # NoSuchKey is the common-and-expected miss. Other failures
+            # (network, auth, malformed bucket name) still surface via
+            # logger.exception so they don't get hidden behind the same
+            # return-None envelope.
+            if _is_no_such_key(exc):
                 return None
             logger.exception(
                 "[WebChatGateway] R2FileStore.read failed key=%s", storage_key
@@ -524,8 +545,7 @@ class R2FileStore:
                     Bucket=self._bucket, Key=storage_key
                 )
         except Exception as exc:
-            name = type(exc).__name__
-            if "NoSuchKey" not in name:
+            if not _is_no_such_key(exc):
                 logger.exception(
                     "[WebChatGateway] R2FileStore.delete (R2) failed key=%s",
                     storage_key,

@@ -24,6 +24,7 @@
 - `ChatDeps.conv_service` / `StreamRegistry.__init__` 用 `TYPE_CHECKING` 还原真实类型（之前为 `Any`），方法重命名能在 type-check 时报错
 
 ### Fixed
+- **R2 NoSuchKey 误判**：部分 botocore 版本下 NoSuchKey 通过 `ClientError` + `response["Error"]["Code"]` 暴露，原先只用 `type(exc).__name__` 子串匹配，漏判后 `R2FileStore.read` / `.delete` 会把"对象不存在"这种预期路径打成 `logger.exception` 完整 traceback，污染日志并干扰运维区分真实 R2 故障。新增 `_is_no_such_key(exc)` 辅助同时覆盖两种 shape（类名子串 + 结构化 Error.Code）
 - **PIL 解码阻塞事件循环**：`/upload` 在 handler 协程里同步调 `detect_image_mime`，一张 20MB 图片的 PIL `verify()` + 格式探测能占用事件循环数百毫秒到数秒，期间所有 SSE 心跳、长轮询、LLM 流式输出都被挂起 —— 单进程网关的隐性 P0。新增 `detect_image_mime_async` 包装走 `asyncio.to_thread`，CPU 重活转默认线程池；同步实现保留供测试与其他工作线程上下文复用
 - **数据目录违规 AstrBot 规范**：SQLite DB 与本地上传根目录默认值原本写死 `data/webchat_gateway.db` / `data/webchat_uploads`（裸落在 AstrBot 工作目录），违反 AstrBot 框架规范，AstrBot 重装/迁移时数据"消失"且不会随 `data/plugin_data/` 一起迁移。改为 `StarTools.get_data_dir("astrbot_plugin_webchat_gateway")` 下的 `webchat_gateway.db` / `webchat_uploads`；`_conf_schema.json` 默认值改空串由代码侧填默认，自定义路径仍可手动指定。`SqliteStorage.initialize()` 启动时若检测到旧路径有遗留 DB 而新路径为空会打印迁移指引（不自动移动，避免多实例环境下的误操作）
 - **schema-version 降级 bug**：SQLite + MySQL migration ladder 之前无条件 `UPDATE _schema_meta SET value = CURRENT`，older binary 启动 newer DB 时会悄悄降级。改成 `if stored == CURRENT_SCHEMA_VERSION` 才写
