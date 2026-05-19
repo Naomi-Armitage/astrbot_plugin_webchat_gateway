@@ -155,7 +155,9 @@ def _build_service(
     """Construct a ConversationService with all-stub deps and return
     `(service, cm, storage, audit, event_bus, llm)` so each test can
     assert on the relevant slots."""
-    from astrbot_plugin_webchat_gateway.handlers import conversations as conv_mod
+    from astrbot_plugin_webchat_gateway.handlers import (
+        conversations_service as conv_mod,
+    )
     from astrbot_plugin_webchat_gateway.handlers.conversations import (
         ConversationService,
     )
