@@ -25,6 +25,7 @@ and the handler only cares about the binary pass/fail signal. Returning
 
 from __future__ import annotations
 
+import asyncio
 from io import BytesIO
 
 from PIL import Image
@@ -104,6 +105,23 @@ def detect_image_mime(content: bytes) -> str | None:
     return _FORMAT_TO_MIME.get(fmt)
 
 
+async def detect_image_mime_async(content: bytes) -> str | None:
+    """Off-thread wrapper around `detect_image_mime`.
+
+    PIL's `verify()` + format re-read can spend hundreds of ms (small
+    files) to several seconds (a 20 MB JPEG near the size cap) doing
+    CPU-bound work. Running it directly on the event loop stalls every
+    other in-flight request — SSE heartbeats, long-poll waiters, the
+    LLM streaming pump — for that entire duration. `asyncio.to_thread`
+    moves the call to the default thread pool so the loop stays
+    responsive while the decode runs.
+
+    The sync `detect_image_mime` is kept for tests and any future
+    caller that's already on a worker thread.
+    """
+    return await asyncio.to_thread(detect_image_mime, content)
+
+
 def ext_for_mime(mime: str) -> str | None:
     """Return the on-disk extension for a validated MIME, or None.
 
@@ -120,5 +138,6 @@ __all__ = [
     "ALLOWED_MIME_TO_EXT",
     "PIL_MAX_PIXELS",
     "detect_image_mime",
+    "detect_image_mime_async",
     "ext_for_mime",
 ]

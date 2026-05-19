@@ -46,7 +46,7 @@ from ..core.file_cookie import (
 from ..core.file_store import FileStore
 from ..core.image_util import (
     ALLOWED_MIME_TO_EXT,
-    detect_image_mime,
+    detect_image_mime_async,
     ext_for_mime,
 )
 from ..core.ip_guard import IpGuard
@@ -250,7 +250,7 @@ def make_upload_handler(deps: UploadDeps):
                 same_origin_host=same_host,
             )
 
-        mime = detect_image_mime(file_content)
+        mime = await detect_image_mime_async(file_content)
         if mime is None or mime not in allowed_mime:
             await deps.audit.write(
                 "upload_rejected",
