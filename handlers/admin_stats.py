@@ -11,7 +11,7 @@ from astrbot.api import logger
 
 from ..core.audit import AuditLogger
 from ..core.ip_guard import IpGuard
-from ..storage.base import _UNSET, AbstractStorage
+from ..storage.base import UNSET, AbstractStorage
 from .admin_tokens import ServiceError, TokenService, gate_admin
 from .common import (
     client_ip,
@@ -187,7 +187,7 @@ def make_admin_handlers(deps: AdminDeps):
             # rewriting other columns.
             field_keys = {"daily_quota", "note", "expires_at"}
             if any(k in body for k in field_keys):
-                expires_arg: object = _UNSET
+                expires_arg: object = UNSET
                 if "expires_at" in body:
                     expires_arg = body.get("expires_at")
                 summary = await deps.token_service.update_fields(

@@ -498,8 +498,6 @@ class WebChatGatewayPlugin(Star):
         name: str,
         daily_quota: int = 0,
     ):
-        if not event.is_admin():
-            return
         if not self._ensure_ready():
             yield event.plain_result("[WebChatGateway] 插件未就绪，请先检查日志。")
             return
@@ -529,8 +527,6 @@ class WebChatGatewayPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @webchat_group.command("revoke")
     async def cmd_revoke(self, event: AstrMessageEvent, name: str):
-        if not event.is_admin():
-            return
         if not self._ensure_ready():
             yield event.plain_result("[WebChatGateway] 插件未就绪。")
             return
@@ -546,8 +542,6 @@ class WebChatGatewayPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @webchat_group.command("list")
     async def cmd_list(self, event: AstrMessageEvent):
-        if not event.is_admin():
-            return
         if not self._ensure_ready():
             yield event.plain_result("[WebChatGateway] 插件未就绪。")
             return
@@ -555,12 +549,23 @@ class WebChatGatewayPlugin(Star):
         if not rows:
             yield event.plain_result("[WebChatGateway] 暂无 token。")
             return
+        # Cap chat-platform replies so a deployment with hundreds of tokens
+        # doesn't produce a single multi-thousand-line message that the
+        # IM platform truncates or rate-limits. Operators with > 30 tokens
+        # should use the admin UI to browse.
+        _MAX_LINES_PER_MSG = 30
         lines = ["[WebChatGateway] tokens:"]
         for r in rows:
             status = "REVOKED" if r.revoked_at else "active"
             lines.append(
                 f"- {r.name} | {status} | {r.today_usage}/{r.daily_quota} 今日 | "
                 f"创建 {self._format_time(r.created_at)}"
+            )
+        total = len(rows)
+        if total > _MAX_LINES_PER_MSG:
+            lines = lines[: _MAX_LINES_PER_MSG + 1]
+            lines.append(
+                f"... (+{total - _MAX_LINES_PER_MSG} more, 请使用 admin UI 查看完整列表)"
             )
         yield event.plain_result("\n".join(lines))
 
@@ -572,8 +577,6 @@ class WebChatGatewayPlugin(Star):
         name: str,
         days: int = 7,
     ):
-        if not event.is_admin():
-            return
         if not self._ensure_ready():
             yield event.plain_result("[WebChatGateway] 插件未就绪。")
             return

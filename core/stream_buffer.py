@@ -167,6 +167,15 @@ class _InMemoryEntry:
     `terminal` Event is set once at close() and never replaced — late
     subscribers parking after close see it already-set and exit their
     wait immediately.
+
+    Snapshot order in `append_chunk`: copy `chunks` → set current
+    `new_chunk` Event → swap in a fresh Event → mark `terminal` if
+    closing. Doing the read-side copy before swapping keeps any
+    subscriber that's about to fire `wait()` on the about-to-be-stale
+    Event from racing with the producer's swap; the producer always
+    publishes the new chunk to the snapshot list before any waiter is
+    released, so a waiter that wakes always sees the chunk it was
+    woken for.
     """
 
     __slots__ = (

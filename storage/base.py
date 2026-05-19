@@ -8,16 +8,23 @@ from datetime import date
 
 
 # Sentinel for partial updates where None is a meaningful value (e.g.
-# clearing tokens.expires_at to NULL). `_UNSET` means "leave the column
+# clearing tokens.expires_at to NULL). `UNSET` means "leave the column
 # alone"; `None` means "set to NULL". Implementations check identity.
+#
+# `_UNSET` is kept as a deprecated alias for one release so external
+# callers (the handler layer's payload helpers + the older AstrBot
+# integrations that import directly from `storage.base`) don't break.
+# Prefer the public `UNSET` going forward — `_UNSET` will be removed
+# in the next minor.
 class _Sentinel:
     __slots__ = ()
 
     def __repr__(self) -> str:  # pragma: no cover - debug only
-        return "_UNSET"
+        return "UNSET"
 
 
-_UNSET: _Sentinel = _Sentinel()
+UNSET: _Sentinel = _Sentinel()
+_UNSET: _Sentinel = UNSET  # deprecated alias — prefer `UNSET`
 
 
 @dataclass(frozen=True)

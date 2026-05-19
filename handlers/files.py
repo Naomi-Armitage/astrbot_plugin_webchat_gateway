@@ -53,6 +53,7 @@ from ..core.ip_guard import IpGuard
 from ..core.ratelimit import PerTokenUploadGate
 from ..storage.base import AbstractStorage
 from .common import (
+    build_cors_headers,
     client_ip,
     extract_origin,
     gate_request,
@@ -696,8 +697,6 @@ def make_serve_handler(deps: UploadDeps):
                 allowed_origins=allowed,
                 same_origin_host=same_host,
             )
-
-        from .common import build_cors_headers
 
         cors = build_cors_headers(origin, allowed, same_origin_host=same_host)
         return web.Response(

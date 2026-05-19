@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .base import (
+    UNSET,
     _UNSET,
     AbstractStorage,
     AuditRow,
@@ -54,6 +55,7 @@ __all__ = [
     "UpdateRow",
     "NewEvent",
     "FileRow",
+    "UNSET",
     "_UNSET",
     "get_storage",
 ]

@@ -45,7 +45,7 @@ from ..core.file_store import FileStore
 from ..core.llm_bridge import LlmBridge, map_llm_error
 from ..core.ratelimit import PerTokenConcurrency
 from ..storage.base import (
-    _UNSET,
+    UNSET,
     AbstractStorage,
     NewEvent,
     SessionMetaRow,
@@ -133,11 +133,6 @@ class RegenerateResult:
 
 
 # ----- helpers -----
-
-
-def _umo(token_name: str, session_id: str) -> str:
-    """Match the namespacing used by LlmBridge so CM lookups line up."""
-    return f"webchat_gateway:{token_name}:{session_id}"
 
 
 class ConversationService:
@@ -701,10 +696,17 @@ class ConversationService:
                     out["incomplete"] = True
                 # Prefer CM-derived attachments (long-term store);
                 # fall back to events if CM didn't have them (e.g.
-                # close_incomplete partial-write race).
-                attachments_for_msg = msg.get("attachments") or list(
-                    attachments_map_from_events.get(i, [])
-                )
+                # close_incomplete partial-write race). Use an explicit
+                # `is not None` check so an empty CM attachment list
+                # (legal, means "user sent text-only after editing out
+                # the image") doesn't silently fall through to events.
+                cm_attachments = msg.get("attachments")
+                if cm_attachments is not None:
+                    attachments_for_msg = cm_attachments
+                else:
+                    attachments_for_msg = list(
+                        attachments_map_from_events.get(i, [])
+                    )
                 if attachments_for_msg and msg["role"] == "user":
                     enriched: list[dict] = []
                     for att in attachments_for_msg:
@@ -754,11 +756,11 @@ class ConversationService:
         if title_manual is not None:
             changed["title_manual"] = title_manual
         now = self._now()
-        pinned_arg: int | None | object = _UNSET
+        pinned_arg: int | None | object = UNSET
         if pinned is not None:
             pinned_arg = now if pinned else None
             changed["pinned"] = pinned
-        deleted_arg: int | None | object = _UNSET
+        deleted_arg: int | None | object = UNSET
         if deleted is not None:
             deleted_arg = now if deleted else None
             changed["deleted"] = deleted
@@ -1642,7 +1644,7 @@ class ConversationService:
                 # `deleted_at` to undelete and emit a meta_updated event
                 # before the message pair so all peers re-create / reveal
                 # the row consistently.
-                deleted_arg: int | None | object = _UNSET
+                deleted_arg: int | None | object = UNSET
                 if existing.deleted_at is not None:
                     deleted_arg = None
                     events.append(
@@ -1782,7 +1784,7 @@ class ConversationService:
                 # Existing session — same un-delete logic as
                 # record_chat_pair so a soft-deleted session resurfaces
                 # consistently when the user resumes typing into it.
-                deleted_arg: int | None | object = _UNSET
+                deleted_arg: int | None | object = UNSET
                 if existing.deleted_at is not None:
                     deleted_arg = None
                     events.append(
