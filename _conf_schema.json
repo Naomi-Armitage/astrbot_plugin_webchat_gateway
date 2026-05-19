@@ -148,8 +148,8 @@
       "sqlite_path": {
         "type": "string",
         "description": "SQLite 数据库文件路径",
-        "hint": "相对路径以 AstrBot 工作目录为基准；建议 data/webchat_gateway.db。",
-        "default": "data/webchat_gateway.db"
+        "hint": "留空则使用 AstrBot 标准插件数据目录 data/plugin_data/astrbot_plugin_webchat_gateway/webchat_gateway.db；填写绝对路径或以 AstrBot 工作目录为基准的相对路径可自定义位置。",
+        "default": ""
       },
       "mysql_dsn": {
         "type": "string",
@@ -217,8 +217,8 @@
       "local_path": {
         "type": "string",
         "description": "本地存储根目录",
-        "hint": "相对路径以 AstrBot 工作目录为基准；文件按 {token_name}/{file_id}.{ext} 组织。",
-        "default": "data/webchat_uploads"
+        "hint": "留空则使用 AstrBot 标准插件数据目录 data/plugin_data/astrbot_plugin_webchat_gateway/webchat_uploads；文件按 {token_name}/{file_id}.{ext} 组织。",
+        "default": ""
       },
       "max_file_size_mb": {
         "type": "int",

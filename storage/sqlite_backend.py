@@ -8,6 +8,8 @@ from datetime import date, timedelta
 
 import aiosqlite
 
+from astrbot.api import logger
+
 from .base import (
     _UNSET,
     AbstractStorage,
@@ -53,6 +55,30 @@ class SqliteStorage(AbstractStorage):
         directory = os.path.dirname(self._db_path)
         if directory:
             os.makedirs(directory, exist_ok=True)
+        # Legacy location detection. v0.3.0 and earlier defaulted to
+        # `data/webchat_gateway.db` (under AstrBot working dir). v0.3.1
+        # moved defaults under `data/plugin_data/{plugin_name}/` via
+        # StarTools.get_data_dir. We do NOT auto-migrate — moving a
+        # SQLite DB between volumes silently is the kind of operation
+        # that loses data if the operator has multiple AstrBot installs
+        # pointing at the same working tree. Just warn loudly.
+        legacy_db = os.path.join("data", "webchat_gateway.db")
+        if (
+            os.path.abspath(self._db_path) != os.path.abspath(legacy_db)
+            and os.path.exists(legacy_db)
+            and not os.path.exists(self._db_path)
+        ):
+            logger.warning(
+                "[WebChatGateway] legacy SQLite DB detected at %s but the "
+                "configured path is %s (which does not exist yet). The "
+                "plugin will start with an EMPTY database. To preserve "
+                "existing tokens/usage/audit, stop AstrBot, move the "
+                "legacy file to the new location, then restart. "
+                "Auto-migration is intentionally disabled to avoid data "
+                "loss in multi-install setups.",
+                legacy_db,
+                self._db_path,
+            )
         self._conn = await aiosqlite.connect(self._db_path)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA journal_mode=WAL")

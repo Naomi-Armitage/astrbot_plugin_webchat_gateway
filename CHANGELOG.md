@@ -21,6 +21,7 @@
 - `ChatDeps.conv_service` / `StreamRegistry.__init__` 用 `TYPE_CHECKING` 还原真实类型（之前为 `Any`），方法重命名能在 type-check 时报错
 
 ### Fixed
+- **数据目录违规 AstrBot 规范**：SQLite DB 与本地上传根目录默认值原本写死 `data/webchat_gateway.db` / `data/webchat_uploads`（裸落在 AstrBot 工作目录），违反 AstrBot 框架规范，AstrBot 重装/迁移时数据"消失"且不会随 `data/plugin_data/` 一起迁移。改为 `StarTools.get_data_dir("astrbot_plugin_webchat_gateway")` 下的 `webchat_gateway.db` / `webchat_uploads`；`_conf_schema.json` 默认值改空串由代码侧填默认，自定义路径仍可手动指定。`SqliteStorage.initialize()` 启动时若检测到旧路径有遗留 DB 而新路径为空会打印迁移指引（不自动移动，避免多实例环境下的误操作）
 - **schema-version 降级 bug**：SQLite + MySQL migration ladder 之前无条件 `UPDATE _schema_meta SET value = CURRENT`，older binary 启动 newer DB 时会悄悄降级。改成 `if stored == CURRENT_SCHEMA_VERSION` 才写
 - **plugin 静默启动失败**：`_start` 在 mysql 缺 DSN / storage init 失败时只 log + return，AstrBot 误以为 ready 后所有命令返回"插件未就绪"。改成 raise → AstrBot 显示"plugin failed to load"
 - **logout endpoint 是 timing oracle**：cookie 在 HMAC 验证前就用 `peek_name` 查 DB，timing 差异可枚举 token name。新增 IP guard + `record_failure` 让探测在 brute-force 阈值后被锁

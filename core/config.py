@@ -3,10 +3,31 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
 
 from astrbot.api import logger
+from astrbot.api.star import StarTools
+
+# Pinned to the plugin's package directory name so StarTools.get_data_dir
+# resolves to data/plugin_data/astrbot_plugin_webchat_gateway/ regardless of
+# call-stack heuristics. Hard-coding the name is intentional: the inferred
+# name varies depending on where get_data_dir is called from, and we want a
+# stable location for the DB and uploads tree across the codebase.
+_PLUGIN_NAME = "astrbot_plugin_webchat_gateway"
+
+
+def _default_data_dir() -> Path:
+    """AstrBot-managed data dir for this plugin.
+
+    StarTools.get_data_dir creates the directory if missing and returns
+    an absolute Path under AstrBot's `data/plugin_data/{name}/`. Using
+    this for default storage paths means plugin data follows the normal
+    AstrBot data-volume lifecycle (backup, restore, reinstall-safe)
+    instead of leaking into the AstrBot working-directory root.
+    """
+    return StarTools.get_data_dir(_PLUGIN_NAME)
 
 
 def _get(cfg: Any, key: str, default: Any = None) -> Any:
@@ -271,6 +292,21 @@ class ConfigView:
         return f"{self.conversations_item_path}/regenerate"
 
     @property
+    def conversations_message_edit_path(self) -> str:
+        """POST endpoint that non-destructively edits a user message at
+        `{message_index}`. Folds the old user msg + its bot reply,
+        splices new content in place, leaves downstream history."""
+        return f"{self.conversations_message_path}/edit"
+
+    @property
+    def conversations_message_regenerate_path(self) -> str:
+        """POST endpoint that regenerates the bot reply that follows a
+        user message at `{message_index}` without truncating the tail
+        — folds the old reply, inserts a new one, downstream preserved.
+        Distinct from `conversations_regenerate_path` (destructive)."""
+        return f"{self.conversations_message_path}/regenerate"
+
+    @property
     def events_path(self) -> str:
         return f"{self.endpoint_prefix}/events"
 
@@ -366,9 +402,10 @@ class ConfigView:
                 driver,
             )
             driver = "sqlite"
-        sqlite_path = str(
-            _get(raw_storage, "sqlite_path") or "data/webchat_gateway.db"
-        ).strip()
+        sqlite_path_raw = str(_get(raw_storage, "sqlite_path") or "").strip()
+        sqlite_path = sqlite_path_raw or str(
+            _default_data_dir() / "webchat_gateway.db"
+        )
         mysql_dsn = str(_get(raw_storage, "mysql_dsn") or "").strip()
         # MySQL connection pool cap. Default 5 fits friends-list scale;
         # larger gateways should raise to 20-50.
@@ -418,9 +455,10 @@ class ConfigView:
                 uploads_driver,
             )
             uploads_driver = "local"
-        local_path = str(
-            _get(raw_uploads, "local_path") or "data/webchat_uploads"
-        ).strip() or "data/webchat_uploads"
+        local_path_raw = str(_get(raw_uploads, "local_path") or "").strip()
+        local_path = local_path_raw or str(
+            _default_data_dir() / "webchat_uploads"
+        )
         max_file_size_mb = _clamp_int(
             _get(raw_uploads, "max_file_size_mb"), default=20, lo=1, hi=200
         )

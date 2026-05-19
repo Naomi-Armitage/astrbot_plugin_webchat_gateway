@@ -182,11 +182,11 @@ curl -X POST http://127.0.0.1:6186/api/webchat/chat \
 | `trust_referer_as_origin` | `false` | 浏览器请求缺少 `Origin` 时是否回退到 `Referer`。默认关；开启会削弱 CSRF 防御（详见[安全注意事项](#security)）。 |
 | `master_admin_key` | `""` | 管理 API 主密钥；为空则禁用所有 `/admin/*`。建议 32+ 字符强随机。 |
 | `storage.driver` | `sqlite` | `sqlite` 或 `mysql` |
-| `storage.sqlite_path` | `data/webchat_gateway.db` | SQLite 文件路径，相对路径以 AstrBot 工作目录为基准 |
+| `storage.sqlite_path` | `""` | SQLite 文件路径，留空使用 `data/plugin_data/astrbot_plugin_webchat_gateway/webchat_gateway.db`；可填绝对路径或以 AstrBot 工作目录为基准的相对路径 |
 | `storage.mysql_dsn` | `""` | MySQL DSN，如 `mysql://user:pass@host:3306/dbname`（也支持 `mariadb://`）；`driver=mysql` 时必填 |
 | `uploads.enabled` | `true` | 是否启用图片上传（关掉只是不注册 `/upload` 路由，已有图片仍可通过 `/files/{id}` 访问） |
 | `uploads.storage_driver` | `local` | `local`（默认）或 `r2`（Cloudflare R2） |
-| `uploads.local_path` | `data/webchat_uploads` | 本地存储根目录；相对路径以 AstrBot 工作目录为基准 |
+| `uploads.local_path` | `""` | 本地存储根目录，留空使用 `data/plugin_data/astrbot_plugin_webchat_gateway/webchat_uploads`；可填绝对路径或以 AstrBot 工作目录为基准的相对路径 |
 | `uploads.max_file_size_mb` | `20` | 单文件上限（1-200 MB） |
 | `uploads.per_token_storage_mb` | `500` | 每 token 累计存储上限（含未提交的暂存） |
 | `uploads.max_attachments_per_message` | `4` | 单条消息最多附件数（1-16） |
@@ -392,12 +392,15 @@ curl "$BASE/api/webchat/admin/tokens?include_revoked=true" \
 
 ### SQLite（默认）
 
-零配置。数据库文件默认在 `data/webchat_gateway.db`（相对 AstrBot 工作目录）。
+零配置。数据库文件默认在 `data/plugin_data/astrbot_plugin_webchat_gateway/webchat_gateway.db`（相对 AstrBot 工作目录）。
+
+> 从 v0.3.0 升级而来：旧版默认路径为 `data/webchat_gateway.db`。停止 AstrBot 后将旧 DB 移动到新路径即可保留全部 tokens / 用量 / 审计数据；插件启动时若检测到旧文件但新路径为空会打印警告。
 
 **备份**：插件运行时直接复制 `.db` 文件可能拿到不一致的快照（WAL 在途）。建议使用 SQLite 自带的 `.backup`：
 
 ```bash
-sqlite3 data/webchat_gateway.db ".backup data/webchat_gateway.backup.db"
+sqlite3 data/plugin_data/astrbot_plugin_webchat_gateway/webchat_gateway.db \
+  ".backup data/plugin_data/astrbot_plugin_webchat_gateway/webchat_gateway.backup.db"
 ```
 
 或者先停 AstrBot 再 `cp`。
