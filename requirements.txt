@@ -1,7 +1,6 @@
 aiosqlite>=0.19
 Pillow>=10.0
 redis>=4.2
+aiobotocore>=2.13
 # Optional: required only when storage.driver = "mysql"
 # aiomysql>=0.2
-# Optional: required only when uploads.storage_driver = "r2"
-# aiobotocore>=2.13

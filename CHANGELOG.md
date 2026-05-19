@@ -32,6 +32,7 @@
 - `ChatDeps.conv_service` / `StreamRegistry.__init__` 用 `TYPE_CHECKING` 还原真实类型（之前为 `Any`），方法重命名能在 type-check 时报错
 
 ### Fixed
+- **`aiobotocore` 转为必装依赖**：`uploads.storage_driver=r2` 是 schema 里 `["local", "r2"]` 仅有的两个选项之一，但 `aiobotocore` 在 `requirements.txt` 里被注释成 optional，pip 不读注释。配置了 r2 的用户启动时会看到 `R2FileStore unavailable (...); falling back to LocalFileStore` 警告并被静默降级回 local —— 一个开箱即用的支持选项不该需要用户手动 `pip install`。把 `aiobotocore>=2.13` 从注释里抬出来变真依赖（`aiomysql` 留着 optional，MySQL 是规模化场景）
 - **SSE 终态帧 seq 防御性 clamp**：`/chat/stream` 在结束（成功 done / llm_timeout / empty_reply / 通用 Exception）时把 `handle_obj.next_seq` 当 terminal frame 的 `seq` 写出去。正常路径 `next_seq == last_appended_seq + 1`，但极端竞态下（close_incomplete / close_failed 与 buffer flush 并发，或 buffer driver 重置 next_seq）观测到 `next_seq == last_appended_seq`，让客户端收到一个**非单调**的终态 seq，dedup 链可能 mismatch。新增本地 `last_appended_seq` tracking，3 处 terminal write 用 `max(handle_obj.next_seq, last_appended_seq + 1)` 兜底，纯防御性 —— 正常路径行为不变
 - **LLM 历史长度兜底**：`_history_text` 把所有 CM-paged 行 join 成 prompt，没有总长度上限。一个用户粘的日志/大段代码可能让单条 turn 几兆字符，挤掉系统提示和当前问题，甚至推爆上下文窗口。新增 `_MAX_HISTORY_CHARS = 8000` 兜底，超出走 tail-keep（丢最早，保最新 —— 对话连续性比保留早期片段更有用）。history_turns 已经在 CM 层窗口控制，这是字符级双层保护
 - **LlmBridge fallback 丢失 persona system_prompt**：`generate_reply` 在 AstrBot 旧版本不接受 `image_urls=` 时会 TypeError fallback 到 `provider.text_chat(prompt=, image_urls=)` 直接调；fallback 路径**没传 system_prompt**，导致配置了人格的多模态请求悄悄丢失人格上下文（主路径 `llm_generate` 通过 `persona_id` 内部解析人格，fallback 没有等价机制）。在 fallback 调用里补 `system_prompt=system_prompt`（`_resolve_persona()` 返回值已在 scope 里），人格上下文恢复
