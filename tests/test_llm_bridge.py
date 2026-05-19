@@ -75,11 +75,16 @@ class _StubProvider:
 class _StubConversationManager:
     """In-memory CM stub. The bridge calls
     `get_curr_conversation_id`, `new_conversation`, and
-    `get_human_readable_context` — fake the minimum surface."""
+    `get_human_readable_context` — fake the minimum surface.
 
-    def __init__(self) -> None:
+    `history_lines` is what `get_human_readable_context` returns;
+    set on construction so individual tests can simulate long-history
+    scenarios for the truncation guard."""
+
+    def __init__(self, history_lines: list[str] | None = None) -> None:
         self.curr_cid: str | None = None
         self.new_conv_calls: list[dict[str, Any]] = []
+        self._history_lines = history_lines or []
 
     async def get_curr_conversation_id(self, umo: str) -> str | None:
         return self.curr_cid
@@ -92,9 +97,11 @@ class _StubConversationManager:
     async def get_human_readable_context(
         self, *, unified_msg_origin: str, conversation_id: str, page: int, page_size: int
     ) -> tuple[list[str], int]:
-        # Bridge requests page=1 size=history_turns*2. We return empty so
-        # the prompt builder skips the history block entirely.
-        return [], 0
+        # CM's contract is newest-first; the bridge reverses to get
+        # chronological order. Mirror that by returning the configured
+        # lines in reversed order so tests can think in chronological
+        # terms when constructing `history_lines`.
+        return list(reversed(self._history_lines[-page_size:])), len(self._history_lines)
 
 
 class _StubPersonaManager:
@@ -119,11 +126,14 @@ class _StubContext:
         provider_id: str | None = "prov-stub",
         provider: _StubProvider | None = None,
         persona: _StubPersona | None = None,
+        history_lines: list[str] | None = None,
     ) -> None:
         self._provider_id = provider_id
         self.provider = provider or _StubProvider()
         self.persona_manager = _StubPersonaManager(persona)
-        self.conversation_manager = _StubConversationManager()
+        self.conversation_manager = _StubConversationManager(
+            history_lines=history_lines
+        )
         # AsyncMock with return_value, override per-test via .side_effect
         # or by reassigning to make it raise.
         self.llm_generate = AsyncMock(
@@ -418,6 +428,86 @@ class TestProviderConfigErrors:
                 username="alice",
                 message="hi",
             )
+
+
+@pytest.mark.asyncio
+class TestHistoryCharCap:
+    """P1-5. `_history_text` joins all CM-paged lines into a single
+    string fed into the prompt builder. Without a cap, a single
+    pathological turn (user pasted a log dump) can dominate the prompt
+    and squeeze out the system prompt + current question, or push the
+    rendered history past the model's context window. Cap = 8000
+    chars, tail-keep (drop oldest, preserve newest)."""
+
+    async def test_short_history_passes_through_unmodified(self):
+        from astrbot_plugin_webchat_gateway.core.llm_bridge import LlmBridge
+
+        lines = ["[user]: hi", "[bot]: hello", "[user]: how are you"]
+        ctx = _StubContext(history_lines=lines)
+        # history_turns > 0 so the bridge actually fetches history.
+        bridge = LlmBridge(ctx, history_turns=8, persona_id="", timeout_seconds=10)
+        await bridge.generate_reply(
+            token_name="alice",
+            session_id="s1",
+            username="alice",
+            message="continue?",
+        )
+        prompt = ctx.llm_generate.call_args.kwargs["prompt"]
+        # Every line appears in chronological order.
+        for line in lines:
+            assert line in prompt
+        # Body fits well under the cap → no truncation marker / lost text.
+        assert "[Recent Conversation Context]" in prompt
+
+    async def test_long_history_is_tail_trimmed_to_8000_chars(self):
+        from astrbot_plugin_webchat_gateway.core.llm_bridge import LlmBridge
+
+        # 20 turns × ~600 chars/turn = ~12000 chars body. The
+        # `_MAX_HISTORY_CHARS` cap is 8000. Build distinctive markers
+        # at both ends so the test can verify tail-keep precisely.
+        old_marker = "OLDEST_LINE_MARKER_x" * 30  # 600 chars
+        new_marker = "NEWEST_LINE_MARKER_x" * 30  # 600 chars
+        middle = ["filler line " + "x" * 580 for _ in range(18)]
+        lines = [old_marker] + middle + [new_marker]
+        ctx = _StubContext(history_lines=lines)
+        bridge = LlmBridge(
+            ctx, history_turns=20, persona_id="", timeout_seconds=10
+        )
+        await bridge.generate_reply(
+            token_name="alice",
+            session_id="s1",
+            username="alice",
+            message="continue?",
+        )
+        prompt = ctx.llm_generate.call_args.kwargs["prompt"]
+
+        # Extract the history block (between markers).
+        ctx_marker = "[Recent Conversation Context]\n"
+        msg_marker = "\n\n[Current User Message]"
+        ctx_start = prompt.find(ctx_marker)
+        assert ctx_start >= 0, "history block missing"
+        ctx_start += len(ctx_marker)
+        ctx_end = prompt.find(msg_marker, ctx_start)
+        assert ctx_end > ctx_start, "couldn't find end of history block"
+        history_body = prompt[ctx_start:ctx_end]
+
+        # The full untrimmed body is ~12000 chars; after the 8000 cap
+        # the rendered slice should be <= 8000.
+        assert len(history_body) <= 8000, (
+            f"History body length {len(history_body)} exceeds the "
+            f"8000-char cap — P1-5 truncation didn't fire."
+        )
+
+        # Tail-keep semantics: the newest line MUST survive; the
+        # oldest line should be GONE (the budget consumed by middle
+        # filler ensures it).
+        assert new_marker in history_body, (
+            "Newest line must survive the tail-keep truncation"
+        )
+        assert old_marker not in history_body, (
+            "Oldest line should have been dropped by the tail-keep "
+            "truncation given the 8000-char budget"
+        )
 
 
 def test_map_llm_error_routes_known_codes():

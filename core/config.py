@@ -357,14 +357,17 @@ class ConfigView:
         admin_key = str(_get(cfg, "master_admin_key") or "").strip()
         # Hard floor enforced here so the rest of the codebase never
         # sees a too-short key. constant_time_eq + IP guard cover the
-        # online attack but a sub-16-char key is offline-crackable
-        # in minutes if logs ever leak. Clear the key so admin
-        # endpoints behave exactly as if it were unset; the warning
-        # is logged once at parse time.
-        if admin_key and len(admin_key) < 16:
+        # online attack but a sub-24-char key is offline-crackable in
+        # hours if logs ever leak (the threshold tightened from 16 to
+        # 24 in v0.3.2 — see CHANGELOG BREAKING note). Clear the key
+        # so admin endpoints behave exactly as if it were unset; the
+        # error is logged once at parse time.
+        if admin_key and len(admin_key) < 24:
             logger.error(
-                "[WebChatGateway] master_admin_key MUST be >= 16 chars; "
-                "current length=%d. Admin endpoints DISABLED until rotated.",
+                "[WebChatGateway] master_admin_key MUST be >= 24 chars; "
+                "current length=%d. Admin endpoints DISABLED until rotated. "
+                "Generate a fresh one with: "
+                "`python -c \"import secrets; print(secrets.token_urlsafe(32))\"`",
                 len(admin_key),
             )
             admin_key = ""
@@ -559,9 +562,9 @@ class ConfigView:
             logger.warning(
                 "[WebChatGateway] master_admin_key is empty; admin endpoints disabled"
             )
-        elif len(self.master_admin_key) < 24:
+        elif len(self.master_admin_key) < 32:
             logger.warning(
-                "[WebChatGateway] master_admin_key is shorter than 24 chars; consider regenerating"
+                "[WebChatGateway] master_admin_key is shorter than 32 chars; consider regenerating with `python -c \"import secrets; print(secrets.token_urlsafe(32))\"`"
             )
         if self.storage.driver == "mysql" and not self.storage.mysql_dsn:
             logger.error(

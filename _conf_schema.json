@@ -130,7 +130,7 @@
   "master_admin_key": {
     "type": "string",
     "description": "管理 API 主密钥",
-    "hint": "为空则禁用 /admin/* HTTP 端点（机器人内 /webchat 命令仍可用）；建议使用 32+ 字符强随机字符串，可用 `python -c \"import secrets; print(secrets.token_urlsafe(32))\"` 生成。请勿提交到代码仓库。",
+    "hint": "为空则禁用 /admin/* HTTP 端点（机器人内 /webchat 命令仍可用）；**至少 24 字符**（v0.3.2 起的硬下限，更短会被清空），建议 32+ 字符强随机字符串，可用 `python -c \"import secrets; print(secrets.token_urlsafe(32))\"` 生成。请勿提交到代码仓库。",
     "default": ""
   },
   "storage": {

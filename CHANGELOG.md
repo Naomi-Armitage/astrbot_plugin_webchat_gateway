@@ -5,6 +5,14 @@
 
 ## Unreleased
 
+### ⚠️ Breaking
+- **`master_admin_key` 硬下限从 16 字符上调到 24 字符**。本来认为 16 字符够（在 IP-guard + 常量时间比较的保护下），但**一旦日志泄漏，sub-24 字符的 key 是离线可破解时间数量级（数小时～数天）**，远低于密钥轮换周期。升级到本版本后：
+  - 长度 ≥ 24 字符：照常工作。
+  - 长度 16-23 字符：启动时一次性 ERROR 日志，**`admin_key` 被清空**，HTTP `/admin/*` 端点全部禁用（机器人内 `/webchat` 命令仍能用）。日志里会提示生成命令：`python -c "import secrets; print(secrets.token_urlsafe(32))"`。
+  - 同时，建议下限的 WARNING 阈值从 24 上调到 32，鼓励运维使用更长的随机 key。
+  
+  **升级建议**：在升级前用上面那条命令重新生成一个 32+ 字符的 key，更新到 `_conf_schema.json` / AstrBot 配置 UI，再重启插件。
+
 ### Added — UI 操作 / 多设备 / 流式
 - 用户消息 hover **编辑** 按钮：把原文加载进底部 composer，由用户改完手动发送。原气泡不动，编辑后的内容作为新一轮在对话底部出现（用完整当前上下文）
 - 用户消息 hover **再问一次** 按钮：一键把原文 + 附件作为新一轮 `/chat/stream` dispatch 到对话底部。原气泡不动；LLM 看到完整当前上下文（包含中间所有 turn），所以同一个问题在不同时刻可能得到不同答案。和 bot-side `重新生成`（截尾重生）显式区分
@@ -24,8 +32,10 @@
 - `ChatDeps.conv_service` / `StreamRegistry.__init__` 用 `TYPE_CHECKING` 还原真实类型（之前为 `Any`），方法重命名能在 type-check 时报错
 
 ### Fixed
-- **P1-1 LlmBridge fallback 丢失 persona system_prompt**：`generate_reply` 在 AstrBot 旧版本不接受 `image_urls=` 时会 TypeError fallback 到 `provider.text_chat(prompt=, image_urls=)` 直接调；fallback 路径**没传 system_prompt**，导致配置了人格的多模态请求悄悄丢失人格上下文（主路径 `llm_generate` 通过 `persona_id` 内部解析人格，fallback 没有等价机制）。在 fallback 调用里补 `system_prompt=system_prompt`（`_resolve_persona()` 返回值已在 scope 里），人格上下文恢复
-- **P1-2 SSE 握手 ConnectionError 误算 internal_error**：`/chat/stream` 的握手期 try/except 把 `ConnectionResetError` / `ConnectionError` 落到泛 `Exception` 分支 → `close_failed(error_code="internal_error")` → 污染异常率监控。客户端在 `: ready\n\n` 后立即 RST（快速重试 / 链路抖动）是**正常 cancelled**而非服务端故障。新增独立 except 分支：info-level 日志（不打 traceback）+ `close_failed("cancelled")` + 直接 return response（不 re-raise — 对端已断）
+- **SSE 终态帧 seq 防御性 clamp**：`/chat/stream` 在结束（成功 done / llm_timeout / empty_reply / 通用 Exception）时把 `handle_obj.next_seq` 当 terminal frame 的 `seq` 写出去。正常路径 `next_seq == last_appended_seq + 1`，但极端竞态下（close_incomplete / close_failed 与 buffer flush 并发，或 buffer driver 重置 next_seq）观测到 `next_seq == last_appended_seq`，让客户端收到一个**非单调**的终态 seq，dedup 链可能 mismatch。新增本地 `last_appended_seq` tracking，3 处 terminal write 用 `max(handle_obj.next_seq, last_appended_seq + 1)` 兜底，纯防御性 —— 正常路径行为不变
+- **LLM 历史长度兜底**：`_history_text` 把所有 CM-paged 行 join 成 prompt，没有总长度上限。一个用户粘的日志/大段代码可能让单条 turn 几兆字符，挤掉系统提示和当前问题，甚至推爆上下文窗口。新增 `_MAX_HISTORY_CHARS = 8000` 兜底，超出走 tail-keep（丢最早，保最新 —— 对话连续性比保留早期片段更有用）。history_turns 已经在 CM 层窗口控制，这是字符级双层保护
+- **LlmBridge fallback 丢失 persona system_prompt**：`generate_reply` 在 AstrBot 旧版本不接受 `image_urls=` 时会 TypeError fallback 到 `provider.text_chat(prompt=, image_urls=)` 直接调；fallback 路径**没传 system_prompt**，导致配置了人格的多模态请求悄悄丢失人格上下文（主路径 `llm_generate` 通过 `persona_id` 内部解析人格，fallback 没有等价机制）。在 fallback 调用里补 `system_prompt=system_prompt`（`_resolve_persona()` 返回值已在 scope 里），人格上下文恢复
+- **SSE 握手 ConnectionError 误算 internal_error**：`/chat/stream` 的握手期 try/except 把 `ConnectionResetError` / `ConnectionError` 落到泛 `Exception` 分支 → `close_failed(error_code="internal_error")` → 污染异常率监控。客户端在 `: ready\n\n` 后立即 RST（快速重试 / 链路抖动）是**正常 cancelled**而非服务端故障。新增独立 except 分支：info-level 日志（不打 traceback）+ `close_failed("cancelled")` + 直接 return response（不 re-raise — 对端已断）
 - **bot 重新生成时的双气泡 race**：以前点 bot 气泡的"重新生成"，POST 响应回来才调 `recordOptimistic` / `recordPendingDelete` 做去重。但 server 把 `message_added` / `message_deleted` 事件比 POST 响应更早通过 long-poll 推到 client 时，client 直接 push 一份新 bot，POST 响应再 push 一份 → 出现两个一模一样的 bot 气泡（F5 后才被 server 真实状态 1 条同步取代）。重新生成改走 SSE 流式后：(1) 立刻 pre-truncate + recordPendingDelete 防止后到的 `message_deleted(idx)` 把新 bot 误删；(2) 复用 `streamFinalizeSuppressed` 让抢先到的 `message_added` 接管 streaming 气泡；(3) SSE done 兜底再扫一次 history.tail，防止两层 race 都漏过的边界。彻底消除双气泡
 - **`replayActive` 强制滑到底**：以前任何 replay 都无条件 `scrollToEnd()`，mid-history 删除 / 重新生成 / 编辑都会把用户从他正在读的位置弹到底部。改为：渲染前记录滚动位置，仅当用户已经"接近底部"（≤80px）时才 scrollToEnd；否则用 height delta 校正后还原原滚动位置
 - **消息气泡的异常换行**：两部分修复 ——

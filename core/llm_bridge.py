@@ -84,6 +84,20 @@ class LlmBridge:
             )
             return None, None
 
+    # Hard cap on the rendered history slice (in CHAR count, not
+    # tokens — but at typical model packing of 2-4 chars/token, 8K
+    # chars maps to 2-4K tokens of *just* history before the prompt
+    # frame and the current user message are even appended). Without
+    # this guard, a token-side runaway (verbose model that keeps
+    # generating long replies, or pathological pasted content) could
+    # let the rendered history overflow the model's context window
+    # and trigger a provider 4xx mid-turn. The history slice is
+    # already CM-windowed by `history_turns` (page_size = turns*2)
+    # but a single turn can be megabytes if the user pasted a log
+    # dump — that one giant entry would dominate the prompt and
+    # squeeze out the system prompt + the current question.
+    _MAX_HISTORY_CHARS = 8000
+
     async def _history_text(self, unified_origin: str, conversation_id: str) -> str:
         if self._history_turns <= 0:
             return ""
@@ -96,7 +110,19 @@ class LlmBridge:
         if not lines:
             return ""
         ordered = list(reversed(lines))
-        return "\n".join(ordered)
+        joined = "\n".join(ordered)
+        if len(joined) > self._MAX_HISTORY_CHARS:
+            # Tail-keep: a conversation that ran past the cap loses the
+            # oldest turns, not the most recent ones. Continuity with
+            # what the user is asking right now is more useful than
+            # preserving a partial early turn. The cut may bisect a
+            # line; leave it raw rather than realigning to a newline
+            # boundary — provider tokenizers treat a half-line as a
+            # complete prefix and the model handles the implicit start
+            # fine (cleaner to occasionally render one truncated line
+            # than to lose another entire turn to alignment).
+            joined = joined[-self._MAX_HISTORY_CHARS:]
+        return joined
 
     @staticmethod
     def _build_prompt(

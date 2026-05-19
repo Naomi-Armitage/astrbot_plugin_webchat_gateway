@@ -811,6 +811,22 @@ def make_chat_stream_handler(deps: ChatDeps):
         collected: list[str] = []
         client_gone = False
         terminal_emitted = False  # registry.close_* called → don't double-close
+        # Defensive sequence-monotonicity guard for terminal frames.
+        # The registry hands back a fresh seq per chunk via `append`; in
+        # the happy path `handle_obj.next_seq` advances to one past the
+        # last appended seq and a terminal `done`/`error` frame uses
+        # `next_seq` directly. Under extreme races (close_incomplete /
+        # close_failed running concurrently with a buffer flush, or a
+        # buffer driver that resets next_seq for any reason), next_seq
+        # has in the past been observed equal to the last appended seq
+        # instead of one-past, producing a non-monotonic `seq` in the
+        # terminal frame the client sees. Tracking the last appended
+        # seq locally and clamping `last_seq = max(next_seq,
+        # last_appended_seq + 1)` on every terminal-frame write makes
+        # this purely additive: nominal behavior is unchanged (next_seq
+        # already equals last_appended_seq + 1 in the happy path), but
+        # the pathological case can no longer leak into the wire.
+        last_appended_seq = -1
 
         async def _write_frame(frame: bytes) -> bool:
             # Write returns when the chunk has been handed to the transport.
@@ -930,6 +946,7 @@ def make_chat_stream_handler(deps: ChatDeps):
 
                     collected.append(chunk)
                     seq = await deps.registry.append(handle_obj, chunk)
+                    last_appended_seq = seq
                     if not client_gone:
                         frame = (
                             "data: "
@@ -946,7 +963,7 @@ def make_chat_stream_handler(deps: ChatDeps):
             except RuntimeError as exc:
                 code = str(exc)
                 full_text = "".join(collected)
-                last_seq = handle_obj.next_seq  # next unused seq → terminal frame uses it
+                last_seq = max(handle_obj.next_seq, last_appended_seq + 1)  # clamp — see init comment
                 if code == "llm_timeout":
                     if collected:
                         # Aborted with content — persist as incomplete.
@@ -1116,7 +1133,7 @@ def make_chat_stream_handler(deps: ChatDeps):
                 raise
             except Exception as exc:
                 logger.exception("[WebChatGateway] LLM stream failed")
-                last_seq = handle_obj.next_seq
+                last_seq = max(handle_obj.next_seq, last_appended_seq + 1)
                 if collected:
                     new_count = await deps.storage.increment_daily_usage(
                         token.name, day=today
@@ -1179,7 +1196,7 @@ def make_chat_stream_handler(deps: ChatDeps):
 
             # Successful stream end. Persist + audit + done frame.
             full_reply = "".join(collected)
-            last_seq = handle_obj.next_seq
+            last_seq = max(handle_obj.next_seq, last_appended_seq + 1)
             if not full_reply:
                 # Provider returned end-of-stream without any chunks. No
                 # persist, no quota — but distinct from `llm_timeout` for
