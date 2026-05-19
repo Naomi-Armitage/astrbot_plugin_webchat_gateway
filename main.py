@@ -404,6 +404,10 @@ class WebChatGatewayPlugin(Star):
                         events_retention_seconds=self._CHAT_SYNC_EVENTS_RETENTION_SECONDS,
                         deleted_meta_retention_seconds=self._CHAT_SYNC_DELETED_META_RETENTION_SECONDS,
                         upload_orphan_retention_seconds=self._UPLOAD_ORPHAN_RETENTION_SECONDS,
+                        audit_retention_seconds=(
+                            (self._cfg.audit_retention_days if self._cfg else 7)
+                            * 86400
+                        ),
                     ),
                     cookie_logout_tracker=self._cookie_logout_tracker,
                     event_bus=self._event_bus,

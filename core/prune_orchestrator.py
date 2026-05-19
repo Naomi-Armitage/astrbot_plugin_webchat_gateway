@@ -80,6 +80,7 @@ class PruneRetentionConfig:
     deleted_meta_retention_seconds: int = 90 * 86400
     upload_orphan_retention_seconds: int = 3600
     ip_failures_retention_seconds: int = 24 * 3600
+    audit_retention_seconds: int = 7 * 86400
 
 
 class PruneOrchestrator:
@@ -241,6 +242,17 @@ class PruneOrchestrator:
             )
         except Exception:
             logger.exception("[WebChatGateway] prune_ip_failures failed")
+        try:
+            pruned_audit = await storage.prune_audit(
+                before_ts=now - self._cfg.audit_retention_seconds,
+            )
+            if pruned_audit:
+                logger.info(
+                    "[WebChatGateway] audit prune removed %d row(s)",
+                    pruned_audit,
+                )
+        except Exception:
+            logger.exception("[WebChatGateway] prune_audit failed")
         if self._event_bus is not None:
             try:
                 await self._event_bus.prune_idle()

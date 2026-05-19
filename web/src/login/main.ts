@@ -31,7 +31,7 @@ form.addEventListener("submit", async (e) => {
   const token = tokenInput.value.trim();
   const username = usernameInput.value.trim() || "Friend";
   if (!token) {
-    errEl.textContent = "请先填写访问 token。";
+    errEl.textContent = "请先填写访问凭证。";
     tokenInput.focus();
     return;
   }
@@ -44,7 +44,7 @@ form.addEventListener("submit", async (e) => {
       credentials: "same-origin",
     });
     if (resp.status === 401) {
-      errEl.textContent = "Token 无效或已撤销。";
+      errEl.textContent = "访问凭证无效或已撤销。";
       tokenInput.focus();
       return;
     }

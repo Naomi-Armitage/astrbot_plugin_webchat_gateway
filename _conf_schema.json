@@ -97,6 +97,12 @@
     "hint": "范围 1 - 1000000。也可在签发时单独指定，不指定则使用此默认值。",
     "default": 200
   },
+  "audit_retention_days": {
+    "type": "int",
+    "description": "审计日志保留天数",
+    "hint": "超过该天数的审计日志会被后台清理任务删除。范围 1 - 3650，默认 7 天。0 / 负值会被夹紧到 1；过大值会被夹紧到 3650。",
+    "default": 7
+  },
   "ip_brute_force_max_fails": {
     "type": "int",
     "description": "同 IP 鉴权失败多少次后封禁",

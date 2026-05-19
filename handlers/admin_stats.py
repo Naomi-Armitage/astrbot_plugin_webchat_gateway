@@ -327,10 +327,60 @@ def make_admin_handlers(deps: AdminDeps):
         ip = client_ip(request, trust_forwarded_for=deps.trust_forwarded_for)
         try:
             await _gate(request, ip, origin, allow_missing=True)
-            limit = _parse_int(request.query.get("limit"), default=100, lo=1, hi=500)
-            rows = await deps.storage.get_recent_audit(limit=limit)
+            q = request.query
+            # Page-based pagination. `page` is 1-indexed because that's
+            # what the UI binds to; `page_size` and `page` are both
+            # clamped at the storage layer too, but doing it here keeps
+            # the offset arithmetic clean.
+            page_size = _parse_int(q.get("page_size"), default=100, lo=1, hi=1000)
+            page = _parse_int(q.get("page"), default=1, lo=1, hi=1_000_000)
+            offset = (page - 1) * page_size
+            # Back-compat: the old `limit` param still works (page=1,
+            # whatever limit the caller passed), so existing scripts
+            # don't break.
+            limit_arg = q.get("limit")
+            if limit_arg is not None and "page_size" not in q:
+                page_size = _parse_int(limit_arg, default=100, lo=1, hi=1000)
+                offset = 0
+                page = 1
+
+            event = (q.get("event") or "").strip() or None
+            name = (q.get("name") or "").strip() or None
+            ip_filter = (q.get("ip") or "").strip() or None
+            ts_from_raw = q.get("ts_from")
+            ts_to_raw = q.get("ts_to")
+            ts_from: int | None
+            ts_to: int | None
+            try:
+                ts_from = int(ts_from_raw) if ts_from_raw else None
+            except (TypeError, ValueError):
+                ts_from = None
+            try:
+                ts_to = int(ts_to_raw) if ts_to_raw else None
+            except (TypeError, ValueError):
+                ts_to = None
+
+            rows, total = await deps.storage.list_audit(
+                limit=page_size,
+                offset=offset,
+                event=event,
+                name=name,
+                ip=ip_filter,
+                ts_from=ts_from,
+                ts_to=ts_to,
+            )
             await deps.audit.write(
-                "admin_audit", ip=ip, detail={"limit": limit, "count": len(rows)}
+                "admin_audit",
+                ip=ip,
+                detail={
+                    "page": page,
+                    "page_size": page_size,
+                    "count": len(rows),
+                    "total": total,
+                    "filtered": bool(
+                        event or name or ip_filter or ts_from or ts_to
+                    ),
+                },
             )
         except ServiceError as exc:
             return _err(request, origin, exc)
@@ -349,7 +399,10 @@ def make_admin_handlers(deps: AdminDeps):
                         "detail": r.detail,
                     }
                     for r in rows
-                ]
+                ],
+                "total": total,
+                "page": page,
+                "page_size": page_size,
             },
             origin=origin,
             allowed_origins=allowed,

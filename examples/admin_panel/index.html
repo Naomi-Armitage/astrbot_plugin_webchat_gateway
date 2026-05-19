@@ -472,6 +472,132 @@
         gap: 6px;
       }
 
+      /* ----- Audit filter row ----- */
+      .filter-row {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+        gap: 10px;
+        margin-bottom: 12px;
+        padding: 12px;
+        background: var(--surface-2);
+        border: 1px solid var(--border-soft);
+        border-radius: 8px;
+      }
+      .filter-row label {
+        display: flex;
+        flex-direction: column;
+        font-size: 11px;
+        color: var(--muted);
+        font-weight: 500;
+        letter-spacing: 0.02em;
+        gap: 4px;
+      }
+      .filter-row input,
+      .filter-row select {
+        padding: 7px 9px;
+        background: var(--bg-elev);
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        font: inherit;
+        font-size: 12px;
+      }
+      .filter-row input:focus,
+      .filter-row select:focus {
+        outline: none;
+        border-color: var(--accent);
+        box-shadow: 0 0 0 3px var(--accent-soft);
+      }
+      .filter-actions {
+        display: flex;
+        align-items: end;
+        gap: 8px;
+      }
+      .filter-actions button {
+        font-size: 12px;
+        padding: 7px 12px;
+      }
+
+      /* ----- Pagination ----- */
+      .pagination {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 8px;
+        margin-top: 14px;
+        padding-top: 12px;
+        border-top: 1px solid var(--border-soft);
+      }
+      .pagination .summary {
+        font-size: 12px;
+        color: var(--muted);
+        margin-right: auto;
+      }
+      .pagination .summary strong {
+        color: var(--text);
+        font-weight: 600;
+      }
+      .pagination .page-size {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .pagination .page-size select {
+        padding: 5px 8px;
+        background: var(--bg-elev);
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        font: inherit;
+        font-size: 12px;
+        cursor: pointer;
+      }
+      .pagination .page-size select:focus {
+        outline: none;
+        border-color: var(--accent);
+        box-shadow: 0 0 0 3px var(--accent-soft);
+      }
+      .pager {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+      }
+      .pager button.page-btn {
+        background: transparent;
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 5px 10px;
+        font-size: 12px;
+        font-weight: 500;
+        cursor: pointer;
+        min-width: 32px;
+        transition: background .12s ease, border-color .12s ease, color .12s ease;
+      }
+      .pager button.page-btn:hover:not(:disabled):not(.active) {
+        background: var(--surface-2);
+        border-color: var(--accent);
+        color: var(--text-strong);
+      }
+      .pager button.page-btn.active {
+        background: var(--accent-soft);
+        border-color: var(--accent);
+        color: var(--accent-strong);
+        cursor: default;
+      }
+      .pager button.page-btn:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+      }
+      .pager .ellipsis {
+        color: var(--muted);
+        padding: 0 4px;
+        user-select: none;
+        font-size: 12px;
+      }
+
       .login-shell {
         display: grid;
         place-items: center;
@@ -642,6 +768,22 @@
           </thead>
           <tbody id="listBody"></tbody>
         </table>
+        <div class="pagination" id="listPagination" hidden>
+          <span class="summary" id="listSummary"></span>
+          <label class="page-size">
+            每页
+            <select id="listPageSize">
+              <option value="20">20</option>
+              <option value="50" selected>50</option>
+              <option value="100">100</option>
+              <option value="200">200</option>
+              <option value="500">500</option>
+              <option value="1000">1000</option>
+            </select>
+            条
+          </label>
+          <div class="pager" id="listPager"></div>
+        </div>
         <span id="listStatus" class="status"></span>
       </section>
 
@@ -679,12 +821,49 @@
             <button id="refreshAudit" class="ghost">刷新</button>
           </div>
         </div>
+        <div class="filter-row">
+          <label>事件 (event)
+            <input id="filterEvent" type="text" placeholder="如 chat_ok / auth_fail" autocomplete="off" spellcheck="false" />
+          </label>
+          <label>Name
+            <input id="filterName" type="text" placeholder="模糊匹配" autocomplete="off" spellcheck="false" />
+          </label>
+          <label>IP
+            <input id="filterIp" type="text" placeholder="模糊匹配" autocomplete="off" spellcheck="false" />
+          </label>
+          <label>起始时间
+            <input id="filterFrom" type="datetime-local" />
+          </label>
+          <label>结束时间
+            <input id="filterTo" type="datetime-local" />
+          </label>
+          <div class="filter-actions">
+            <button id="applyFilter" type="button">筛选</button>
+            <button id="clearFilter" class="ghost" type="button">清除</button>
+          </div>
+        </div>
         <table>
           <thead>
             <tr><th>时间</th><th>事件</th><th>Name</th><th>IP</th><th>详情</th></tr>
           </thead>
           <tbody id="auditBody"></tbody>
         </table>
+        <div class="pagination" id="auditPagination" hidden>
+          <span class="summary" id="auditSummary"></span>
+          <label class="page-size">
+            每页
+            <select id="auditPageSize">
+              <option value="20">20</option>
+              <option value="50">50</option>
+              <option value="100" selected>100</option>
+              <option value="200">200</option>
+              <option value="500">500</option>
+              <option value="1000">1000</option>
+            </select>
+            条
+          </label>
+          <div class="pager" id="auditPager"></div>
+        </div>
         <span id="auditStatus" class="status"></span>
       </section>
     </div>
@@ -942,9 +1121,72 @@
         }
       };
 
+      // ----- Pagination helper -----
+      // Renders a pager into `container` showing: first page + ellipsis +
+      // last 3 pages (and current page in the middle when it isn't already
+      // covered). Always renders Prev / Next. `onJump(page)` is called when
+      // a number is clicked or Prev/Next pressed; the callback owns the
+      // actual data refetch.
+      function renderPager(container, current, totalPages, onJump) {
+        container.textContent = "";
+        if (totalPages <= 0) return;
+        const cur = Math.max(1, Math.min(current, totalPages));
+
+        const makeBtn = (label, page, opts = {}) => {
+          const b = document.createElement("button");
+          b.type = "button";
+          b.className = "page-btn";
+          b.textContent = label;
+          if (opts.active) b.classList.add("active");
+          if (opts.disabled) b.disabled = true;
+          if (opts.aria) b.setAttribute("aria-label", opts.aria);
+          if (!opts.disabled && !opts.active) {
+            b.onclick = () => onJump(page);
+          }
+          return b;
+        };
+        const makeEllipsis = () => {
+          const s = document.createElement("span");
+          s.className = "ellipsis";
+          s.textContent = "…";
+          s.setAttribute("aria-hidden", "true");
+          return s;
+        };
+
+        // Prev
+        container.appendChild(
+          makeBtn("‹", cur - 1, { disabled: cur <= 1, aria: "上一页" })
+        );
+
+        // Build the visible page set: first + last 3 + current (and its
+        // immediate neighbors if they sit in the gap, for orientation).
+        const pages = new Set();
+        pages.add(1);
+        for (let i = Math.max(1, totalPages - 2); i <= totalPages; i++) pages.add(i);
+        pages.add(cur);
+        if (cur - 1 > 1) pages.add(cur - 1);
+        if (cur + 1 < totalPages) pages.add(cur + 1);
+
+        const sorted = [...pages].filter((p) => p >= 1 && p <= totalPages).sort((a, b) => a - b);
+        let prev = 0;
+        for (const p of sorted) {
+          if (p - prev > 1) container.appendChild(makeEllipsis());
+          container.appendChild(
+            makeBtn(String(p), p, { active: p === cur, aria: `第 ${p} 页` })
+          );
+          prev = p;
+        }
+
+        // Next
+        container.appendChild(
+          makeBtn("›", cur + 1, { disabled: cur >= totalPages, aria: "下一页" })
+        );
+      }
+
       // ----- List -----
       let lastList = [];
-      async function loadList() {
+      let listPageState = { page: 1, pageSize: 50 };
+      async function loadList(resetPage = true) {
         const status = $("listStatus");
         status.textContent = "加载中...";
         status.className = "status";
@@ -952,12 +1194,37 @@
           const q = $("includeRevoked").checked ? "?include_revoked=true" : "";
           const data = await api(`/api/webchat/admin/tokens${q}`);
           lastList = data.tokens;
-          renderList(data.tokens);
+          if (resetPage) listPageState.page = 1;
+          renderListPage();
           status.textContent = `${data.tokens.length} 个 token`;
           status.className = "status success";
         } catch (e) {
           status.textContent = `失败: ${e.message}`;
           status.className = "status error";
+        }
+      }
+      function renderListPage() {
+        const { page, pageSize } = listPageState;
+        const total = lastList.length;
+        const totalPages = Math.max(1, Math.ceil(total / pageSize));
+        const curPage = Math.min(page, totalPages);
+        listPageState.page = curPage;
+        const start = (curPage - 1) * pageSize;
+        const slice = lastList.slice(start, start + pageSize);
+        renderList(slice);
+        const pagination = $("listPagination");
+        if (total === 0) {
+          pagination.hidden = true;
+        } else {
+          pagination.hidden = false;
+          const fromIdx = start + 1;
+          const toIdx = Math.min(start + slice.length, total);
+          $("listSummary").innerHTML =
+            `第 <strong>${fromIdx}-${toIdx}</strong> 条 / 共 <strong>${total}</strong> 条 · 第 <strong>${curPage}</strong> / ${totalPages} 页`;
+          renderPager($("listPager"), curPage, totalPages, (p) => {
+            listPageState.page = p;
+            renderListPage();
+          });
         }
       }
       function renderList(rows) {
@@ -997,8 +1264,13 @@
           body.appendChild(tr);
         }
       }
-      $("refreshList").onclick = loadList;
-      $("includeRevoked").onchange = loadList;
+      $("refreshList").onclick = () => loadList(true);
+      $("includeRevoked").onchange = () => loadList(true);
+      $("listPageSize").onchange = (e) => {
+        listPageState.pageSize = Number(e.target.value) || 50;
+        listPageState.page = 1;
+        renderListPage();
+      };
 
       // ----- Stats -----
       function populateNames() {
@@ -1074,19 +1346,75 @@
 
       // ----- Audit -----
       let auditTimer = null;
-      async function loadAudit() {
+      let auditPageState = { page: 1, pageSize: 100 };
+
+      function readAuditFilters() {
+        const f = {
+          event: $("filterEvent").value.trim(),
+          name: $("filterName").value.trim(),
+          ip: $("filterIp").value.trim(),
+        };
+        const fromVal = $("filterFrom").value.trim();
+        const toVal = $("filterTo").value.trim();
+        if (fromVal) {
+          const ms = new Date(fromVal).getTime();
+          if (!Number.isNaN(ms)) f.ts_from = Math.round(ms / 1000);
+        }
+        if (toVal) {
+          const ms = new Date(toVal).getTime();
+          if (!Number.isNaN(ms)) f.ts_to = Math.round(ms / 1000);
+        }
+        return f;
+      }
+
+      async function loadAudit(resetPage = true) {
         const status = $("auditStatus");
         status.textContent = "加载中...";
         status.className = "status";
         try {
-          const data = await api("/api/webchat/admin/audit?limit=200");
+          if (resetPage) auditPageState.page = 1;
+          const filters = readAuditFilters();
+          const params = new URLSearchParams();
+          params.set("page", String(auditPageState.page));
+          params.set("page_size", String(auditPageState.pageSize));
+          if (filters.event) params.set("event", filters.event);
+          if (filters.name) params.set("name", filters.name);
+          if (filters.ip) params.set("ip", filters.ip);
+          if (filters.ts_from != null) params.set("ts_from", String(filters.ts_from));
+          if (filters.ts_to != null) params.set("ts_to", String(filters.ts_to));
+          const data = await api(`/api/webchat/admin/audit?${params.toString()}`);
           renderAudit(data.events);
-          status.textContent = `${data.events.length} 条`;
+          renderAuditPagination(data);
+          status.textContent = data.total != null
+            ? `共 ${data.total} 条，本页 ${data.events.length} 条`
+            : `${data.events.length} 条`;
           status.className = "status success";
         } catch (e) {
           status.textContent = `失败: ${e.message}`;
           status.className = "status error";
         }
+      }
+      function renderAuditPagination(data) {
+        const total = Number(data.total || 0);
+        const pageSize = Number(data.page_size || auditPageState.pageSize);
+        const page = Number(data.page || auditPageState.page);
+        auditPageState.page = page;
+        auditPageState.pageSize = pageSize;
+        const pagination = $("auditPagination");
+        if (total === 0) {
+          pagination.hidden = true;
+          return;
+        }
+        pagination.hidden = false;
+        const totalPages = Math.max(1, Math.ceil(total / pageSize));
+        const start = (page - 1) * pageSize + 1;
+        const end = Math.min(page * pageSize, total);
+        $("auditSummary").innerHTML =
+          `第 <strong>${start}-${end}</strong> 条 / 共 <strong>${total}</strong> 条 · 第 <strong>${page}</strong> / ${totalPages} 页`;
+        renderPager($("auditPager"), page, totalPages, (p) => {
+          auditPageState.page = p;
+          loadAudit(false);
+        });
       }
       function renderAudit(events) {
         const body = $("auditBody");
@@ -1103,13 +1431,39 @@
           body.appendChild(tr);
         }
       }
-      $("refreshAudit").onclick = loadAudit;
+      $("refreshAudit").onclick = () => loadAudit(false);
       $("autoRefresh").onchange = (e) => {
         clearInterval(auditTimer);
         if (e.target.checked) {
-          auditTimer = setInterval(loadAudit, 10000);
+          // Auto-refresh keeps the current page so the operator's view
+          // doesn't yank back to page 1 every 10s. New rows arriving while
+          // they're paging through page 5 will surface on the next manual
+          // refresh — that's the right trade-off.
+          auditTimer = setInterval(() => loadAudit(false), 10000);
         }
       };
+      $("auditPageSize").onchange = (e) => {
+        auditPageState.pageSize = Number(e.target.value) || 100;
+        loadAudit(true);
+      };
+      $("applyFilter").onclick = () => loadAudit(true);
+      $("clearFilter").onclick = () => {
+        $("filterEvent").value = "";
+        $("filterName").value = "";
+        $("filterIp").value = "";
+        $("filterFrom").value = "";
+        $("filterTo").value = "";
+        loadAudit(true);
+      };
+      // Enter inside any filter field triggers the same search.
+      ["filterEvent", "filterName", "filterIp", "filterFrom", "filterTo"].forEach((id) => {
+        $(id).addEventListener("keydown", (e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            loadAudit(true);
+          }
+        });
+      });
 
       function escape(s) {
         return String(s)

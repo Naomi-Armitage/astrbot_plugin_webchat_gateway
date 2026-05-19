@@ -590,6 +590,77 @@ class MysqlStorage(AbstractStorage):
             for r in rows
         ]
 
+    async def list_audit(
+        self,
+        *,
+        limit: int,
+        offset: int = 0,
+        event: str | None = None,
+        name: str | None = None,
+        ip: str | None = None,
+        ts_from: int | None = None,
+        ts_to: int | None = None,
+    ) -> tuple[list[AuditRow], int]:
+        limit = max(1, min(int(limit), 1000))
+        offset = max(0, int(offset))
+        where: list[str] = []
+        params: list = []
+        if event:
+            where.append("event LIKE %s")
+            params.append(f"%{event}%")
+        if name:
+            where.append("name LIKE %s")
+            params.append(f"%{name}%")
+        if ip:
+            where.append("ip LIKE %s")
+            params.append(f"%{ip}%")
+        if ts_from is not None:
+            where.append("ts >= %s")
+            params.append(int(ts_from))
+        if ts_to is not None:
+            where.append("ts <= %s")
+            params.append(int(ts_to))
+        where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+
+        async with self._read_tx() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    f"SELECT COUNT(*) AS c FROM audit_log{where_sql}",
+                    tuple(params),
+                )
+                total_row = await cur.fetchone()
+                total = int(total_row["c"]) if total_row else 0
+
+                await cur.execute(
+                    f"SELECT id, ts, name, ip, event, detail FROM audit_log{where_sql} "
+                    "ORDER BY ts DESC, id DESC LIMIT %s OFFSET %s",
+                    tuple(params) + (limit, offset),
+                )
+                rows = await cur.fetchall()
+        return (
+            [
+                AuditRow(
+                    id=int(r["id"]),
+                    ts=int(r["ts"]),
+                    name=r["name"],
+                    ip=r["ip"],
+                    event=r["event"],
+                    detail=r["detail"] or "",
+                )
+                for r in rows
+            ],
+            total,
+        )
+
+    async def prune_audit(self, *, before_ts: int) -> int:
+        async with self._write_tx() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "DELETE FROM audit_log WHERE ts < %s",
+                    (int(before_ts),),
+                )
+                return cur.rowcount or 0
+
     # ----- chat sync (v3) -----
     @staticmethod
     def _row_to_session_meta(row: dict) -> SessionMetaRow:

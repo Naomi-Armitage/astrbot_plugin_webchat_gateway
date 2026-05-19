@@ -53,22 +53,22 @@
         <div class="container">
           <form class="card" id="entryForm" autocomplete="off" novalidate>
             <h2>开始聊天</h2>
-            <p class="lede">输入你的访问 token 与昵称，进入聊天页面。</p>
+            <p class="lede">输入你的昵称与访问凭证，进入聊天页面。</p>
             <div class="field">
-              <label for="token">访问 Token</label>
+              <label for="username">昵称（用户名）</label>
+              <input id="username" name="username" type="text"
+                placeholder="Friend" maxlength="32"
+                autocomplete="off" spellcheck="false" />
+            </div>
+            <div class="field">
+              <label for="token">访问凭证（密码 / Token）</label>
               <div class="field-row">
                 <input id="token" name="token" type="password" required
-                  placeholder="粘贴管理员发给你的 token"
+                  placeholder="粘贴管理员发给你的访问凭证"
                   autocomplete="off" spellcheck="false" />
                 <button type="button" class="reveal-btn" id="revealBtn"
                   aria-pressed="false">显示</button>
               </div>
-            </div>
-            <div class="field">
-              <label for="username">昵称</label>
-              <input id="username" name="username" type="text"
-                placeholder="Friend" maxlength="32"
-                autocomplete="off" spellcheck="false" />
             </div>
             <button type="submit" class="submit" id="submitBtn">
               开始聊天
@@ -78,7 +78,7 @@
               </svg>
             </button>
             <div class="err" id="err" role="alert"></div>
-            <p class="hint">没有 token？请联系把这个链接发给你的人。</p>
+            <p class="hint">没有访问凭证？请联系把这个链接发给你的人。</p>
           </form>
         </div>
       </section>

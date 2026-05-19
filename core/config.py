@@ -184,6 +184,7 @@ class ConfigView:
     auto_title_enabled: bool
     persona_id: str
     default_daily_quota: int
+    audit_retention_days: int
     ip_brute_force_max_fails: int
     ip_brute_force_block_seconds: int
     trust_forwarded_for: bool
@@ -341,6 +342,9 @@ class ConfigView:
         persona = str(_get(cfg, "persona_id") or "").strip()
         default_quota = _clamp_int(
             _get(cfg, "default_daily_quota"), default=200, lo=1, hi=1_000_000
+        )
+        audit_retention_days = _clamp_int(
+            _get(cfg, "audit_retention_days"), default=7, lo=1, hi=3650
         )
         ip_max = _clamp_int(
             _get(cfg, "ip_brute_force_max_fails"), default=10, lo=0, hi=10_000
@@ -512,6 +516,7 @@ class ConfigView:
             auto_title_enabled=auto_title,
             persona_id=persona,
             default_daily_quota=default_quota,
+            audit_retention_days=audit_retention_days,
             ip_brute_force_max_fails=ip_max,
             ip_brute_force_block_seconds=ip_block,
             trust_forwarded_for=trust_xff,

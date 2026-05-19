@@ -244,6 +244,36 @@ class AbstractStorage(ABC):
     @abstractmethod
     async def get_recent_audit(self, *, limit: int) -> list[AuditRow]: ...
 
+    @abstractmethod
+    async def list_audit(
+        self,
+        *,
+        limit: int,
+        offset: int = 0,
+        event: str | None = None,
+        name: str | None = None,
+        ip: str | None = None,
+        ts_from: int | None = None,
+        ts_to: int | None = None,
+    ) -> tuple[list[AuditRow], int]:
+        """Filterable, paginated audit log read.
+
+        Returns `(rows, total)`. `total` is the count matching the same
+        filter (without limit/offset) so the UI can compute page count.
+        Rows ordered by `ts DESC, id DESC`. `limit` clamped to 1..1000;
+        `offset` clamped to ``>=0``. String filters use case-insensitive
+        substring match; pass empty / None to skip.
+        """
+
+    @abstractmethod
+    async def prune_audit(self, *, before_ts: int) -> int:
+        """Delete audit rows whose `ts < before_ts`. Returns rows deleted.
+
+        Without this, `audit_log` grows unbounded — every chat/admin
+        request emits at least one row. The plugin runs this from the
+        retention orchestrator on the configured cadence.
+        """
+
     # ----- chat sync (v3) -----
     @abstractmethod
     async def upsert_session_meta(
