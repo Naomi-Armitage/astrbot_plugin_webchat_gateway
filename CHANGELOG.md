@@ -26,7 +26,9 @@
 ### Fixed
 - **bot 重新生成时的双气泡 race**：以前点 bot 气泡的"重新生成"，POST 响应回来才调 `recordOptimistic` / `recordPendingDelete` 做去重。但 server 把 `message_added` / `message_deleted` 事件比 POST 响应更早通过 long-poll 推到 client 时，client 直接 push 一份新 bot，POST 响应再 push 一份 → 出现两个一模一样的 bot 气泡（F5 后才被 server 真实状态 1 条同步取代）。重新生成改走 SSE 流式后：(1) 立刻 pre-truncate + recordPendingDelete 防止后到的 `message_deleted(idx)` 把新 bot 误删；(2) 复用 `streamFinalizeSuppressed` 让抢先到的 `message_added` 接管 streaming 气泡；(3) SSE done 兜底再扫一次 history.tail，防止两层 race 都漏过的边界。彻底消除双气泡
 - **`replayActive` 强制滑到底**：以前任何 replay 都无条件 `scrollToEnd()`，mid-history 删除 / 重新生成 / 编辑都会把用户从他正在读的位置弹到底部。改为：渲染前记录滚动位置，仅当用户已经"接近底部"（≤80px）时才 scrollToEnd；否则用 height delta 校正后还原原滚动位置
-- **消息气泡的异常换行**：`.msg` 用 `word-break: break-word` 在所有气泡（user 和 bot 都中招）按字符切，长 URL / 长词被切得稀碎。改为 `overflow-wrap: break-word; word-break: normal;` —— 词边界优先，纯长串才退化到字符级断行，CJK 文本的自然断行也保留
+- **消息气泡的异常换行**：两部分修复 ——
+  - **断词算法**：`.msg` 用 `word-break: break-word` 在所有气泡（user 和 bot 都中招）按字符切，长 URL / 长词被切得稀碎。改为 `overflow-wrap: break-word; word-break: normal;` —— 词边界优先，纯长串才退化到字符级断行，CJK 文本的自然断行也保留
+  - **宽度循环依赖**：`.msg max-width: 78%` 的百分比相对的是 `.msg-row` 的 shrink-to-fit 宽度，而后者本身依赖 `.msg` 的 max-content（循环）。浏览器解析时先测得 row = `.msg` 的 max-content，再用这个值算出 `.msg max-width = 0.78 × max-content` —— 比内容本身还窄，强制触发不必要的换行。表现是"怎么正确 vibe coding"在宽屏上也被切成两行（气泡被压到自己 max-content 的 78%）。把 `max-width: 78%` 上移到 `.msg-row` 直接挂 `#messages`（定值百分比），`.msg` 不再 max-width，循环消除
 - **失败消息的编辑按钮重复**：失败的 user 气泡同时挂"hover 编辑"和"气泡下方编辑铅笔图标"两个入口，且都执行同样的"加载到 composer"，UI 上还会互相重叠。失败气泡的 `.msg-actions` 整组隐藏，单留下方的常驻铅笔
 - **R2 NoSuchKey 误判**：部分 botocore 版本下 NoSuchKey 通过 `ClientError` + `response["Error"]["Code"]` 暴露，原先只用 `type(exc).__name__` 子串匹配，漏判后 `R2FileStore.read` / `.delete` 会把"对象不存在"这种预期路径打成 `logger.exception` 完整 traceback，污染日志并干扰运维区分真实 R2 故障。新增 `_is_no_such_key(exc)` 辅助同时覆盖两种 shape（类名子串 + 结构化 Error.Code）
 - **PIL 解码阻塞事件循环**：`/upload` 在 handler 协程里同步调 `detect_image_mime`，一张 20MB 图片的 PIL `verify()` + 格式探测能占用事件循环数百毫秒到数秒，期间所有 SSE 心跳、长轮询、LLM 流式输出都被挂起 —— 单进程网关的隐性 P0。新增 `detect_image_mime_async` 包装走 `asyncio.to_thread`，CPU 重活转默认线程池；同步实现保留供测试与其他工作线程上下文复用

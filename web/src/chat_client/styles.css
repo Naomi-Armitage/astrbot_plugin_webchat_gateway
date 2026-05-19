@@ -395,7 +395,6 @@ header h1 {
 }
 
 .msg {
-  max-width: 78%;
   padding: 10px 14px;
   font: 14.5px/1.55 var(--font-display);
   white-space: pre-wrap;
@@ -1295,7 +1294,18 @@ body.lightbox-open { overflow: hidden; }
   display: flex;
   flex-direction: column;
   gap: 2px;
-  max-width: 100%;
+  /* 78% of #messages — definite percentage (since #messages has a
+     defined width from the flex layout), avoiding the circular
+     dependency that arose when the cap lived on `.msg`: a percentage
+     max-width on .msg resolved against .msg-row's shrink-to-fit
+     width, which itself depended on .msg's max-content, so the row
+     measured at content width N, then capped .msg at 0.78×N and
+     forced a wrap even when #messages was several times wider. The
+     stable result was bubbles capped at 78% of their OWN natural
+     width — short messages with one long word ("怎么正确 vibe
+     coding") wrapped unnecessarily on otherwise empty screens.
+     Capping the row directly against #messages decouples this. */
+  max-width: 78%;
   /* Animation only runs on the row itself (was on .msg). Moving it
      here avoids a double-animate when the bubble swaps innerHTML on
      regenerate; the row stays put. */
