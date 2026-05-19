@@ -762,6 +762,35 @@ def make_chat_stream_handler(deps: ChatDeps):
                     handle_obj.stream_id,
                 )
             raise
+        except (ConnectionResetError, ConnectionError):
+            # Peer dropped the connection between our 200/headers and
+            # the first data frame (typical when a fast client retries
+            # before the previous request settled, or when a flaky
+            # transit RST'd the TCP session right after `: ready\n\n`).
+            # This is operationally a `cancelled` — there's no
+            # WebChatGateway-side fault to surface — so route it that
+            # way instead of letting it land in the generic Exception
+            # branch below and pollute the `internal_error` audit count
+            # / dashboard alerts. info-level (not exception): a
+            # traceback per peer-drop is noise. Return the response
+            # (already headers-flushed) instead of re-raising — the
+            # client is gone, so propagating would just trip aiohttp's
+            # own peer-disconnect handling for nothing.
+            logger.info(
+                "[WebChatGateway] SSE handshake peer-dropped sid=%s",
+                handle_obj.stream_id,
+            )
+            try:
+                await deps.registry.close_failed(
+                    handle_obj, error_code="cancelled"
+                )
+            except Exception:
+                logger.exception(
+                    "[WebChatGateway] close_failed during handshake-drop"
+                    " cleanup raised sid=%s",
+                    handle_obj.stream_id,
+                )
+            return response
         except Exception:
             logger.exception(
                 "[WebChatGateway] SSE handshake failed sid=%s",

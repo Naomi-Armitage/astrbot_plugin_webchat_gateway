@@ -33,6 +33,44 @@ astrbot_api = types.ModuleType("astrbot.api")
 astrbot_api.logger = _logger  # type: ignore[attr-defined]
 astrbot_api_star = types.ModuleType("astrbot.api.star")
 
+# `handlers/conversations.py` imports AssistantMessageSegment / TextPart
+# / ImageURLPart / UserMessageSegment from `astrbot.core.agent.message`
+# at module load. Provide passthrough stand-ins so the import succeeds —
+# any test that actually constructs these (e.g. the regenerate-stream
+# service tests) monkeypatches conv_mod.{AssistantMessageSegment,TextPart}
+# with shapes it controls; the stubs here just need to be importable.
+astrbot_core = types.ModuleType("astrbot.core")
+astrbot_core_agent = types.ModuleType("astrbot.core.agent")
+astrbot_core_agent_message = types.ModuleType("astrbot.core.agent.message")
+
+
+class _StubSegment:
+    def __init__(self, *args, **kwargs) -> None:
+        self._args = args
+        self._kwargs = kwargs
+
+    def model_dump(self) -> dict:
+        return {}
+
+
+astrbot_core_agent_message.AssistantMessageSegment = _StubSegment  # type: ignore[attr-defined]
+astrbot_core_agent_message.UserMessageSegment = _StubSegment  # type: ignore[attr-defined]
+astrbot_core_agent_message.TextPart = _StubSegment  # type: ignore[attr-defined]
+astrbot_core_agent_message.ImageURLPart = _StubSegment  # type: ignore[attr-defined]
+
+# `core/llm_bridge.py` does a defensive import of EmptyModelOutputError
+# from astrbot.core.exceptions; the bridge falls back to a local shim
+# if the import fails, but providing the stub keeps the import path
+# uniform across test setups.
+astrbot_core_exceptions = types.ModuleType("astrbot.core.exceptions")
+
+
+class _EmptyModelOutputError(Exception):
+    pass
+
+
+astrbot_core_exceptions.EmptyModelOutputError = _EmptyModelOutputError  # type: ignore[attr-defined]
+
 
 class _StarToolsStub:
     """Mimic astrbot.api.star.StarTools.get_data_dir(plugin_name).
@@ -68,6 +106,18 @@ astrbot_api.star = astrbot_api_star  # type: ignore[attr-defined]
 sys.modules.setdefault("astrbot", astrbot_pkg)
 sys.modules.setdefault("astrbot.api", astrbot_api)
 sys.modules.setdefault("astrbot.api.star", astrbot_api_star)
+sys.modules.setdefault("astrbot.core", astrbot_core)
+sys.modules.setdefault("astrbot.core.agent", astrbot_core_agent)
+sys.modules.setdefault(
+    "astrbot.core.agent.message", astrbot_core_agent_message
+)
+sys.modules.setdefault(
+    "astrbot.core.exceptions", astrbot_core_exceptions
+)
+astrbot_pkg.core = astrbot_core  # type: ignore[attr-defined]
+astrbot_core.agent = astrbot_core_agent  # type: ignore[attr-defined]
+astrbot_core_agent.message = astrbot_core_agent_message  # type: ignore[attr-defined]
+astrbot_core.exceptions = astrbot_core_exceptions  # type: ignore[attr-defined]
 
 
 # --- plugin import path ------------------------------------------------------

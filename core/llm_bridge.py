@@ -195,9 +195,22 @@ class LlmBridge:
                     provider = self._context.get_provider_by_id(provider_id)
                     if provider is None:
                         raise RuntimeError("chat_provider_not_configured")
+                    # Pass the resolved system_prompt explicitly. Without
+                    # it, AstrBot's provider.text_chat would receive the
+                    # prompt body alone — the inline `[System Prompt]\n…`
+                    # block in `prompt` is documentation for the model,
+                    # NOT a substitute for the provider's actual system
+                    # prompt channel (which some backends route through a
+                    # separate SDK field). Skipping system_prompt here
+                    # silently dropped persona context on the
+                    # image+persona path — `llm_generate` would have
+                    # resolved persona_id internally, but the fallback
+                    # had no equivalent. The variable is already in
+                    # scope from `_resolve_persona()`.
                     resp = await provider.text_chat(
                         prompt=prompt,
                         image_urls=image_urls,
+                        system_prompt=system_prompt,
                     )
             else:
                 resp = await self._context.llm_generate(
