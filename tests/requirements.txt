@@ -1,0 +1,13 @@
+# Test-only dependencies. The runtime requirements live in ../requirements.txt
+# and are intentionally NOT duplicated here — `pip install -r requirements.txt`
+# remains the install of record; the test suite layers on top.
+#
+# AstrBot itself is intentionally absent: tests/conftest.py stubs the
+# `astrbot.api` / `astrbot.api.star` modules in sys.modules so unit tests
+# can exercise plugin code without the framework being importable.
+
+pytest>=8.0
+pytest-asyncio>=1.0
+aiosqlite>=0.19          # required by storage backend tests
+aiohttp>=3.10            # required by P0-2 integration test
+Pillow>=10.0             # required by P0-2 image-decode tests
