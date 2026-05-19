@@ -232,65 +232,16 @@ def make_chat_handler(deps: ChatDeps):
         token = gated.token
 
         # Parse + length check (before taking the per-token lock so a slow
-        # body cannot pin the slot).
-        try:
-            payload = await request.json()
-        except web.HTTPRequestEntityTooLarge:
-            return json_response(
-                {"error": "payload_too_large"},
-                status=413,
-                origin=origin,
-                allowed_origins=allowed,
-                same_origin_host=same_host,
-            )
-        except json.JSONDecodeError:
-            return json_response(
-                {"error": "invalid_json"},
-                status=400,
-                origin=origin,
-                allowed_origins=allowed,
-                same_origin_host=same_host,
-            )
-        except Exception:
-            logger.exception("[WebChatGateway] unexpected JSON parse error")
-            return json_response(
-                {"error": "invalid_json"},
-                status=400,
-                origin=origin,
-                allowed_origins=allowed,
-                same_origin_host=same_host,
-            )
-        try:
-            data = _parse_payload(
-                payload, max_attachments=deps.max_attachments_per_message
-            )
-        except _ParseError as exc:
-            return json_response(
-                {"error": exc.code},
-                status=exc.status,
-                origin=origin,
-                allowed_origins=allowed,
-                same_origin_host=same_host,
-            )
-        if data is None:
-            return json_response(
-                {"error": "invalid_payload"},
-                status=400,
-                origin=origin,
-                allowed_origins=allowed,
-                same_origin_host=same_host,
-            )
-        if len(data.message) > deps.max_message_length:
-            return json_response(
-                {
-                    "error": "message_too_long",
-                    "max_length": deps.max_message_length,
-                },
-                status=400,
-                origin=origin,
-                allowed_origins=allowed,
-                same_origin_host=same_host,
-            )
+        # body cannot pin the slot). Shared with /chat/stream via
+        # _parse_chat_body so the error-shape contract stays in lockstep.
+        parsed = await _parse_chat_body(
+            request, deps.max_message_length,
+            max_attachments=deps.max_attachments_per_message,
+            origin=origin, allowed=allowed, same_host=same_host,
+        )
+        if isinstance(parsed, web.Response):
+            return parsed
+        data = parsed
 
         # Validate attachment ownership before taking the per-token lock
         # so a stale or cross-token file_id can't pin the slot during the
