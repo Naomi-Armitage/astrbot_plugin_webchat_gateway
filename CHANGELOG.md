@@ -15,6 +15,7 @@
 - 新增 `EVENT_MESSAGE_DELETED = "message_deleted"` 事件类型，payload `{index, role}`
 
 ### Changed
+- **`POST /conversations/{sid}/regenerate` 改为 SSE 流式**：以前是同步 LLM 调用 + JSON 响应，现在响应 `text/event-stream`，每个 `{"type":"chunk","delta":...}` 数据帧推一段增量文本，最终 `{"type":"done","reply":...,"remaining":...,"daily_quota":...}` 收尾。错误用 `{"type":"error","code":...}` SSE 帧告知。截断 + 持久化 + `message_deleted` / `message_added` 事件发布的语义都没变（只是 LLM 调用由 `generate_reply` 切到 `generate_reply_stream`）
 - README API 参考补全 ~13 个之前未文档化的端点（`/chat/stream/*` 系列、`/conversations/*` 多设备同步、`/me`、`/title`、`/events`、admin session 等）
 - `storage.mysql_pool_max` 配置项暴露（默认 5、范围 1-100），不再写死 maxsize=5
 - 后台 prune 周期从 24h 缩到 6h，让 `_UPLOAD_ORPHAN_RETENTION_SECONDS=3600` 真正在 1-2 倍窗口内回收，避免孤儿上传占额度长达 25h
@@ -23,6 +24,8 @@
 - `ChatDeps.conv_service` / `StreamRegistry.__init__` 用 `TYPE_CHECKING` 还原真实类型（之前为 `Any`），方法重命名能在 type-check 时报错
 
 ### Fixed
+- **bot 重新生成时的双气泡 race**：以前点 bot 气泡的"重新生成"，POST 响应回来才调 `recordOptimistic` / `recordPendingDelete` 做去重。但 server 把 `message_added` / `message_deleted` 事件比 POST 响应更早通过 long-poll 推到 client 时，client 直接 push 一份新 bot，POST 响应再 push 一份 → 出现两个一模一样的 bot 气泡（F5 后才被 server 真实状态 1 条同步取代）。重新生成改走 SSE 流式后：(1) 立刻 pre-truncate + recordPendingDelete 防止后到的 `message_deleted(idx)` 把新 bot 误删；(2) 复用 `streamFinalizeSuppressed` 让抢先到的 `message_added` 接管 streaming 气泡；(3) SSE done 兜底再扫一次 history.tail，防止两层 race 都漏过的边界。彻底消除双气泡
+- **`replayActive` 强制滑到底**：以前任何 replay 都无条件 `scrollToEnd()`，mid-history 删除 / 重新生成 / 编辑都会把用户从他正在读的位置弹到底部。改为：渲染前记录滚动位置，仅当用户已经"接近底部"（≤80px）时才 scrollToEnd；否则用 height delta 校正后还原原滚动位置
 - **消息气泡的异常换行**：`.msg` 用 `word-break: break-word` 在所有气泡（user 和 bot 都中招）按字符切，长 URL / 长词被切得稀碎。改为 `overflow-wrap: break-word; word-break: normal;` —— 词边界优先，纯长串才退化到字符级断行，CJK 文本的自然断行也保留
 - **失败消息的编辑按钮重复**：失败的 user 气泡同时挂"hover 编辑"和"气泡下方编辑铅笔图标"两个入口，且都执行同样的"加载到 composer"，UI 上还会互相重叠。失败气泡的 `.msg-actions` 整组隐藏，单留下方的常驻铅笔
 - **R2 NoSuchKey 误判**：部分 botocore 版本下 NoSuchKey 通过 `ClientError` + `response["Error"]["Code"]` 暴露，原先只用 `type(exc).__name__` 子串匹配，漏判后 `R2FileStore.read` / `.delete` 会把"对象不存在"这种预期路径打成 `logger.exception` 完整 traceback，污染日志并干扰运维区分真实 R2 故障。新增 `_is_no_such_key(exc)` 辅助同时覆盖两种 shape（类名子串 + 结构化 Error.Code）

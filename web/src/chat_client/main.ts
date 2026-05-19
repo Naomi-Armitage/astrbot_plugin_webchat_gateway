@@ -401,13 +401,32 @@ const serverRoleToLocal = (r: ServerRole): Role => r === "assistant" ? "bot" : "
 const localRoleToServer = (r: Role): ServerRole => r === "bot" ? "assistant" : "user";
 
 function replayActive(): void {
+  // Preserve scroll position when the user wasn't already pinned to
+  // the bottom. Mid-history regenerate / mid-history delete used to
+  // snap the viewport to the new bottom even when the user was
+  // reading several screens up — disorienting. Threshold ~80 px
+  // matches the "near bottom" feel used elsewhere on the page.
+  const prevScrollTop = msgs.scrollTop;
+  const prevScrollHeight = msgs.scrollHeight;
+  const prevClientHeight = msgs.clientHeight;
+  const wasNearBottom =
+    prevScrollHeight - (prevScrollTop + prevClientHeight) < 80;
   clearMsgList();
   const history = currentSession().history;
   for (const item of history) {
     addMessageBubble(item.role, item.text, item.attachments, item.failure);
     if (item.role === "bot" && item.incomplete) appendIncompleteNoticeToLastBubble();
   }
-  scrollToEnd();
+  if (wasNearBottom) {
+    scrollToEnd();
+  } else {
+    // Re-anchor on the pre-render scroll position, biased by any
+    // height change above the viewport so the same content stays
+    // visually stable. If the new content is shorter than the old
+    // scroll offset (e.g. a big tail was truncated), clamp at 0.
+    const delta = msgs.scrollHeight - prevScrollHeight;
+    msgs.scrollTop = Math.max(0, prevScrollTop + delta);
+  }
 }
 
 // Render-only: never mutates store, never persists. Used by replay + by
@@ -1593,90 +1612,270 @@ async function regenerateMessage(bubble: HTMLDivElement): Promise<void> {
   const item = sess.history[idx];
   if (!item || item.role !== "bot") return;
   const sid = sess.id;
-  // Race-guard: don't fire if a /chat/stream is already in flight for
-  // this session (server would 409 us, but failing fast is friendlier).
+  // Race-guard: don't fire if any stream is already in flight for this
+  // session (a /chat/stream send OR a previous regen). Setting
+  // `sync.streamAbort` below makes a second regen click see this same
+  // guard and bail.
   if (sync.streamAbort) {
     addMessageBubble("notice", "正在处理中，稍候。");
     return;
   }
-  bubble.classList.add("regenerating");
-  // Disable the action buttons inside this row so the user can't fire
-  // a second regenerate / delete while the first is pending.
-  const row = bubble.closest<HTMLElement>(".msg-row");
-  const actionBtns = row
-    ? Array.from(row.querySelectorAll<HTMLButtonElement>(".msg-action-btn"))
-    : [];
-  for (const b of actionBtns) b.disabled = true;
+
+  // Pre-record pending-delete for the target index so the long-poll's
+  // own `message_deleted(idx, "assistant")` event (emitted server-side
+  // when the regen commits) doesn't fire the splice handler against
+  // the NEW bot we'll push at the same logical position after `done`.
+  // For mid-history regen the server emits additional deletes for the
+  // dropped tail; those target indices > idx that don't exist locally
+  // after our pre-truncate, so the splice handler's missing-target
+  // guard makes them safe no-ops.
+  recordPendingDelete(sid, idx, "assistant");
+
+  // Optimistic local truncate. Drops the old bot reply (+ any tail in
+  // the mid-history case) so the streaming bubble lands at the same
+  // logical position the old reply occupied. saveStore + replayActive
+  // so a refresh mid-stream doesn't lose the truncate.
+  const sBefore = store.sessions[sid];
+  if (sBefore) {
+    sBefore.history.length = idx;
+    sBefore.lastActiveAt = Date.now();
+    saveStore();
+    if (sid === store.activeId) replayActive();
+  }
+
+  // Stop button + abort hookup, mirroring the /chat/stream POST path.
+  // The action buttons in the bubble's row would naturally be disabled
+  // once the bubble's removed, but we explicitly disable any held-over
+  // refs (covers a second click sneaking in between the replayActive
+  // and the bubble removal).
+  const ac = new AbortController();
+  sync.streamAbort = ac;
+  setSendMode("stop");
+  sendBtn.disabled = false;
+
+  // Mount an empty streaming bubble at the tail of the message list.
+  // Mirrors `attachStreamingBubble`'s shape (Text node + caret span +
+  // .msg.bot.md.streaming class) so the race handler at applyEvent's
+  // message_added(assistant) case finds it via `.msg.bot.streaming`
+  // and the existing CSS hides the hover-action chrome until the
+  // streaming class is removed.
+  hideTyping();
+  const newBubble = document.createElement("div") as HTMLDivElement;
+  newBubble.className = "msg bot md streaming";
+  const streamTextNode = document.createTextNode("");
+  const caretSpan = document.createElement("span");
+  caretSpan.className = "stream-caret";
+  caretSpan.setAttribute("aria-hidden", "true");
+  newBubble.appendChild(streamTextNode);
+  newBubble.appendChild(caretSpan);
+  const streamRow = document.createElement("div");
+  streamRow.className = "msg-row bot-row";
+  streamRow.appendChild(newBubble);
+  streamRow.appendChild(buildMessageActions("bot", newBubble));
+  msgs.appendChild(streamRow);
+  scrollToEnd();
+
+  const finishAbort = (): void => {
+    if (sync.streamAbort === ac) sync.streamAbort = null;
+    setSendMode("send");
+  };
+  const cleanupBubble = (): void => {
+    // Bubble may already be gone (race handler dropped it on
+    // message_added). Guarded removeBubbleWithRow is a no-op then.
+    if (newBubble.parentElement) removeBubbleWithRow(newBubble);
+  };
+
   let resp: Response;
   try {
-    resp = await fetchWithTimeout(
-      regenerateUrl(sid),
-      {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { "Content-Type": "application/json", ...bearer() },
-        body: JSON.stringify({ message_index: idx }),
-      },
-      FETCH_TIMEOUT_CHAT_MS,
-    );
-  } catch {
-    bubble.classList.remove("regenerating");
-    for (const b of actionBtns) b.disabled = false;
+    resp = await fetch(regenerateUrl(sid), {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json", ...bearer() },
+      body: JSON.stringify({ message_index: idx }),
+      signal: ac.signal,
+    });
+  } catch (e) {
+    finishAbort();
+    cleanupBubble();
+    if ((e as { name?: string })?.name === "AbortError") return;
     addMessageBubble("error", "重新生成失败，请检查网络。");
     return;
   }
-  let payload: Record<string, unknown> = {};
-  try { payload = await resp.json(); } catch {}
-  bubble.classList.remove("regenerating");
-  for (const b of actionBtns) b.disabled = false;
-  if (resp.status === 401) { handle401(); return; }
-  if (resp.status === 429 && (payload.error as string) === "concurrent_request") {
-    addMessageBubble("notice", "正在处理中，稍候。");
-    return;
-  }
-  if (resp.status === 429 && (payload.error as string) === "quota_exceeded") {
-    setBadge(0, payload.daily_quota as number);
-    addMessageBubble("notice", "今日额度已用完，明日 0 点重置。");
-    return;
-  }
-  if (resp.status === 404) {
-    addMessageBubble("error", "原消息已不存在。");
-    return;
-  }
-  if (resp.status === 502 || resp.status === 504) {
-    const code = (payload.error as string) || "";
-    addMessageBubble("error", streamErrorCopy(code));
-    return;
-  }
-  if (!resp.ok) {
+
+  if (resp.status === 401) { finishAbort(); cleanupBubble(); handle401(); return; }
+
+  const ct = (resp.headers.get("Content-Type") || "").toLowerCase();
+  if (!resp.ok || !ct.includes("text/event-stream") || !resp.body) {
+    // Pre-handshake errors (auth / parse / 4xx routing) still come
+    // back as plain JSON — match the prior handler's error copy.
+    let payload: Record<string, unknown> = {};
+    try { payload = await resp.json(); } catch {}
+    finishAbort();
+    cleanupBubble();
     const code = (payload.error as string) || `http_${resp.status}`;
-    addMessageBubble("error", `重新生成失败: ${code}`);
+    if (resp.status === 429 && code === "concurrent_request") {
+      addMessageBubble("notice", "正在处理中，稍候。");
+    } else if (resp.status === 429 && code === "quota_exceeded") {
+      setBadge(0, payload.daily_quota as number);
+      addMessageBubble("notice", "今日额度已用完，明日 0 点重置。");
+    } else if (resp.status === 404) {
+      addMessageBubble("error", "原消息已不存在。");
+    } else if (resp.status === 502 || resp.status === 504) {
+      addMessageBubble("error", streamErrorCopy(code));
+    } else {
+      addMessageBubble("error", `重新生成失败: ${code}`);
+    }
     return;
   }
-  const reply = (payload.reply as string) || "(空回复)";
-  setBadge(payload.remaining as number, payload.daily_quota as number);
-  // The server truncates raw history to [0, message_index) then appends
-  // the new reply, so mirror locally: drop everything from idx onward
-  // and push the new bot entry at idx. For the common case (regenerate
-  // the LAST bot reply) this is identical to an in-place swap; for the
-  // mid-conversation case (rare — user kept chatting past this bot
-  // turn, then went back to regenerate) it keeps history aligned with
-  // what the server now believes. Either way we replayActive so the
-  // DOM reflects the new shape.
+
+  // SSE consumer. Frames are `data: <json>\n\n`; the server emits
+  // `{type:"chunk",delta}` / `{type:"done",...}` / `{type:"error",code}`.
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: false });
+  let buffer = "";
+  let accumulated = "";
+  // Wrap done-state + error-code in an object so TS's CFA narrows
+  // per-access on the property reads after the loop, instead of
+  // collapsing the closure-mutated `let` binding to `never` after a
+  // `!doneInfo` truthiness check (a known TS narrowing limitation
+  // around closure assignment).
+  const out: {
+    done: { reply: string; remaining: number; daily_quota: number } | null;
+    errorCode: string;
+  } = { done: null, errorCode: "" };
+
+  const handleFrame = (frame: string): void => {
+    let jsonStr = "";
+    for (const rawLine of frame.split("\n")) {
+      const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+      if (!line || line.startsWith(":")) continue;
+      if (line.startsWith("data:")) {
+        const v = line.slice(5);
+        jsonStr += v.startsWith(" ") ? v.slice(1) : v;
+      }
+    }
+    if (!jsonStr) return;
+    let obj: Record<string, unknown>;
+    try { obj = JSON.parse(jsonStr) as Record<string, unknown>; } catch { return; }
+    const t = obj.type;
+    if (t === "chunk" && typeof obj.delta === "string") {
+      accumulated += obj.delta;
+      // Only update the DOM if the bubble's still mounted — the race
+      // handler may have dropped it (long-poll's message_added beat us
+      // to the punch on a backgrounded tab). Subsequent chunks still
+      // accumulate so the final done event can run the dedup check.
+      if (newBubble.parentElement) {
+        streamTextNode.data = accumulated;
+        scrollToEnd();
+      }
+    } else if (t === "done") {
+      out.done = {
+        reply: typeof obj.reply === "string" ? obj.reply : accumulated,
+        remaining: typeof obj.remaining === "number" ? obj.remaining : 0,
+        daily_quota: typeof obj.daily_quota === "number" ? obj.daily_quota : 0,
+      };
+    } else if (t === "error" && typeof obj.code === "string") {
+      out.errorCode = obj.code;
+    }
+  };
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let nl: number;
+      while ((nl = buffer.indexOf("\n\n")) !== -1) {
+        const frame = buffer.slice(0, nl);
+        buffer = buffer.slice(nl + 2);
+        handleFrame(frame);
+        if (out.done || out.errorCode) break;
+      }
+      if (out.done || out.errorCode) break;
+    }
+  } catch (e) {
+    finishAbort();
+    cleanupBubble();
+    if ((e as { name?: string })?.name === "AbortError") return;
+    addMessageBubble("error", "重新生成失败：连接被截断。");
+    return;
+  } finally {
+    try { await reader.cancel(); } catch {}
+  }
+
+  finishAbort();
+
+  if (out.errorCode) {
+    cleanupBubble();
+    if (out.errorCode === "concurrent_request") {
+      addMessageBubble("notice", "正在处理中，稍候。");
+    } else if (out.errorCode === "quota_exceeded") {
+      addMessageBubble("notice", "今日额度已用完，明日 0 点重置。");
+    } else if (out.errorCode === "llm_timeout" || out.errorCode === "empty_reply") {
+      addMessageBubble("error", streamErrorCopy(out.errorCode));
+    } else {
+      addMessageBubble("error", `重新生成失败: ${out.errorCode}`);
+    }
+    return;
+  }
+
+  if (!out.done) {
+    cleanupBubble();
+    addMessageBubble("error", "重新生成失败：连接被截断。");
+    return;
+  }
+  const finalDone = out.done;
+
+  // Race protection: if long-poll's message_added arrived mid-stream
+  // it dropped our streaming bubble and set streamFinalizeSuppressed —
+  // the new bot has already been added to history and rendered. Just
+  // refresh the badge and bail.
+  if (sync.streamFinalizeSuppressed[sid]) {
+    delete sync.streamFinalizeSuppressed[sid];
+    setBadge(finalDone.remaining, finalDone.daily_quota);
+    renderSessionList();
+    return;
+  }
+
+  // Defensive secondary check: even if the suppression flag wasn't
+  // set, the tail of history might already carry an identical bot
+  // entry (added by a stray long-poll batch we didn't catch). Skip
+  // the local push in that case so we don't end up with two copies.
   const sNow = store.sessions[sid];
   if (sNow) {
-    sNow.history.length = idx;
+    const tail = sNow.history[sNow.history.length - 1];
+    const alreadyAdded =
+      tail &&
+      tail.role === "bot" &&
+      tail.text === finalDone.reply;
+    if (alreadyAdded) {
+      cleanupBubble();
+      setBadge(finalDone.remaining, finalDone.daily_quota);
+      renderSessionList();
+      return;
+    }
+  }
+
+  // Normal finalize. Strip the streaming chrome and swap the bubble
+  // text for the markdown render. Push to history + record the dedup
+  // entry so the upcoming long-poll `message_added` for this reply
+  // gets consumed.
+  newBubble.classList.remove("streaming");
+  caretSpan.remove();
+  newBubble.innerHTML = renderMarkdown(finalDone.reply);
+  decorateCodeblocks(newBubble);
+
+  if (sNow) {
     sNow.history.push({
       role: "bot",
-      text: reply,
+      text: finalDone.reply,
       ts: Date.now(),
     });
     sNow.lastActiveAt = Date.now();
     saveStore();
-    if (sid === store.activeId) replayActive();
   }
-  recordOptimistic(sid, "assistant", reply);
-  recordPendingDelete(sid, idx, "assistant");
+  setBadge(finalDone.remaining, finalDone.daily_quota);
+  recordOptimistic(sid, "assistant", finalDone.reply);
   renderSessionList();
 }
 

@@ -9,6 +9,7 @@ multi-event changes (e.g. session_created + 2x message_added) atomically.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from contextlib import asynccontextmanager
@@ -51,6 +52,7 @@ from ..storage.base import (
 )
 from .admin_tokens import ServiceError
 from .common import (
+    build_cors_headers,
     error_response,
     extract_origin,
     gate_request,
@@ -1315,7 +1317,7 @@ class ConversationService:
         )
         return row
 
-    async def regenerate_assistant_message(
+    async def regenerate_assistant_message_stream(
         self,
         *,
         token_name: str,
@@ -1324,30 +1326,34 @@ class ConversationService:
         username: str = "WebUser",
         token_daily_quota: int,
         ip: str | None = None,
-    ) -> RegenerateResult:
-        """Drop the assistant message at `message_index` (0-based into the
-        rendered history), truncate CM history to `[0, message_index)`, run
-        the non-streaming LLM call on the truncated context, append the new
-        assistant reply, and emit `message_deleted` + `message_added` events.
+    ) -> AsyncIterator[dict]:
+        """Streaming variant of regenerate_assistant_message.
 
-        Acquires the per-token concurrency lock; raises
-        `ServiceError("concurrent_request", 429)` on contention.
+        Drops the assistant message at `message_index`, truncates CM
+        history to `[0, message_index)`, runs the **streaming** LLM
+        call on the truncated context, appends the new assistant
+        reply, and emits `message_deleted` + `message_added` events.
 
-        Raises `ServiceError("session_not_found", 404)` if no conversation
-        exists for the session; `("message_not_found", 404)` if the index
-        is out of range OR the message at that index isn't an assistant
-        turn; `("quota_exceeded", 429)` if the token's daily quota is hit;
-        propagates `("llm_timeout", 504)` / `("empty_reply", 502)` /
-        `("llm_call_failed", 500)` for upstream LLM failures (file release
-        on failure is documented inline). `token_daily_quota` is the
-        TokenRow's `daily_quota` — passed in rather than re-fetched here
-        so the handler can keep auth and service concerns separate.
+        Yields one of:
 
-        `username` is passed through to `LlmBridge.generate_reply` so the
-        provider's prompt builder uses the same `[Current User Message]`
-        framing as the original /chat call. Defaults to "WebUser" to
-        match the chat handler's default when the client doesn't supply
-        one.
+          * `{"type": "chunk", "delta": str}` — incremental text from
+            the LLM provider (text_chat_stream chunk delta)
+          * `{"type": "done", "reply": str, "remaining": int,
+            "daily_quota": int}` — final state once persistence +
+            event emission complete
+
+        Raises `ServiceError("concurrent_request", 429)` on lock
+        contention, `("session_not_found", 404)` /
+        `("message_not_found", 404)` for routing failures,
+        `("quota_exceeded", 429)` for quota, and
+        `("llm_timeout", 504)` / `("empty_reply", 502)` /
+        `("llm_call_failed", 500)` for upstream LLM failures. The
+        SSE HTTP handler catches and translates to SSE error frames.
+
+        `username` is passed through to `LlmBridge.generate_reply_stream`
+        so the provider's prompt builder uses the same
+        `[Current User Message]` framing as the original /chat call.
+        Defaults to "WebUser" to match the chat handler's default.
         """
         if self._llm_bridge is None:
             # Defensive — main.py always wires this. A missing bridge
@@ -1360,16 +1366,17 @@ class ConversationService:
             session_id=session_id,
             ip=ip,
         ):
-            return await self._regenerate_inner(
+            async for evt in self._regenerate_stream_inner(
                 token_name=token_name,
                 session_id=session_id,
                 message_index=message_index,
                 username=username,
                 token_daily_quota=token_daily_quota,
                 ip=ip,
-            )
+            ):
+                yield evt
 
-    async def _regenerate_inner(
+    async def _regenerate_stream_inner(
         self,
         *,
         token_name: str,
@@ -1378,7 +1385,7 @@ class ConversationService:
         username: str,
         token_daily_quota: int,
         ip: str | None,
-    ) -> RegenerateResult:
+    ) -> AsyncIterator[dict]:
         raw_history, cid, target_raw_idx, _target_entry, target_role = (
             await self._resolve_target_raw_index(
                 token_name=token_name,
@@ -1393,9 +1400,9 @@ class ConversationService:
             raise ServiceError("message_not_found", status=404)
 
         # Recover the most recent user message (text + image refs) from
-        # the surviving rendered history. LlmBridge.generate_reply needs
-        # both: `message=` for the textual prompt and `image_urls=` so a
-        # multimodal turn doesn't silently degrade to text-only on
+        # the surviving rendered history. LlmBridge.generate_reply_stream
+        # needs both: `message=` for the textual prompt and `image_urls=`
+        # so a multimodal turn doesn't silently degrade to text-only on
         # regeneration. Walk back from target_raw_idx to the closest
         # user entry. If none exists (rare — assistant at the start of
         # the conversation, possible via tool-call only context) we 404.
@@ -1487,8 +1494,8 @@ class ConversationService:
                 image_urls.append(local_path)
 
         # Truncate CM history to [0, target_raw_idx) and persist BEFORE
-        # the LLM call. LlmBridge.generate_reply reads from CM via
-        # `_history_text`; with the truncated history in place the
+        # the LLM call. LlmBridge.generate_reply_stream reads from CM
+        # via `_history_text`; with the truncated history in place the
         # provider sees the right context.
         truncated_history = raw_history[:target_raw_idx]
         dropped_tail = raw_history[target_raw_idx:]
@@ -1517,25 +1524,29 @@ class ConversationService:
             log_label="regenerate_assistant_message",
         )
 
+        # Streaming LLM call. Each yielded chunk becomes an SSE frame
+        # for the client to render into the streaming bubble; the
+        # accumulated text is persisted at stream end.
+        collected: list[str] = []
         try:
-            reply = await self._llm_bridge.generate_reply(
+            async for chunk in self._llm_bridge.generate_reply_stream(
                 token_name=token_name,
                 session_id=session_id,
                 username=username,
                 message=last_user_text,
                 image_urls=image_urls or None,
-            )
+            ):
+                collected.append(chunk)
+                yield {"type": "chunk", "delta": chunk}
         except Exception as exc:
             code, status, audit_event = map_llm_error(exc)
             if status == 500:
                 logger.exception(
-                    "[WebChatGateway] regenerate LLM call failed"
+                    "[WebChatGateway] regenerate LLM stream failed"
                 )
-            # Audit detail shape matches the pre-helper layout: the
-            # llm_timeout / empty_reply branches carried only
-            # {operation}, the 500 branch added {error: <str(exc)>}.
-            # Audit consumers that key off `"error" in detail` would
-            # otherwise see a new always-present `""` value.
+            # Audit detail shape matches the non-streaming pre-helper
+            # layout: llm_timeout / empty_reply carried only
+            # {operation}, 500 added {error}.
             detail: dict[str, Any] = {"operation": "regenerate"}
             if status == 500:
                 detail["error"] = str(exc)[:200]
@@ -1546,6 +1557,19 @@ class ConversationService:
                 detail=detail,
             )
             raise ServiceError(code, status=status) from None
+
+        reply = "".join(collected).strip()
+        if not reply:
+            # Empty stream — provider yielded zero non-empty chunks.
+            # Same audit/error shape as the non-streaming empty_reply
+            # branch (map_llm_error → "empty_reply", 502).
+            await self._audit.write(
+                "llm_empty_reply",
+                name=token_name,
+                ip=ip,
+                detail={"operation": "regenerate"},
+            )
+            raise ServiceError("empty_reply", status=502)
 
         # LLM succeeded — append the new assistant reply to the
         # truncated history. We use `AssistantMessageSegment` /
@@ -1660,11 +1684,12 @@ class ConversationService:
                 "remaining": remaining,
             },
         )
-        return RegenerateResult(
-            reply=reply,
-            remaining=remaining,
-            daily_quota=token_daily_quota,
-        )
+        yield {
+            "type": "done",
+            "reply": reply,
+            "remaining": remaining,
+            "daily_quota": token_daily_quota,
+        }
 
     async def record_chat_pair(
         self,
@@ -2487,19 +2512,29 @@ def make_conversation_handlers(
         Body: `{"message_index": int}` — index of the assistant message
         to regenerate. The user message preceding it stays. The endpoint
         truncates CM history to `[0, message_index)`, runs the
-        non-streaming LLM call, appends the new assistant reply, and
+        **streaming** LLM call, appends the new assistant reply, and
         emits `message_deleted` + `message_added` events for peers.
 
-        Responses:
-          200 `{ok: true, reply: str, remaining: int, daily_quota: int}`.
-          400 `{error: "invalid_payload"|"invalid_json"}`.
-          401 — auth gate.
-          404 `{error: "session_not_found"|"message_not_found"}`.
-          429 `{error: "concurrent_request"}` — another in-flight op.
-          429 `{error: "quota_exceeded"}` — daily quota hit.
-          502 `{error: "empty_reply"}` — provider returned no tokens.
-          504 `{error: "llm_timeout"}` — provider stalled.
-          500 `{error: "llm_call_failed"|"regenerate_failed"|"internal_error"}`.
+        Returns `text/event-stream`. Each SSE data frame is JSON. Event
+        shapes:
+          * `{"type": "chunk", "delta": str}` — incremental text from
+            the LLM
+          * `{"type": "done", "reply": str, "remaining": int,
+            "daily_quota": int}` — final state once persistence + event
+            emission complete (the LLM reply has finished + been
+            persisted; the SSE will close right after)
+          * `{"type": "error", "code": str}` — terminal failure. Codes
+            mirror the JSON error codes the previous non-streaming
+            handler returned: `invalid_payload` / `invalid_json` /
+            `session_not_found` / `message_not_found` /
+            `concurrent_request` / `quota_exceeded` / `empty_reply` /
+            `llm_timeout` / `llm_call_failed` / `regenerate_failed` /
+            `internal_error`.
+
+        Before SSE handshake (auth / parse errors) the response is a
+        plain JSON error (same as the previous handler). Once `prepare`
+        has flushed the 200 + event-stream headers, ALL further errors
+        come back as SSE `{"type": "error", ...}` frames.
         """
         gated = await gate_request(request, deps)
         if isinstance(gated, web.Response):
@@ -2536,32 +2571,101 @@ def make_conversation_handlers(
             return _err(
                 request, gated.origin, ServiceError("invalid_payload", status=400)
             )
+
+        cors = build_cors_headers(
+            gated.origin, gated.allowed, same_origin_host=gated.same_host
+        )
+        response = web.StreamResponse(
+            status=200,
+            headers={
+                **cors,
+                "Content-Type": "text/event-stream; charset=utf-8",
+                "Cache-Control": "no-store",
+                # nginx: disable response buffering. Apache mod_proxy
+                # obeys this same header. Without it, intermediate
+                # proxies hold chunks until a buffer fills, defeating
+                # streaming.
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+        async def write_frame(payload: dict) -> bool:
+            """Serialise + write one SSE data frame. Returns False on
+            disconnect/write failure so the caller can stop iterating
+            (and skip further side-effect-free chunk emits). The done /
+            error frames still go through the same path; if the write
+            fails on done, the server state is already consistent
+            (events persisted, audit written) — the client just won't
+            see the final acknowledgement, which is recoverable via
+            list_conversations on the next refresh."""
+            try:
+                data = json.dumps(payload, ensure_ascii=False)
+                await response.write(
+                    ("data: " + data + "\n\n").encode("utf-8")
+                )
+                return True
+            except (ConnectionResetError, asyncio.CancelledError):
+                raise
+            except Exception:
+                # Write errors past handshake are usually disconnects.
+                # Don't log.exception per-chunk (could be one entry per
+                # token in a long reply); log once at caller scope.
+                return False
+
+        # SSE handshake. Failure here means the client closed before we
+        # could send the 200 + event-stream headers. Return a plain
+        # response (already started, so just bail) and let the upstream
+        # task drain.
         try:
-            result = await service.regenerate_assistant_message(
+            await response.prepare(request)
+            await response.write(b": ready\n\n")
+        except (ConnectionResetError, asyncio.CancelledError):
+            return response
+        except Exception:
+            logger.exception(
+                "[WebChatGateway] regenerate SSE handshake failed"
+            )
+            return response
+
+        client_connected = True
+        try:
+            async for evt in service.regenerate_assistant_message_stream(
                 token_name=gated.token.name,
                 session_id=session_id,
                 message_index=raw_index,
                 token_daily_quota=gated.token.daily_quota,
                 ip=gated.ip,
-            )
+            ):
+                if not client_connected:
+                    # Client gone — keep draining the generator so the
+                    # CM write + event emission still happen, but stop
+                    # bothering with the (failing) SSE writes.
+                    continue
+                ok = await write_frame(evt)
+                if not ok:
+                    client_connected = False
         except ServiceError as exc:
-            return _err(request, gated.origin, exc)
+            if client_connected:
+                await write_frame({"type": "error", "code": exc.code})
+        except (ConnectionResetError, asyncio.CancelledError):
+            # Client disconnect during chunk write. Generator may have
+            # raised this too if it was awaiting a write at the time.
+            # Either way, just bail — service-side persistence either
+            # already happened or will be rolled back by exception
+            # propagation.
+            return response
         except Exception:
-            logger.exception("[WebChatGateway] regenerate_message failed")
-            return _err(
-                request, gated.origin, ServiceError("internal_error", status=500)
+            logger.exception(
+                "[WebChatGateway] regenerate SSE stream failed"
             )
-        return json_response(
-            {
-                "ok": True,
-                "reply": result.reply,
-                "remaining": result.remaining,
-                "daily_quota": result.daily_quota,
-            },
-            origin=gated.origin,
-            allowed_origins=gated.allowed,
-            same_origin_host=gated.same_host,
-        )
+            if client_connected:
+                await write_frame({"type": "error", "code": "internal_error"})
+
+        try:
+            await response.write_eof()
+        except Exception:
+            pass
+        return response
 
     async def preflight(request: web.Request) -> web.Response:
         return preflight_response(
