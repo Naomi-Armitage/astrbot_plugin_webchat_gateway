@@ -292,21 +292,6 @@ class ConfigView:
         return f"{self.conversations_item_path}/regenerate"
 
     @property
-    def conversations_message_edit_path(self) -> str:
-        """POST endpoint that non-destructively edits a user message at
-        `{message_index}`. Folds the old user msg + its bot reply,
-        splices new content in place, leaves downstream history."""
-        return f"{self.conversations_message_path}/edit"
-
-    @property
-    def conversations_message_regenerate_path(self) -> str:
-        """POST endpoint that regenerates the bot reply that follows a
-        user message at `{message_index}` without truncating the tail
-        — folds the old reply, inserts a new one, downstream preserved.
-        Distinct from `conversations_regenerate_path` (destructive)."""
-        return f"{self.conversations_message_path}/regenerate"
-
-    @property
     def events_path(self) -> str:
         return f"{self.endpoint_prefix}/events"
 

@@ -6,9 +6,8 @@
 ## Unreleased
 
 ### Added — UI 操作 / 多设备 / 流式
-- 聊天页用户消息加 hover **编辑** 按钮：就地用 textarea 改写后 `POST {prefix}/conversations/{sid}/messages/{idx}/edit`。**非破坏性**——旧 user msg 和它的 bot 回复被服务端标 `folded`、保留在 history 里，新一对插在折叠区之后；下游历史完整保留并继续参与未来 LLM 上下文。客户端把连续 folded 项合并成 `.msg-fold-bar` 可展开组（chevron 90° 旋转）
-- 用户消息 hover **重生成** 按钮：`POST {prefix}/conversations/{sid}/messages/{idx}/regenerate` 重生成紧随的 bot 回复。同样非破坏：旧 bot reply 被 fold，新 reply 插在 fold 之后，downstream 不变。和 `regenerate_assistant_message`（破坏式截尾）显式区分
-- 新增 `EVENT_MESSAGE_FOLDED` / `EVENT_MESSAGE_INSERTED` 事件类型，多设备实时同步折叠状态与插入位置
+- 用户消息 hover **编辑** 按钮：把原文加载进底部 composer，由用户改完手动发送。原气泡不动，编辑后的内容作为新一轮在对话底部出现（用完整当前上下文）
+- 用户消息 hover **再问一次** 按钮：一键把原文 + 附件作为新一轮 `/chat/stream` dispatch 到对话底部。原气泡不动；LLM 看到完整当前上下文（包含中间所有 turn），所以同一个问题在不同时刻可能得到不同答案。和 bot-side `重新生成`（截尾重生）显式区分
 - 聊天页每条消息加 hover 三按钮：**复制 / 删除 / 重新生成**（最后一个仅 bot）。delete 调 `DELETE {prefix}/conversations/{sid}/messages/{idx}`，regenerate 调 `POST {prefix}/conversations/{sid}/regenerate`。移动端长按 350ms 触发同样的菜单（10px 移动容差当滚动取消）
 - Markdown 代码块换成 Telegram 风：等宽（系统栈 `ui-monospace, SFMono-Regular, Menlo, Consolas`）+ 标题行 lang 标签 + 右上"复制全部"按钮（成功后 1.2s 显示"已复制"）+ 每行可单独点击复制（0.6s flash）
 - 新增 `DELETE {prefix}/conversations/{sid}/messages/{idx}`：按渲染索引删单条消息，对端通过 `message_deleted` 事件同步。释放仅被该条引用的附件
@@ -24,6 +23,8 @@
 - `ChatDeps.conv_service` / `StreamRegistry.__init__` 用 `TYPE_CHECKING` 还原真实类型（之前为 `Any`），方法重命名能在 type-check 时报错
 
 ### Fixed
+- **消息气泡的异常换行**：`.msg` 用 `word-break: break-word` 在所有气泡（user 和 bot 都中招）按字符切，长 URL / 长词被切得稀碎。改为 `overflow-wrap: break-word; word-break: normal;` —— 词边界优先，纯长串才退化到字符级断行，CJK 文本的自然断行也保留
+- **失败消息的编辑按钮重复**：失败的 user 气泡同时挂"hover 编辑"和"气泡下方编辑铅笔图标"两个入口，且都执行同样的"加载到 composer"，UI 上还会互相重叠。失败气泡的 `.msg-actions` 整组隐藏，单留下方的常驻铅笔
 - **R2 NoSuchKey 误判**：部分 botocore 版本下 NoSuchKey 通过 `ClientError` + `response["Error"]["Code"]` 暴露，原先只用 `type(exc).__name__` 子串匹配，漏判后 `R2FileStore.read` / `.delete` 会把"对象不存在"这种预期路径打成 `logger.exception` 完整 traceback，污染日志并干扰运维区分真实 R2 故障。新增 `_is_no_such_key(exc)` 辅助同时覆盖两种 shape（类名子串 + 结构化 Error.Code）
 - **PIL 解码阻塞事件循环**：`/upload` 在 handler 协程里同步调 `detect_image_mime`，一张 20MB 图片的 PIL `verify()` + 格式探测能占用事件循环数百毫秒到数秒，期间所有 SSE 心跳、长轮询、LLM 流式输出都被挂起 —— 单进程网关的隐性 P0。新增 `detect_image_mime_async` 包装走 `asyncio.to_thread`，CPU 重活转默认线程池；同步实现保留供测试与其他工作线程上下文复用
 - **数据目录违规 AstrBot 规范**：SQLite DB 与本地上传根目录默认值原本写死 `data/webchat_gateway.db` / `data/webchat_uploads`（裸落在 AstrBot 工作目录），违反 AstrBot 框架规范，AstrBot 重装/迁移时数据"消失"且不会随 `data/plugin_data/` 一起迁移。改为 `StarTools.get_data_dir("astrbot_plugin_webchat_gateway")` 下的 `webchat_gateway.db` / `webchat_uploads`；`_conf_schema.json` 默认值改空串由代码侧填默认，自定义路径仍可手动指定。`SqliteStorage.initialize()` 启动时若检测到旧路径有遗留 DB 而新路径为空会打印迁移指引（不自动移动，避免多实例环境下的误操作）

@@ -52,15 +52,6 @@ const messageItemUrl = (sid: string, index: number): string =>
   `${CONV_URL}/${encodeURIComponent(sid)}/messages/${index}`;
 const regenerateUrl = (sid: string): string =>
   `${CONV_URL}/${encodeURIComponent(sid)}/regenerate`;
-// Non-destructive per-user-message endpoints. These split off the
-// destructive bot regen (above) so the URL itself encodes intent —
-// `/messages/{idx}/edit` and `/messages/{idx}/regenerate` carry the
-// fold-and-splice semantics; `/regenerate` keeps the legacy truncate
-// behavior for the bot-side "Regenerate" button.
-const messageEditUrl = (sid: string, index: number): string =>
-  `${messageItemUrl(sid, index)}/edit`;
-const messageRegenerateUserUrl = (sid: string, index: number): string =>
-  `${messageItemUrl(sid, index)}/regenerate`;
 
 // Upload defaults — overridable from /api/webchat/site at boot so an
 // operator who raises max_attachments_per_message on the server side
@@ -179,12 +170,6 @@ interface HistoryItem {
   // and the entry is NOT promoted to the server CM (so the next LLM turn
   // doesn't see it). Cleared on successful retry/edit.
   failure?: { reason: FailureReason };
-  // Server-side folded flag — set when the user edits a previous turn
-  // or regenerates the bot reply via the non-destructive endpoints.
-  // Folded entries are rendered inside a collapsed `.msg-fold-bar`
-  // group instead of as a regular bubble; their slot still counts in
-  // the rendered index so the raw↔rendered mapping stays stable.
-  folded?: boolean;
 }
 type FailureReason = "stopped" | "send_failed";
 interface SessionMeta {
@@ -237,7 +222,6 @@ interface ServerMessage {
   ts?: number;
   incomplete?: boolean;
   attachments?: AttachmentRef[];
-  folded?: boolean;
 }
 interface ServerConversationDetail {
   session_id: string;
@@ -253,8 +237,6 @@ type EventType =
   | "history_cleared"
   | "message_added"
   | "message_deleted"
-  | "message_folded"
-  | "message_inserted"
   | "stream_started"
   | "stream_ended";
 interface ServerEvent {
@@ -420,121 +402,12 @@ const localRoleToServer = (r: Role): ServerRole => r === "bot" ? "assistant" : "
 
 function replayActive(): void {
   clearMsgList();
-  // Group consecutive folded entries into a single collapsed
-  // .msg-fold-group element. Non-folded entries render normally via
-  // addMessageBubble. The fold-bar is a horizontal toggle that
-  // expands to reveal each folded bubble in muted styling — see
-  // `appendFoldGroup` below for the DOM shape.
   const history = currentSession().history;
-  let pending: HistoryItem[] = [];
-  const flush = (): void => {
-    if (pending.length === 0) return;
-    appendFoldGroup(pending);
-    pending = [];
-  };
   for (const item of history) {
-    if (item.folded) {
-      pending.push(item);
-      continue;
-    }
-    flush();
     addMessageBubble(item.role, item.text, item.attachments, item.failure);
     if (item.role === "bot" && item.incomplete) appendIncompleteNoticeToLastBubble();
   }
-  flush();
   scrollToEnd();
-}
-
-// Build a bare-bones bubble DOM for a folded entry. Mirrors the
-// content-rendering branch of `addMessageBubble` (attachment grid +
-// markdown for bot / plain text for user) but skips the .msg-row +
-// .msg-actions wrappers — folded bubbles aren't interactive. The
-// `.msg.user`/`.msg.bot` classes are kept intact so
-// `indexOfRenderedBubble`'s position count stays aligned with the
-// raw history index (folded bubbles still occupy a slot).
-function buildFoldedBubble(item: HistoryItem): HTMLDivElement {
-  const div = document.createElement("div");
-  div.className = "msg " + item.role + " folded";
-  const list = Array.isArray(item.attachments) ? item.attachments : [];
-  const hasImages = item.role === "user" && list.length > 0;
-  if (hasImages) {
-    const count = Math.min(list.length, MAX_ATTACHMENTS_PER_MESSAGE);
-    const grid = document.createElement("div");
-    grid.className = "msg-attachments cnt-" + count;
-    for (let i = 0; i < count; i++) {
-      const a = list[i]!;
-      const img = document.createElement("img");
-      img.className = "msg-image";
-      img.loading = "lazy";
-      img.alt = "";
-      img.src = fileServeUrl(a.file_id);
-      attachImgErrorRetry(img);
-      const captureIdx = i;
-      img.addEventListener("click", () => openLightbox(list, captureIdx));
-      grid.appendChild(img);
-    }
-    div.appendChild(grid);
-  }
-  if (item.role === "bot") {
-    div.classList.add("md");
-    if (item.text) {
-      div.innerHTML = renderMarkdown(item.text);
-      decorateCodeblocks(div);
-    }
-  } else if (item.text) {
-    if (hasImages) {
-      const span = document.createElement("div");
-      span.className = "msg-text";
-      span.textContent = item.text;
-      div.appendChild(span);
-    } else {
-      div.textContent = item.text;
-    }
-  }
-  return div;
-}
-
-function appendFoldGroup(items: HistoryItem[]): void {
-  if (items.length === 0) return;
-  const group = document.createElement("div");
-  group.className = "msg-fold-group";
-  const toggle = document.createElement("button");
-  toggle.type = "button";
-  toggle.className = "msg-fold-toggle";
-  toggle.setAttribute("aria-expanded", "false");
-  toggle.setAttribute("aria-label", `已折叠 ${items.length} 条，点击展开`);
-  // Chevron + label live inside the toggle button so the entire bar
-  // is one click target. The chevron rotates via CSS transform when
-  // the group gets the .expanded class.
-  const chevron = document.createElement("span");
-  chevron.className = "msg-fold-chevron";
-  chevron.setAttribute("aria-hidden", "true");
-  chevron.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"`
-    + ` stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" focusable="false">`
-    + `<path d="m9 6 6 6-6 6"/></svg>`;
-  const label = document.createElement("span");
-  label.className = "msg-fold-label";
-  label.textContent = `已折叠 ${items.length} 条`;
-  toggle.appendChild(chevron);
-  toggle.appendChild(label);
-  const content = document.createElement("div");
-  content.className = "msg-fold-content";
-  for (const it of items) {
-    content.appendChild(buildFoldedBubble(it));
-  }
-  toggle.addEventListener("click", () => {
-    const expanded = group.classList.toggle("expanded");
-    toggle.setAttribute("aria-expanded", expanded ? "true" : "false");
-    toggle.setAttribute(
-      "aria-label",
-      expanded
-        ? `已折叠 ${items.length} 条，点击收起`
-        : `已折叠 ${items.length} 条，点击展开`,
-    );
-  });
-  group.appendChild(toggle);
-  group.appendChild(content);
-  msgs.appendChild(group);
 }
 
 // Render-only: never mutates store, never persists. Used by replay + by
@@ -962,11 +835,17 @@ function addMessageBubble(
 // the target onward and runs a new LLM turn on the truncated history.
 // Existing behavior, unchanged.
 //
-// User 重新生成 (data-action=regen-user): non-destructive — folds the
-// bot reply that follows this user message and splices a new reply in
-// place. Downstream history is preserved. Uses
-// /conversations/{sid}/messages/{idx}/regenerate (distinct path from
-// the bot variant).
+// User 再问一次 (data-action=regen-user): non-destructive — dispatches
+// the original user text + attachments as a NEW turn at the bottom of
+// the conversation via the regular `/chat/stream` path. The LLM sees
+// the full current context (including any intervening turns) so the
+// same question can yield a different answer than the original.
+// The original bubble stays untouched.
+//
+// 编辑 (data-action=edit): loads the original text into the composer
+// for the user to rewrite + manually send. Same destination — a new
+// turn at the bottom — just with text the user could change first.
+// Both flows use the existing send path; no special server endpoint.
 //
 // Click handlers look up the bubble's current position in the rendered
 // history at click time (via indexOfRenderedBubble) so a delete that's
@@ -1002,14 +881,14 @@ function buildMessageActions(role: "user" | "bot", _bubble: HTMLDivElement): HTM
     regenBtn.innerHTML = ICON_REGEN;
     actions.appendChild(regenBtn);
   } else {
-    // User-side regen + edit. Both are non-destructive: the old
-    // entries get folded into a collapsed `.msg-fold-bar` group;
-    // downstream messages stay live.
+    // User-side 再问一次 + 编辑. Both append a new turn at the bottom
+    // of the conversation (via the regular /chat/stream path) using
+    // the current full context. The original bubble is never modified.
     const regenUserBtn = document.createElement("button");
     regenUserBtn.type = "button";
     regenUserBtn.className = "msg-action-btn msg-action-regen";
-    regenUserBtn.setAttribute("aria-label", "重新生成回复");
-    regenUserBtn.title = "重新生成";
+    regenUserBtn.setAttribute("aria-label", "再问一次");
+    regenUserBtn.title = "再问一次";
     regenUserBtn.dataset.action = "regen-user";
     regenUserBtn.innerHTML = ICON_REGEN;
     actions.appendChild(regenUserBtn);
@@ -1801,292 +1680,52 @@ async function regenerateMessage(bubble: HTMLDivElement): Promise<void> {
   renderSessionList();
 }
 
-// Non-destructive regenerate based on a user message. The user bubble
-// stays, the bot reply that followed it (if any) is folded, and a new
-// bot reply is spliced in at the next position. Downstream history is
-// preserved. Mirrors `regenerateMessage` (bot-side) in error/race
-// handling — the only differences are the endpoint and the local
-// history mutation (splice instead of truncate).
-async function regenerateUserMessage(bubble: HTMLDivElement): Promise<void> {
+// "再问一次" — dispatch the original user text + attachments as a new
+// turn at the bottom of the conversation. The original bubble stays
+// untouched; the LLM sees the FULL current context (including every
+// intervening turn) when it answers, so the same question can yield a
+// different answer than the original. Intentionally distinct from the
+// bot-side "重新生成" (`regenerateMessage`), which truncates and
+// replaces the bot reply in place.
+function regenerateUserMessage(bubble: HTMLDivElement): void {
   const idx = indexOfRenderedBubble(bubble);
   if (idx < 0) return;
   const sess = currentSession();
   const item = sess.history[idx];
-  if (!item || item.role !== "user" || item.folded) return;
-  const sid = sess.id;
+  if (!item || item.role !== "user") return;
   if (sync.streamAbort) {
     addMessageBubble("notice", "正在处理中，稍候。");
     return;
   }
-  bubble.classList.add("regenerating");
-  const row = bubble.closest<HTMLElement>(".msg-row");
-  const actionBtns = row
-    ? Array.from(row.querySelectorAll<HTMLButtonElement>(".msg-action-btn"))
-    : [];
-  for (const b of actionBtns) b.disabled = true;
-  let resp: Response;
-  try {
-    resp = await fetchWithTimeout(
-      messageRegenerateUserUrl(sid, idx),
-      {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { "Content-Type": "application/json", ...bearer() },
-      },
-      FETCH_TIMEOUT_CHAT_MS,
-    );
-  } catch {
-    bubble.classList.remove("regenerating");
-    for (const b of actionBtns) b.disabled = false;
-    addMessageBubble("error", "重新生成失败，请检查网络。");
-    return;
-  }
-  let payload: Record<string, unknown> = {};
-  try { payload = await resp.json(); } catch {}
-  bubble.classList.remove("regenerating");
-  for (const b of actionBtns) b.disabled = false;
-  if (resp.status === 401) { handle401(); return; }
-  if (resp.status === 429 && (payload.error as string) === "concurrent_request") {
-    addMessageBubble("notice", "正在处理中，稍候。");
-    return;
-  }
-  if (resp.status === 429 && (payload.error as string) === "quota_exceeded") {
-    setBadge(0, payload.daily_quota as number);
-    addMessageBubble("notice", "今日额度已用完，明日 0 点重置。");
-    return;
-  }
-  if (resp.status === 404) {
-    addMessageBubble("error", "原消息已不存在。");
-    return;
-  }
-  if (resp.status === 502 || resp.status === 504) {
-    const code = (payload.error as string) || "";
-    addMessageBubble("error", streamErrorCopy(code));
-    return;
-  }
-  if (!resp.ok) {
-    const code = (payload.error as string) || `http_${resp.status}`;
-    addMessageBubble("error", `重新生成失败: ${code}`);
-    return;
-  }
-  const reply = (payload.reply as string) || "(空回复)";
-  setBadge(payload.remaining as number, payload.daily_quota as number);
-  // Local mirror of the server's splice. The next entry (if it's the
-  // bot reply for this user msg) is folded; the new reply is inserted
-  // right after. Downstream entries stay live, just shifted by +1.
-  const sNow = store.sessions[sid];
-  if (sNow) {
-    const next = sNow.history[idx + 1];
-    let insertAt = idx + 1;
-    if (next && next.role === "bot") {
-      next.folded = true;
-      insertAt = idx + 2;
-    }
-    sNow.history.splice(insertAt, 0, {
-      role: "bot",
-      text: reply,
-      ts: Date.now(),
-    });
-    sNow.lastActiveAt = Date.now();
-    saveStore();
-    if (sid === store.activeId) replayActive();
-  }
-  // Dedup the upcoming long-poll `message_inserted`(assistant) event
-  // the same way bot regen dedups its `message_added` — same content
-  // key, same role.
-  recordOptimistic(sid, "assistant", reply);
-  renderSessionList();
+  void performSend(item.text, item.attachments ? [...item.attachments] : []);
 }
 
-// Inline edit a user message. Swaps the bubble's text content for a
-// textarea + 保存/取消 buttons; on save, POSTs the new text to the
-// edit endpoint, folds the old pair (user + bot reply if any), and
-// splices the new user msg + new bot reply in place. ESC cancels;
-// blur does NOT cancel (a stray click into a different tab would
-// otherwise wipe a half-written edit).
-async function editUserMessage(bubble: HTMLDivElement): Promise<void> {
+// "编辑" — load the original text into the composer so the user can
+// rewrite it and send manually. The original bubble stays in place;
+// once the edited version is sent it appears as a new turn at the
+// bottom with the new text and full current context (NOT a
+// destructive in-place replacement of the original).
+function editUserMessage(bubble: HTMLDivElement): void {
   const idx = indexOfRenderedBubble(bubble);
   if (idx < 0) return;
   const sess = currentSession();
   const item = sess.history[idx];
-  if (!item || item.role !== "user" || item.folded) return;
-  if (sync.streamAbort) {
-    addMessageBubble("notice", "正在处理中，稍候。");
-    return;
+  if (!item || item.role !== "user") return;
+  // Don't clobber the current draft silently. If the user has started
+  // typing something different, ask first; cancelling leaves both the
+  // bubble and the draft alone.
+  const draft = inputEl.value.trim();
+  if (draft && draft !== item.text) {
+    if (!confirm("当前输入框有未发送的内容，编辑会覆盖。是否继续？")) return;
   }
-  // Guard against opening a second editor on the same bubble.
-  if (bubble.classList.contains("editing")) return;
-  bubble.classList.add("editing");
-
-  // Stash the original DOM so cancel can restore exactly what was
-  // there (including attachment grids and any failure chrome).
-  const originalHtml = bubble.innerHTML;
-  bubble.innerHTML = "";
-
-  const wrap = document.createElement("div");
-  wrap.className = "msg-edit-inline";
-  const ta = document.createElement("textarea");
-  ta.className = "msg-edit-textarea";
-  ta.rows = Math.min(8, Math.max(2, item.text.split("\n").length + 1));
-  ta.value = item.text;
-  ta.setAttribute("aria-label", "编辑消息");
-  const actions = document.createElement("div");
-  actions.className = "msg-edit-actions";
-  const cancelBtn = document.createElement("button");
-  cancelBtn.type = "button";
-  cancelBtn.className = "msg-edit-cancel";
-  cancelBtn.textContent = "取消";
-  const saveBtn = document.createElement("button");
-  saveBtn.type = "button";
-  saveBtn.className = "msg-edit-save";
-  saveBtn.textContent = "保存";
-  actions.appendChild(cancelBtn);
-  actions.appendChild(saveBtn);
-  wrap.appendChild(ta);
-  wrap.appendChild(actions);
-  bubble.appendChild(wrap);
-
-  const restore = (): void => {
-    bubble.classList.remove("editing", "regenerating");
-    bubble.innerHTML = originalHtml;
-  };
-  cancelBtn.addEventListener("click", restore);
-  ta.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") {
-      e.preventDefault();
-      restore();
-    }
-  });
-
-  // Focus + autosize. Caret at end so a quick fix doesn't require a
-  // mouse click; selectionRange wrapped in try/catch because Safari
-  // sometimes throws if the element hasn't fully attached yet.
-  ta.focus();
-  try { ta.setSelectionRange(ta.value.length, ta.value.length); } catch {}
-  const autosize = (): void => {
-    ta.style.height = "auto";
-    ta.style.height = ta.scrollHeight + "px";
-  };
-  ta.addEventListener("input", autosize);
-  autosize();
-
-  const submit = async (): Promise<void> => {
-    const newText = ta.value.trim();
-    if (!newText) {
-      addMessageBubble("notice", "编辑后的内容不能为空。");
-      return;
-    }
-    if (newText === item.text.trim()) {
-      // No-op edit — user probably hit save by mistake. Bail without
-      // burning a quota slot.
-      restore();
-      return;
-    }
-    saveBtn.disabled = true;
-    cancelBtn.disabled = true;
-    ta.disabled = true;
-    bubble.classList.add("regenerating");
-    let resp: Response;
-    try {
-      resp = await fetchWithTimeout(
-        messageEditUrl(sess.id, idx),
-        {
-          method: "POST",
-          credentials: "same-origin",
-          headers: { "Content-Type": "application/json", ...bearer() },
-          body: JSON.stringify({ new_text: newText }),
-        },
-        FETCH_TIMEOUT_CHAT_MS,
-      );
-    } catch {
-      bubble.classList.remove("regenerating");
-      saveBtn.disabled = false;
-      cancelBtn.disabled = false;
-      ta.disabled = false;
-      addMessageBubble("error", "编辑失败，请检查网络。");
-      return;
-    }
-    let payload: Record<string, unknown> = {};
-    try { payload = await resp.json(); } catch {}
-    bubble.classList.remove("regenerating");
-    if (resp.status === 401) { handle401(); return; }
-    if (resp.status === 429 && (payload.error as string) === "concurrent_request") {
-      saveBtn.disabled = false;
-      cancelBtn.disabled = false;
-      ta.disabled = false;
-      addMessageBubble("notice", "正在处理中，稍候。");
-      return;
-    }
-    if (resp.status === 429 && (payload.error as string) === "quota_exceeded") {
-      setBadge(0, payload.daily_quota as number);
-      addMessageBubble("notice", "今日额度已用完，明日 0 点重置。");
-      restore();
-      return;
-    }
-    if (resp.status === 404) {
-      addMessageBubble("error", "原消息已不存在。");
-      restore();
-      return;
-    }
-    if (resp.status === 502 || resp.status === 504) {
-      const code = (payload.error as string) || "";
-      addMessageBubble("error", streamErrorCopy(code));
-      saveBtn.disabled = false;
-      cancelBtn.disabled = false;
-      ta.disabled = false;
-      return;
-    }
-    if (!resp.ok) {
-      const code = (payload.error as string) || `http_${resp.status}`;
-      addMessageBubble("error", `编辑失败: ${code}`);
-      saveBtn.disabled = false;
-      cancelBtn.disabled = false;
-      ta.disabled = false;
-      return;
-    }
-    const reply = (payload.reply as string) || "(空回复)";
-    setBadge(payload.remaining as number, payload.daily_quota as number);
-
-    // Local mirror of the server splice. Old user is folded; if the
-    // next entry was a bot reply it's folded too; the new user/bot
-    // pair lands right after the folded range, downstream stays put.
-    const sNow = store.sessions[sess.id];
-    if (sNow) {
-      sNow.history[idx]!.folded = true;
-      let insertAt = idx + 1;
-      const next = sNow.history[idx + 1];
-      if (next && next.role === "bot") {
-        next.folded = true;
-        insertAt = idx + 2;
-      }
-      const newUserItem: HistoryItem = {
-        role: "user",
-        text: newText,
-        ts: Date.now(),
-      };
-      const newBotItem: HistoryItem = {
-        role: "bot",
-        text: reply,
-        ts: Date.now(),
-      };
-      sNow.history.splice(insertAt, 0, newUserItem, newBotItem);
-      sNow.lastActiveAt = Date.now();
-      saveStore();
-      if (sess.id === store.activeId) replayActive();
-    }
-    recordOptimistic(sess.id, "user", newText);
-    recordOptimistic(sess.id, "assistant", reply);
-    renderSessionList();
-  };
-  saveBtn.addEventListener("click", () => { void submit(); });
-  ta.addEventListener("keydown", (e) => {
-    // Ctrl/Cmd+Enter = save. Plain Enter still inserts a newline so
-    // users can compose multi-line edits without surprise submission.
-    if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !e.isComposing) {
-      e.preventDefault();
-      void submit();
-    }
-  });
+  inputEl.value = item.text;
+  autosizeInput();
+  inputEl.focus();
+  try { inputEl.setSelectionRange(item.text.length, item.text.length); } catch {}
+  if (item.attachments && item.attachments.length) {
+    addMessageBubble("notice", "已加载文字到输入框；图片附件不会自动还原。");
+  }
+  updateSendButtonState();
 }
 
 // ---------- Apply events ----------
@@ -2294,85 +1933,6 @@ function applyEvent(ev: ServerEvent): void {
       if (sid === store.activeId) replayActive();
       break;
     }
-    case "message_folded": {
-      // Peer (or our own long-poll echo of an originating edit / regen-user)
-      // marked a message as folded. Idempotent: if the local entry is
-      // already folded, the originating-device flow already applied it
-      // and we're just consuming the dedup. Otherwise mark + replay.
-      const rawIndex = payload["index"];
-      const rawRole = payload["role"];
-      if (typeof rawIndex !== "number" || !Number.isInteger(rawIndex) || rawIndex < 0) break;
-      if (rawRole !== "user" && rawRole !== "assistant") break;
-      const sess = store.sessions[sid];
-      if (!sess) break;
-      const target = sess.history[rawIndex];
-      if (!target) break;
-      const expectedLocalRole: Role = serverRoleToLocal(rawRole as ServerRole);
-      if (target.role !== expectedLocalRole) break;
-      if (target.folded) {
-        sess.lastActiveAt = Math.max(sess.lastActiveAt, ev.ts * 1000);
-        break;
-      }
-      target.folded = true;
-      sess.lastActiveAt = ev.ts * 1000;
-      if (sid === store.activeId) replayActive();
-      break;
-    }
-    case "message_inserted": {
-      // Splice-in event from edit / regen-user. `index` is the
-      // rendered position the new entry should occupy. Originating
-      // device already spliced + replayed locally; deduped here via
-      // recordOptimistic just like message_added.
-      const rawIndex = payload["index"];
-      const rawRole = payload["role"];
-      const content = payload["content"];
-      if (typeof rawIndex !== "number" || !Number.isInteger(rawIndex) || rawIndex < 0) break;
-      if (rawRole !== "user" && rawRole !== "assistant") break;
-      if (typeof content !== "string") break;
-      const expectedLocalRole: Role = serverRoleToLocal(rawRole as ServerRole);
-      // Dedup via the same optimistic-echo buffer message_added uses.
-      let attachments: AttachmentRef[] | undefined;
-      const rawAttachments = payload["attachments"];
-      if (Array.isArray(rawAttachments) && rawAttachments.length) {
-        const parsed: AttachmentRef[] = [];
-        for (const entry of rawAttachments) {
-          if (entry && typeof entry === "object") {
-            const o = entry as Record<string, unknown>;
-            if (typeof o.file_id === "string" && o.file_id) {
-              const ref: AttachmentRef = {
-                file_id: o.file_id,
-                mime: typeof o.mime === "string" ? o.mime : "image/jpeg",
-              };
-              if (typeof o.width === "number") ref.width = o.width;
-              if (typeof o.height === "number") ref.height = o.height;
-              parsed.push(ref);
-            }
-          }
-        }
-        if (parsed.length) attachments = parsed;
-      }
-      if (consumeIfDuplicate(sid, rawRole as ServerRole, content, ev.ts, attachments)) {
-        const s = store.sessions[sid];
-        if (s) s.lastActiveAt = Math.max(s.lastActiveAt, ev.ts * 1000);
-        break;
-      }
-      const sess = store.sessions[sid];
-      if (!sess) break;
-      // Bounds check: index must land inside the current history (or
-      // be the tail position). A stale long-poll batch could carry an
-      // index out of range; treat as no-op.
-      if (rawIndex > sess.history.length) break;
-      const item: HistoryItem = {
-        role: expectedLocalRole,
-        text: content,
-        ts: ev.ts * 1000,
-      };
-      if (attachments && expectedLocalRole === "user") item.attachments = attachments;
-      sess.history.splice(rawIndex, 0, item);
-      sess.lastActiveAt = ev.ts * 1000;
-      if (sid === store.activeId) replayActive();
-      break;
-    }
     case "stream_started": {
       const streamId = payload["stream_id"];
       if (typeof streamId !== "string" || !streamId) break;
@@ -2514,7 +2074,6 @@ function ingestConversationDetail(detail: ServerConversationDetail): void {
       // Cheap, server-side already validated shape — copy through.
       item.attachments = m.attachments.filter(isAttachmentRef);
     }
-    if (m.folded === true) item.folded = true;
     return item;
   });
   // Preserve local tail entries that haven't yet appeared in the server

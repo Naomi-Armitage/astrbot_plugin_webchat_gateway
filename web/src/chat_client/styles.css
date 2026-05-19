@@ -399,7 +399,15 @@ header h1 {
   padding: 10px 14px;
   font: 14.5px/1.55 var(--font-display);
   white-space: pre-wrap;
-  word-break: break-word;
+  /* `overflow-wrap: break-word` breaks at word boundaries first and only
+     breaks mid-word for genuinely unbreakable runs (long URLs, base64
+     blobs). The previous `word-break: break-word` was aggressive — it
+     split ordinary words at character boundaries, producing the
+     "怪异换行" that affected both user and bot bubbles. CJK characters
+     are individually break-eligible under `word-break: normal`, so
+     this preserves natural Chinese / Japanese line breaking too. */
+  overflow-wrap: break-word;
+  word-break: normal;
   background: var(--card);
   border: 1px solid var(--rule);
   color: var(--ink);
@@ -444,7 +452,6 @@ header h1 {
   color: var(--accent-strong);
   text-decoration: underline;
   text-underline-offset: 2px;
-  word-break: break-word;
 }
 .msg.md a:hover { color: var(--accent); }
 .msg.md ul, .msg.md ol {
@@ -1023,7 +1030,8 @@ footer button:disabled { opacity: .5; cursor: not-allowed; }
 }
 .msg.user .msg-text {
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: break-word;
+  word-break: normal;
 }
 .msg.user:has(.msg-attachments) {
   /* User bubbles with attachments tighten the inner padding so the grid
@@ -1327,6 +1335,14 @@ body.lightbox-open { overflow: hidden; }
    morphing; copy / delete / regenerate aren't meaningful yet. */
 .msg-row:has(.msg.streaming) .msg-actions { display: none; }
 
+/* Failed user message → suppress hover actions entirely. A failed
+   bubble already carries its own always-visible chrome (red retry
+   badge on the left + pencil-icon edit-into-composer below) so the
+   hover row's 再问一次 / 编辑 buttons are redundant. Without this
+   the same bubble shows the pencil edit twice (hover + below) and
+   the layouts overlap. */
+.msg-row:has(.msg-user-failed) .msg-actions { display: none; }
+
 .msg-action-btn {
   appearance: none;
   border: none;
@@ -1411,151 +1427,6 @@ body.lightbox-open { overflow: hidden; }
    doesn't try to anchor itself relative to the row's column axis. */
 .msg-row.user-row .msg-user-failed {
   align-self: stretch;
-}
-
-/* ----- folded-history group -----
-   A horizontal "已折叠 N 条 ▶" bar that replaces the visible bubbles
-   for a consecutive run of folded entries. Click → expands the
-   content (the folded bubbles, rendered with .folded styling) in
-   place. The bar itself looks like a soft horizontal rule so it
-   reads as a separator/marker rather than competing visually with
-   live bubbles. */
-.msg-fold-group {
-  align-self: stretch;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  margin: 2px 0;
-}
-.msg-fold-toggle {
-  appearance: none;
-  border: 1px dashed color-mix(in oklab, var(--rule) 80%, transparent);
-  background: color-mix(in oklab, var(--ink) 3%, transparent);
-  color: var(--ink-soft);
-  border-radius: 999px;
-  padding: 4px 14px;
-  align-self: center;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font: inherit;
-  font-size: 12.5px;
-  cursor: pointer;
-  transition: background-color 0.15s ease, color 0.15s ease,
-              border-color 0.15s ease;
-}
-.msg-fold-toggle:hover {
-  background: color-mix(in oklab, var(--ink) 7%, transparent);
-  color: var(--ink);
-  border-color: color-mix(in oklab, var(--rule) 100%, transparent);
-}
-.msg-fold-toggle:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-.msg-fold-chevron {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 14px;
-  height: 14px;
-  transition: transform 0.18s ease;
-}
-.msg-fold-chevron svg { width: 14px; height: 14px; }
-.msg-fold-group.expanded .msg-fold-chevron { transform: rotate(90deg); }
-.msg-fold-content {
-  display: none;
-  flex-direction: column;
-  gap: 10px;
-  padding: 2px 0;
-}
-.msg-fold-group.expanded .msg-fold-content { display: flex; }
-/* Folded bubbles inherit normal .msg geometry (max-width, padding,
-   alignment via .user/.bot) but render in muted styling so the
-   expanded fold reads as "archived" relative to live messages. */
-.msg.folded {
-  opacity: 0.6;
-  filter: saturate(0.7);
-}
-.msg.folded:hover { opacity: 0.85; }
-
-/* ----- inline user-message edit -----
-   Replaces the bubble's text content with a textarea + 取消/保存
-   buttons when the user clicks the edit action. The textarea
-   inherits font + color from the bubble so the edit feels in-place
-   rather than modal. Save kicks the LLM via the edit endpoint;
-   cancel restores the original DOM. */
-.msg-edit-inline {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  width: 100%;
-  min-width: 220px;
-}
-.msg-edit-textarea {
-  appearance: none;
-  border: 1px solid color-mix(in oklab, var(--accent) 35%, var(--rule));
-  background: color-mix(in oklab, var(--card) 85%, transparent);
-  color: var(--ink);
-  border-radius: 8px;
-  padding: 6px 8px;
-  font: inherit;
-  line-height: 1.5;
-  resize: none;
-  overflow-y: auto;
-  min-height: 36px;
-  max-height: 240px;
-  scrollbar-width: none;
-}
-.msg-edit-textarea::-webkit-scrollbar { display: none; }
-.msg-edit-textarea:focus {
-  outline: none;
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--ring);
-}
-.msg-edit-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 6px;
-}
-.msg-edit-cancel,
-.msg-edit-save {
-  appearance: none;
-  border: 1px solid var(--rule);
-  background: var(--card);
-  color: var(--ink);
-  border-radius: 6px;
-  padding: 3px 12px;
-  font: inherit;
-  font-size: 12.5px;
-  cursor: pointer;
-  transition: background-color 0.15s ease, border-color 0.15s ease,
-              color 0.15s ease;
-}
-.msg-edit-cancel:hover {
-  background: color-mix(in oklab, var(--ink) 5%, transparent);
-}
-.msg-edit-save {
-  background: var(--accent);
-  color: var(--on-accent, #fff);
-  border-color: var(--accent);
-}
-.msg-edit-save:hover {
-  background: color-mix(in oklab, var(--accent) 85%, black);
-  border-color: color-mix(in oklab, var(--accent) 85%, black);
-}
-.msg-edit-cancel:focus-visible,
-.msg-edit-save:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-.msg-edit-cancel:disabled,
-.msg-edit-save:disabled {
-  cursor: not-allowed;
-  opacity: 0.5;
-}
-.msg.editing {
-  cursor: default;
 }
 
 @media (prefers-reduced-motion: reduce) {
