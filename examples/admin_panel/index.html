@@ -539,6 +539,65 @@
         padding: 7px 12px;
       }
 
+      /* ----- Logs viewer ----- */
+      .logs-view {
+        background: var(--bg-elev);
+        border: 1px solid var(--border-soft);
+        border-radius: 8px;
+        padding: 10px 12px;
+        height: min(calc(100vh - 320px), 600px);
+        min-height: 240px;
+        overflow-y: auto;
+        font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 12px;
+        line-height: 1.55;
+        color: var(--text);
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .logs-view .log-entry {
+        padding: 2px 0;
+        border-bottom: 1px solid transparent;
+      }
+      .logs-view .log-entry:hover {
+        border-bottom-color: var(--border-soft);
+      }
+      .logs-view .log-ts {
+        color: var(--muted);
+        margin-right: 8px;
+      }
+      .logs-view .log-level {
+        display: inline-block;
+        min-width: 64px;
+        font-weight: 600;
+        margin-right: 8px;
+      }
+      .logs-view .log-logger {
+        color: var(--muted);
+        margin-right: 8px;
+      }
+      .logs-view .log-entry[data-level="DEBUG"] .log-level    { color: var(--muted); }
+      .logs-view .log-entry[data-level="INFO"] .log-level     { color: var(--accent-strong); }
+      .logs-view .log-entry[data-level="WARNING"] .log-level  { color: var(--warn); }
+      .logs-view .log-entry[data-level="ERROR"] .log-level    { color: var(--bad); }
+      .logs-view .log-entry[data-level="CRITICAL"] .log-level { color: #fff; background: var(--bad); padding: 0 4px; border-radius: 3px; }
+      .logs-view .log-exc {
+        margin-top: 2px;
+        padding: 6px 9px;
+        background: rgba(248, 81, 73, .08);
+        border-left: 2px solid var(--bad);
+        color: var(--bad);
+        font-size: 11px;
+        white-space: pre;
+        overflow-x: auto;
+      }
+      .logs-view .log-empty {
+        color: var(--muted);
+        font-style: italic;
+        padding: 20px 0;
+        text-align: center;
+      }
+
       /* ----- Pagination ----- */
       .pagination {
         display: flex;
@@ -956,6 +1015,7 @@
         <button data-tab="list">列表</button>
         <button data-tab="stats">用量</button>
         <button data-tab="audit">审计</button>
+        <button data-tab="logs">日志</button>
         <button data-tab="settings">设置</button>
       </div>
 
@@ -1117,6 +1177,41 @@
           <div class="pager" id="auditPager"></div>
         </div>
         <span id="auditStatus" class="status"></span>
+      </section>
+
+      <!-- Logs -->
+      <section id="panel-logs" class="panel hidden">
+        <div class="status-bar">
+          <h2>实时日志</h2>
+          <div>
+            <span id="logsStatus" class="status"></span>
+            <button id="logsPauseBtn" class="ghost" type="button">暂停</button>
+            <button id="logsClearBtn" class="ghost" type="button">清空视图</button>
+          </div>
+        </div>
+        <div class="filter-row">
+          <label>最低等级
+            <select id="logsLevel">
+              <option value="">全部</option>
+              <option value="DEBUG">DEBUG</option>
+              <option value="INFO">INFO</option>
+              <option value="WARNING" selected>WARNING</option>
+              <option value="ERROR">ERROR</option>
+              <option value="CRITICAL">CRITICAL</option>
+            </select>
+          </label>
+          <label>关键字
+            <input id="logsGrep" type="text" placeholder="子串模糊匹配 (大小写不敏感)"
+              autocomplete="off" spellcheck="false" />
+          </label>
+          <label class="inline-check" style="align-self: end;">
+            <input id="logsAutoscroll" type="checkbox" checked /> 自动滚到底
+          </label>
+          <div class="filter-actions">
+            <button id="logsApplyBtn" type="button">应用</button>
+          </div>
+        </div>
+        <div id="logsView" class="logs-view" aria-live="polite" aria-label="实时日志输出"></div>
       </section>
 
       <!-- Settings -->
@@ -1345,13 +1440,18 @@
       tabs.forEach((tab) => {
         tab.onclick = () => {
           tabs.forEach((t) => t.classList.toggle("active", t === tab));
-          ["issue", "list", "stats", "audit", "settings"].forEach((name) => {
+          ["issue", "list", "stats", "audit", "logs", "settings"].forEach((name) => {
             $(`panel-${name}`).classList.toggle("hidden", name !== tab.dataset.tab);
           });
           if (tab.dataset.tab === "list") loadList();
           if (tab.dataset.tab === "audit") loadAudit();
           if (tab.dataset.tab === "stats") populateNames();
           if (tab.dataset.tab === "settings") loadSettings();
+          // Logs tab uses an SSE subscription rather than a one-shot
+          // load; opening the tab kicks the subscriber, switching
+          // away tears it down. See ensureLogsStarted / stopLogs.
+          if (tab.dataset.tab === "logs") ensureLogsStarted();
+          else stopLogs();
         };
       });
 
@@ -1818,6 +1918,199 @@
           .replace(/"/g, "&quot;")
           .replace(/'/g, "&#39;");
       }
+
+      // ----- Logs (live tail via SSE) -----
+      // Tab open kicks ensureLogsStarted(): the panel grabs the
+      // current filter values, opens an EventSource against
+      // /api/webchat/admin/logs/stream with those params, and appends
+      // each frame to #logsView. Switching away calls stopLogs() so
+      // we don't keep a long-poll-style connection alive while the
+      // operator's looking at a different tab.
+      const logsState = {
+        es: null,         // EventSource instance while active
+        paused: false,    // Pause button toggles consumption (not the
+                          // subscription itself — pause keeps the
+                          // event stream alive but drops frames so
+                          // they don't fill the DOM).
+        entries: 0,       // Count rendered, used for the cap.
+        cap: 5000,        // DOM cap; matches server buffer. Above
+                          // this we drop the oldest entry on append.
+        scrollPinned: true,
+      };
+
+      function logsBuildUrl() {
+        const params = new URLSearchParams();
+        const level = $("logsLevel").value;
+        const grep = $("logsGrep").value.trim();
+        if (level) params.set("level", level);
+        if (grep) params.set("grep", grep);
+        const qs = params.toString();
+        const base = buildUrl("/api/webchat/admin/logs/stream");
+        return qs ? `${base}?${qs}` : base;
+      }
+
+      function logsFormatTs(ts) {
+        // Unix-seconds → HH:mm:ss.SSS local. Date.now() math keeps it
+        // tight so a long-running tab doesn't drift.
+        const ms = Math.round(ts * 1000);
+        const d = new Date(ms);
+        const pad = (n, w = 2) => String(n).padStart(w, "0");
+        return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
+      }
+
+      function logsAppendEntry(entry) {
+        if (logsState.paused) return;
+        const view = $("logsView");
+        // Lazy-clear the "no entries" placeholder on first real row.
+        const placeholder = view.querySelector(".log-empty");
+        if (placeholder) placeholder.remove();
+        const row = document.createElement("div");
+        row.className = "log-entry";
+        row.dataset.level = entry.level;
+        // Build via DOM nodes + textContent so an attacker-controlled
+        // log line can't smuggle HTML even if a future logger.exception
+        // includes operator-supplied data verbatim.
+        const ts = document.createElement("span");
+        ts.className = "log-ts";
+        ts.textContent = logsFormatTs(entry.ts);
+        const lvl = document.createElement("span");
+        lvl.className = "log-level";
+        lvl.textContent = entry.level;
+        const name = document.createElement("span");
+        name.className = "log-logger";
+        name.textContent = entry.logger;
+        const msg = document.createElement("span");
+        msg.className = "log-msg";
+        msg.textContent = entry.message;
+        row.appendChild(ts);
+        row.appendChild(lvl);
+        row.appendChild(name);
+        row.appendChild(msg);
+        if (entry.exc) {
+          const exc = document.createElement("pre");
+          exc.className = "log-exc";
+          exc.textContent = entry.exc;
+          row.appendChild(exc);
+        }
+        view.appendChild(row);
+        logsState.entries += 1;
+        // DOM-side cap mirrors the server-side ring buffer. Drop the
+        // oldest few when we cross — saves layout/scroll cost.
+        if (logsState.entries > logsState.cap) {
+          const overflow = logsState.entries - logsState.cap;
+          for (let i = 0; i < overflow && view.firstChild; i++) {
+            view.removeChild(view.firstChild);
+          }
+          logsState.entries = logsState.cap;
+        }
+        if ($("logsAutoscroll").checked && logsState.scrollPinned) {
+          view.scrollTop = view.scrollHeight;
+        }
+      }
+
+      function logsSetStatus(text, kind) {
+        const el = $("logsStatus");
+        el.textContent = text || "";
+        el.className = kind ? `status ${kind}` : "status";
+      }
+
+      function ensureLogsStarted() {
+        if (logsState.es) return;
+        const view = $("logsView");
+        view.innerHTML = "";
+        logsState.entries = 0;
+        const empty = document.createElement("div");
+        empty.className = "log-empty";
+        empty.textContent = "等待日志…";
+        view.appendChild(empty);
+        logsSetStatus("订阅中…");
+        let es;
+        try {
+          // EventSource is fetch-with-Cookie by default; same-origin
+          // dashboard hits the session cookie set by /admin/login.
+          // For bearer-only deployments the master key flows via the
+          // existing api() Authorization header path — but
+          // EventSource doesn't support custom headers, so this
+          // viewer requires session-cookie auth (login first).
+          es = new EventSource(logsBuildUrl(), { withCredentials: true });
+        } catch (e) {
+          logsSetStatus(`订阅失败: ${e.message}`, "error");
+          return;
+        }
+        logsState.es = es;
+        es.onopen = () => {
+          logsSetStatus("订阅中 · 实时", "success");
+        };
+        es.onmessage = (ev) => {
+          let payload;
+          try { payload = JSON.parse(ev.data); }
+          catch { return; }
+          if (!payload || typeof payload !== "object") return;
+          logsAppendEntry({
+            id: payload.id,
+            ts: typeof payload.ts === "number" ? payload.ts : Date.now() / 1000,
+            level: String(payload.level || "INFO"),
+            logger: String(payload.logger || ""),
+            message: String(payload.message || ""),
+            exc: typeof payload.exc === "string" ? payload.exc : null,
+          });
+        };
+        es.onerror = () => {
+          // EventSource auto-reconnects with backoff; surface the
+          // disconnect so the operator knows we're not live until it
+          // comes back.
+          logsSetStatus("连接断开，正在重连…", "error");
+        };
+      }
+
+      function stopLogs() {
+        if (logsState.es) {
+          try { logsState.es.close(); } catch {}
+          logsState.es = null;
+        }
+        logsSetStatus("");
+      }
+
+      $("logsPauseBtn").onclick = () => {
+        logsState.paused = !logsState.paused;
+        $("logsPauseBtn").textContent = logsState.paused ? "继续" : "暂停";
+        logsSetStatus(
+          logsState.paused ? "已暂停（新条目不再追加）" : "订阅中 · 实时",
+          logsState.paused ? "" : "success",
+        );
+      };
+      $("logsClearBtn").onclick = () => {
+        const view = $("logsView");
+        view.innerHTML = "";
+        logsState.entries = 0;
+        const empty = document.createElement("div");
+        empty.className = "log-empty";
+        empty.textContent = "已清空。后续日志会继续追加。";
+        view.appendChild(empty);
+      };
+      $("logsApplyBtn").onclick = () => {
+        // Filter change re-subscribes with the new query params. SSE
+        // doesn't have an "update query" frame, so a hard reconnect
+        // is the contract here — same as Loki's live-tail UI does.
+        stopLogs();
+        ensureLogsStarted();
+      };
+      $("logsLevel").addEventListener("change", () => {
+        if (logsState.es) { stopLogs(); ensureLogsStarted(); }
+      });
+      $("logsGrep").addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          if (logsState.es) { stopLogs(); ensureLogsStarted(); }
+        }
+      });
+      // Auto-scroll pin: if operator scrolls up, stop forcing
+      // scrollTop on each new entry until they return to the bottom.
+      $("logsView").addEventListener("scroll", () => {
+        const v = $("logsView");
+        const nearBottom = v.scrollTop + v.clientHeight >= v.scrollHeight - 24;
+        logsState.scrollPinned = nearBottom;
+      });
 
       // ----- Settings -----
       // Spec: GET /api/webchat/admin/settings -> {fields: [{key, section, type,

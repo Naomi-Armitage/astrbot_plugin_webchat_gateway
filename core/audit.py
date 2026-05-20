@@ -23,6 +23,11 @@ Admin reads (audit-trail-only, mirrors lifecycle vocabulary):
                       "重启服务" action; detail: {phase: "requested"}.
                       Emitted BEFORE the actual _stop/_start cycle so
                       the row survives the lifecycle bounce.
+    admin_logs_view — admin subscribed to /admin/logs/stream (one row
+                      per SSE subscription, not per GET poll); detail:
+                      {mode, since, level, grep}. Lets operators see
+                      WHO opened the live log viewer without drowning
+                      audit_log in poll rows.
     admin_auth_fail — admin auth attempt failed at the gate;
                       detail: {reason: no_token|invalid_key|admin_disabled|ip_blocked,
                                retry_after?: int}

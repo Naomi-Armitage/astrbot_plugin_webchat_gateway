@@ -23,10 +23,12 @@ from .core.file_store import FileStore, make_file_store_from_config
 from .core.image_bridge import ImageBridge
 from .core.ip_guard import IpGuard
 from .core.llm_bridge import LlmBridge
+from .core.log_buffer import LogBuffer, LogBufferHandler
 from .core.prune_orchestrator import PruneOrchestrator, PruneRetentionConfig
 from .core.ratelimit import PerTokenConcurrency, PerTokenUploadGate
 from .core.stream_buffer import InMemoryBuffer, RedisBuffer, StreamBuffer
 from .core.stream_registry import StreamRegistry
+from .handlers.admin_logs import AdminLogsDeps
 from .handlers.admin_settings import AdminSettingsDeps
 from .handlers.admin_stats import AdminDeps
 from .handlers.admin_tokens import ServiceError, TokenService
@@ -89,6 +91,11 @@ class WebChatGatewayPlugin(Star):
         # still point at the pre-edit bridge and /image would keep
         # returning ``image_disabled`` until a restart.
         self._chat_deps: Any | None = None
+        # In-memory log ring buffer + its logging.Handler. Both live
+        # for the duration of `_start`; `_stop` detaches the handler
+        # so a subsequent reload doesn't double-handle records.
+        self._log_buffer: LogBuffer | None = None
+        self._log_handler: LogBufferHandler | None = None
 
     async def initialize(self) -> None:
         await self._start()
@@ -127,6 +134,29 @@ class WebChatGatewayPlugin(Star):
         try:
             audit = AuditLogger(storage)
             self._audit = audit
+
+            # In-memory log ring buffer feeding the admin panel's live
+            # log viewer. Attach our handler to the AstrBot logger so
+            # every `logger.info/warning/exception` call across the
+            # plugin lands in the same buffer the operator's "日志"
+            # tab subscribes to. Bound the buffer (default 5000) so a
+            # noisy loop can't pin RAM.
+            log_buffer = LogBuffer()
+            log_handler = LogBufferHandler(log_buffer)
+            try:
+                # Attach to AstrBot's logger object (not the root
+                # logger) so we capture exactly what the rest of the
+                # plugin emits via `from astrbot.api import logger`.
+                # Adding to root would also catch noisy upstreams
+                # (httpx, aiosqlite) we don't care about here.
+                logger.addHandler(log_handler)
+            except Exception:
+                logger.exception(
+                    "[WebChatGateway] log_buffer handler attach failed"
+                )
+            self._log_buffer = log_buffer
+            self._log_handler = log_handler
+
             token_service = TokenService(
                 storage,
                 audit,
@@ -315,6 +345,16 @@ class WebChatGatewayPlugin(Star):
                 on_reload=self._reload_cfg,
                 on_restart=self._restart,
             )
+            admin_logs_deps = AdminLogsDeps(
+                buffer=log_buffer,
+                audit=audit,
+                allowed_origins=cfg.allowed_origins,
+                master_admin_key=cfg.master_admin_key,
+                ip_guard=ip_guard,
+                trust_forwarded_for=cfg.trust_forwarded_for,
+                trust_referer_as_origin=cfg.trust_referer_as_origin,
+                allow_missing_origin=cfg.allow_missing_origin,
+            )
             title_deps = TitleDeps(
                 storage=storage,
                 audit=audit,
@@ -369,6 +409,7 @@ class WebChatGatewayPlugin(Star):
                 chat=chat_deps,
                 admin=admin_deps,
                 admin_settings=admin_settings_deps,
+                admin_logs=admin_logs_deps,
                 title=title_deps,
                 conv=conv_deps,
                 conv_service=conv_service,
@@ -581,6 +622,16 @@ class WebChatGatewayPlugin(Star):
         self._cookie_logout_tracker = None
         self._event_bus = None
         self._chat_deps = None
+        if self._log_handler is not None:
+            try:
+                logger.removeHandler(self._log_handler)
+            except Exception:
+                # Logger may already have torn down or the handler
+                # was never attached (best-effort path during boot
+                # failure). Quiet — `_stop` must not raise.
+                pass
+            self._log_handler = None
+        self._log_buffer = None
 
     # ----- AstrBot in-bot admin commands -----
 
