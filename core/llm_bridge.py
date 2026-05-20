@@ -57,11 +57,30 @@ class LlmBridge:
         history_turns: int,
         persona_id: str,
         timeout_seconds: float = 60.0,
+        total_stream_timeout_seconds: float | None = None,
     ) -> None:
         self._context = context
         self._history_turns = max(0, history_turns)
         self._persona_id_cfg = (persona_id or "").strip()
         self._timeout = float(timeout_seconds) if timeout_seconds else None
+        # Total wall-clock budget for streaming responses. Without this,
+        # a misbehaving provider that emits one byte every (per-chunk
+        # timeout - ε) seconds can hold the per-token concurrency lock
+        # for hours: the per-chunk idle timeout would reset on every
+        # crumb of progress. Default: 8× per-chunk timeout, capped at
+        # 600s and floored at 2× so it always exceeds at least one idle
+        # window. None / 0 disables the total budget (legacy behaviour).
+        if total_stream_timeout_seconds is None:
+            if self._timeout:
+                self._total_stream_timeout: float | None = min(
+                    600.0, max(self._timeout * 2, self._timeout * 8)
+                )
+            else:
+                self._total_stream_timeout = None
+        elif total_stream_timeout_seconds <= 0:
+            self._total_stream_timeout = None
+        else:
+            self._total_stream_timeout = float(total_stream_timeout_seconds)
         self._persona_cache: tuple[str | None, str | None] | None = None
 
     async def _resolve_persona(self) -> tuple[str | None, str | None]:
@@ -269,10 +288,18 @@ class LlmBridge:
         message: str,
         image_urls: list[str] | None = None,
     ) -> AsyncIterator[str]:
-        # Wrap the whole stream in a single wall-clock deadline so a stalled
-        # provider can't pin the per-token concurrency lock indefinitely. Per-
-        # chunk timeouts are intentionally not enforced — that's the heartbeat's
-        # job at the HTTP layer.
+        # Streaming has TWO independent timeouts:
+        #   * Per-chunk idle (`self._timeout`): fires if no new chunk
+        #     arrives within N seconds. Catches the "provider just
+        #     stopped sending" failure mode.
+        #   * Total wall-clock (`self._total_stream_timeout`): caps the
+        #     whole response. Catches the "provider drip-feeds one
+        #     byte every (idle - ε) seconds" failure mode that the
+        #     per-chunk timeout alone can't see — without it a single
+        #     misbehaving call holds the per-token concurrency lock
+        #     for hours.
+        # Both fire as `RuntimeError("llm_timeout")` so the handler
+        # layer treats them identically.
         async def _runner() -> AsyncIterator[str]:
             unified_origin = f"webchat_gateway:{token_name}:{session_id}"
             provider_id = await self._context.get_current_chat_provider_id(
@@ -340,14 +367,12 @@ class LlmBridge:
             # CM persistence is owned by ConversationService.record_chat_pair
             # so partial-reply (incomplete) flows persist via the same path.
 
-        # Per-chunk idle timeout, NOT a total wall-clock budget. Streaming
-        # responses are explicitly unbounded in length (a search-augmented
-        # reply with 30 chunks of 5s each is fine, even though the total
-        # time exceeds `llm_timeout_seconds`); the only failure mode worth
-        # firing on is "no progress in too long". `self._timeout` is the
-        # max gap between consecutive chunks (and the max time before the
-        # first chunk). Non-streaming `generate_reply` retains its total
-        # wall-clock semantics — see asyncio.wait_for in that method.
+        # Combined idle + total-wall-clock timeout. Each iteration
+        # waits min(per_chunk_idle, remaining_total_budget). If the
+        # remaining total budget falls to <= 0 we raise immediately
+        # without entering another wait — covers the corner case
+        # where a chunk arrives just before the deadline and we'd
+        # otherwise loop once more.
         #
         # Persistent-pull pattern: a single in-flight `__anext__()` Task
         # is reused across iterations and shielded from `wait_for`
@@ -360,15 +385,44 @@ class LlmBridge:
         # it on the timeout path below before raising llm_timeout.
         agen = _runner()
         pull_task: asyncio.Task | None = None
+        loop = asyncio.get_running_loop()
+        stream_started_at = loop.time()
+        total_budget = self._total_stream_timeout
         try:
             while True:
                 if pull_task is None:
                     pull_task = asyncio.ensure_future(agen.__anext__())
+
+                # Compute the effective wait for this iteration.
+                if total_budget is not None:
+                    remaining = total_budget - (loop.time() - stream_started_at)
+                    if remaining <= 0:
+                        # Already past the total deadline. Cancel the
+                        # in-flight pull and surface timeout.
+                        pull_task.cancel()
+                        try:
+                            await pull_task
+                        except (
+                            asyncio.CancelledError,
+                            StopAsyncIteration,
+                            Exception,
+                        ):
+                            pass
+                        pull_task = None
+                        raise RuntimeError("llm_timeout")
+                    iter_timeout = (
+                        min(self._timeout, remaining)
+                        if self._timeout
+                        else remaining
+                    )
+                else:
+                    iter_timeout = self._timeout  # may be None
+
                 try:
-                    if self._timeout:
+                    if iter_timeout:
                         text = await asyncio.wait_for(
                             asyncio.shield(pull_task),
-                            timeout=self._timeout,
+                            timeout=iter_timeout,
                         )
                     else:
                         text = await pull_task

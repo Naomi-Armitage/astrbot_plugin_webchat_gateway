@@ -84,6 +84,12 @@
     "hint": "范围 5-600；超时返回错误并记录 audit 事件 llm_timeout。建议 30-120。",
     "default": 60
   },
+  "llm_stream_total_timeout_seconds": {
+    "type": "int",
+    "description": "流式 LLM 单次总超时（秒）",
+    "hint": "流式回复的总 wall-clock 上限。单 chunk 超时只能抓‘provider 停了’，捕不到‘每隔 (idle-ε) 秒挤一个字节’的拖延行为。0 表示使用默认（min(8 × llm_timeout_seconds, 600)），负值禁用总超时。范围 0-7200。",
+    "default": 0
+  },
   "persona_id": {
     "type": "string",
     "description": "WebChat 使用的人格 ID",

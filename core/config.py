@@ -192,6 +192,7 @@ class ConfigView:
     allow_missing_origin: bool
     master_admin_key: str
     llm_timeout_seconds: int
+    llm_stream_total_timeout_seconds: int
     site_name: str
     welcome_message: str
     show_github_link: bool
@@ -378,6 +379,17 @@ class ConfigView:
         llm_timeout = _clamp_int(
             _get(cfg, "llm_timeout_seconds"), default=60, lo=5, hi=600
         )
+        # Total stream timeout: 0 means "use the LlmBridge default
+        # (8× per-chunk, capped at 600s)"; negative disables. Clamp
+        # the positive range to 0..7200 so config typos can't strand
+        # a stream for hours.
+        raw_total = _get(cfg, "llm_stream_total_timeout_seconds", 0)
+        try:
+            llm_stream_total_timeout = int(raw_total)
+        except (TypeError, ValueError):
+            llm_stream_total_timeout = 0
+        if llm_stream_total_timeout > 7200:
+            llm_stream_total_timeout = 7200
         site_name = str(_get(cfg, "site_name") or "").strip()
         welcome_message = str(_get(cfg, "welcome_message") or "").strip()
         show_github_link = _parse_bool(_get(cfg, "show_github_link"), default=True)
@@ -524,6 +536,7 @@ class ConfigView:
             allow_missing_origin=allow_missing,
             master_admin_key=admin_key,
             llm_timeout_seconds=llm_timeout,
+            llm_stream_total_timeout_seconds=llm_stream_total_timeout,
             site_name=site_name,
             welcome_message=welcome_message,
             show_github_link=show_github_link,

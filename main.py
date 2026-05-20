@@ -139,6 +139,11 @@ class WebChatGatewayPlugin(Star):
                 history_turns=cfg.history_turns,
                 persona_id=cfg.persona_id,
                 timeout_seconds=cfg.llm_timeout_seconds,
+                total_stream_timeout_seconds=(
+                    cfg.llm_stream_total_timeout_seconds
+                    if cfg.llm_stream_total_timeout_seconds
+                    else None
+                ),
             )
 
             event_bus = EventBus()
