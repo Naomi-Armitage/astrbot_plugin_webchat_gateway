@@ -190,6 +190,7 @@ class WebChatGatewayPlugin(Star):
                     else None
                 ),
                 chat_provider_id=cfg.chat_provider_id,
+                chat_fallback_provider_id=cfg.chat_fallback_provider_id,
             )
 
             event_bus = EventBus()

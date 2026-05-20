@@ -673,14 +673,21 @@ class TestChatProviderId:
 @pytest.mark.asyncio
 class TestLlmBridgeProviderOverride:
     async def test_override_takes_precedence(self):
-        """When `chat_provider_id` is set in config, LlmBridge
-        returns it verbatim and skips the AstrBot context lookup —
-        which is the whole point of having the override."""
+        """When `chat_provider_id` is set in config AND the provider
+        still exists in the AstrBot context, LlmBridge returns it
+        verbatim and skips the global lookup — which is the whole
+        point of having the override."""
         from astrbot_plugin_webchat_gateway.core.llm_bridge import LlmBridge
 
         context_calls: list[str] = []
 
         class _Ctx:
+            def get_provider_by_id(self, provider_id):
+                # Override resolves to a live provider — return any
+                # truthy sentinel since the bridge only checks identity
+                # against None.
+                return object() if provider_id == "custom-llm" else None
+
             async def get_current_chat_provider_id(self, *, umo):
                 context_calls.append(umo)
                 return "fallback-provider"
@@ -694,13 +701,16 @@ class TestLlmBridgeProviderOverride:
         result = await bridge._resolve_provider_id(umo="webchat_gateway:alice:s1")
         assert result == "custom-llm"
         assert context_calls == [], (
-            "override should short-circuit before the AstrBot lookup"
+            "override should short-circuit before the global lookup"
         )
 
     async def test_no_override_falls_back_to_context(self):
         from astrbot_plugin_webchat_gateway.core.llm_bridge import LlmBridge
 
         class _Ctx:
+            def get_provider_by_id(self, provider_id):
+                return None  # nothing pinned, this should not be called
+
             async def get_current_chat_provider_id(self, *, umo):
                 return "astrbot-default"
 
@@ -720,6 +730,9 @@ class TestLlmBridgeProviderOverride:
         from astrbot_plugin_webchat_gateway.core.llm_bridge import LlmBridge
 
         class _Ctx:
+            def get_provider_by_id(self, provider_id):
+                return None
+
             async def get_current_chat_provider_id(self, *, umo):
                 return "astrbot-default"
 
@@ -731,6 +744,140 @@ class TestLlmBridgeProviderOverride:
         )
         result = await bridge._resolve_provider_id(umo="webchat_gateway:alice:s1")
         assert result == "astrbot-default"
+
+
+@pytest.mark.asyncio
+class TestLlmBridgeProviderFallback:
+    """Regression: configured primary / fallback / global chain.
+
+    Pinned `chat_provider_id` used to be returned verbatim with no
+    existence check, so a provider that got deleted / disabled /
+    renamed in AstrBot hard-failed every chat with
+    `chat_provider_not_configured` (502). The bridge now validates
+    via `context.get_provider_by_id` and steps down through the
+    `chat_fallback_provider_id` middle tier before landing on the
+    bot's global default. Each downward step warns once per
+    (provider_id, role) per process so log noise stays bounded.
+    """
+
+    async def test_primary_missing_falls_back_to_secondary(self, caplog):
+        from astrbot_plugin_webchat_gateway.core.llm_bridge import LlmBridge
+
+        global_calls: list[str] = []
+
+        class _Ctx:
+            def get_provider_by_id(self, provider_id):
+                # primary gone, fallback present
+                return object() if provider_id == "fb-provider" else None
+
+            async def get_current_chat_provider_id(self, *, umo):
+                global_calls.append(umo)
+                return "astrbot-global"
+
+        bridge = LlmBridge(
+            _Ctx(),
+            history_turns=4,
+            persona_id="",
+            chat_provider_id="primary-gone",
+            chat_fallback_provider_id="fb-provider",
+        )
+        with caplog.at_level("WARNING"):
+            result = await bridge._resolve_provider_id(
+                umo="webchat_gateway:alice:s1"
+            )
+        assert result == "fb-provider"
+        assert global_calls == [], (
+            "fallback resolved → must not consult the bot global"
+        )
+        # First miss for primary logs ONE warning carrying both fields.
+        primary_warnings = [
+            r for r in caplog.records
+            if "primary-gone" in r.getMessage() and "primary" in r.getMessage()
+        ]
+        assert len(primary_warnings) == 1
+
+    async def test_both_pinned_missing_falls_back_to_global(self, caplog):
+        from astrbot_plugin_webchat_gateway.core.llm_bridge import LlmBridge
+
+        class _Ctx:
+            def get_provider_by_id(self, provider_id):
+                return None  # neither pinned provider exists
+
+            async def get_current_chat_provider_id(self, *, umo):
+                return "astrbot-global"
+
+        bridge = LlmBridge(
+            _Ctx(),
+            history_turns=4,
+            persona_id="",
+            chat_provider_id="primary-gone",
+            chat_fallback_provider_id="fallback-gone",
+        )
+        with caplog.at_level("WARNING"):
+            result = await bridge._resolve_provider_id(
+                umo="webchat_gateway:alice:s1"
+            )
+        assert result == "astrbot-global"
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any("primary-gone" in m and "primary" in m for m in msgs)
+        assert any("fallback-gone" in m and "fallback" in m for m in msgs)
+
+    async def test_missing_provider_warning_is_logged_once(self, caplog):
+        """A misconfigured override that survives across many chats
+        should NOT spam one WARNING per request — `_resolve_provider_id`
+        runs per chat call. First miss per (id, role) logs; the rest
+        are silent."""
+        from astrbot_plugin_webchat_gateway.core.llm_bridge import LlmBridge
+
+        class _Ctx:
+            def get_provider_by_id(self, provider_id):
+                return None
+
+            async def get_current_chat_provider_id(self, *, umo):
+                return "astrbot-global"
+
+        bridge = LlmBridge(
+            _Ctx(),
+            history_turns=4,
+            persona_id="",
+            chat_provider_id="primary-gone",
+        )
+        with caplog.at_level("WARNING"):
+            for _ in range(5):
+                await bridge._resolve_provider_id(
+                    umo="webchat_gateway:alice:s1"
+                )
+        warns = [
+            r for r in caplog.records
+            if "primary-gone" in r.getMessage()
+        ]
+        assert len(warns) == 1, (
+            "configured-but-missing provider should warn ONCE per process, "
+            f"got {len(warns)} warnings across 5 chat calls"
+        )
+
+    async def test_all_missing_returns_none(self):
+        """When the pinned providers are gone AND the bot has no global
+        default wired either, `_resolve_provider_id` returns None and
+        the caller raises `chat_provider_not_configured`."""
+        from astrbot_plugin_webchat_gateway.core.llm_bridge import LlmBridge
+
+        class _Ctx:
+            def get_provider_by_id(self, provider_id):
+                return None
+
+            async def get_current_chat_provider_id(self, *, umo):
+                return None
+
+        bridge = LlmBridge(
+            _Ctx(),
+            history_turns=4,
+            persona_id="",
+            chat_provider_id="primary-gone",
+            chat_fallback_provider_id="fallback-gone",
+        )
+        result = await bridge._resolve_provider_id(umo="webchat_gateway:alice:s1")
+        assert result is None
 
 
 # ---------------------------------------------------------------------

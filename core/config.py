@@ -202,6 +202,7 @@ class ConfigView:
     auto_title_enabled: bool
     persona_id: str
     chat_provider_id: str
+    chat_fallback_provider_id: str
     default_daily_quota: int
     audit_retention_days: int
     ip_brute_force_max_fails: int
@@ -379,6 +380,9 @@ class ConfigView:
         auto_title = _parse_bool(_get(cfg, "auto_title_enabled"), default=True)
         persona = str(_get(cfg, "persona_id") or "").strip()
         chat_provider_id = str(_get(cfg, "chat_provider_id") or "").strip()
+        chat_fallback_provider_id = str(
+            _get(cfg, "chat_fallback_provider_id") or ""
+        ).strip()
         default_quota = _clamp_int(
             _get(cfg, "default_daily_quota"), default=200, lo=1, hi=1_000_000
         )
@@ -590,6 +594,7 @@ class ConfigView:
             auto_title_enabled=auto_title,
             persona_id=persona,
             chat_provider_id=chat_provider_id,
+            chat_fallback_provider_id=chat_fallback_provider_id,
             default_daily_quota=default_quota,
             audit_retention_days=audit_retention_days,
             ip_brute_force_max_fails=ip_max,

@@ -119,6 +119,16 @@ FIELDS: tuple[SettingField, ...] = (
         ),
     ),
     SettingField(
+        key="chat_fallback_provider_id",
+        section="对话行为",
+        type="string",
+        label="对话模型降级备选 (Fallback Provider ID)",
+        hint=(
+            "当主对话模型在 AstrBot 中被删除 / 禁用 / 改名后，自动降级使用此 "
+            "provider；备选也不可用时再回退到全局默认。留空表示不配置中间一级。"
+        ),
+    ),
+    SettingField(
         key="max_message_length",
         section="对话行为",
         type="int",

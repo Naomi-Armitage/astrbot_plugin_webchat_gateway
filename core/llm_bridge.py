@@ -59,18 +59,36 @@ class LlmBridge:
         timeout_seconds: float = 60.0,
         total_stream_timeout_seconds: float | None = None,
         chat_provider_id: str = "",
+        chat_fallback_provider_id: str = "",
     ) -> None:
         self._context = context
         self._history_turns = max(0, history_turns)
         self._persona_id_cfg = (persona_id or "").strip()
         # Operator-pinned chat provider override. When non-empty,
-        # ``_resolve_provider_id`` returns this verbatim instead of
-        # asking AstrBot which provider is "current" — useful for
-        # deployments where the WebChat plugin needs to target a
-        # specific model independent of the bot's global default
-        # (e.g. cheaper model for chat, GPT-Image-1 still set as the
-        # global). Empty string keeps the legacy fallback behaviour.
+        # ``_resolve_provider_id`` returns this verbatim (subject to the
+        # existence check below) instead of asking AstrBot which
+        # provider is "current" — useful for deployments where the
+        # WebChat plugin needs to target a specific model independent
+        # of the bot's global default (e.g. cheaper model for chat,
+        # GPT-Image-1 still set as the global). Empty string keeps the
+        # legacy fallback behaviour.
         self._chat_provider_override = (chat_provider_id or "").strip()
+        # Mid-tier safety net: when the operator's pinned provider has
+        # been removed / disabled / renamed in AstrBot, we'd otherwise
+        # hard-fail every chat with `chat_provider_not_configured`.
+        # Configuring a fallback here lets the bridge step down ONE
+        # level before falling all the way back to the bot's global
+        # default. Empty string disables the middle tier (legacy
+        # two-step chain: pinned → global).
+        self._chat_provider_fallback = (chat_fallback_provider_id or "").strip()
+        # Process-lifetime memo of "provider X (in role Y) was missing
+        # at lookup time". `_resolve_provider_id` runs per chat call;
+        # without this, every call after the configured provider
+        # vanishes would emit a fresh WARNING line — eventually the
+        # operator stops noticing. First miss per (id, role) logs at
+        # WARNING; subsequent misses are silent so the log stays
+        # readable.
+        self._missing_provider_warned: set[tuple[str, str]] = set()
         self._timeout = float(timeout_seconds) if timeout_seconds else None
         # Total wall-clock budget for streaming responses. Without this,
         # a misbehaving provider that emits one byte every (per-chunk
@@ -95,16 +113,62 @@ class LlmBridge:
     async def _resolve_provider_id(self, *, umo: str) -> str | None:
         """Return the chat provider id to use for ``umo``.
 
-        Operator-pinned override (``chat_provider_id`` config) wins
-        when set — it's the whole point of having the override. Empty
-        string / not set → fall back to AstrBot's
-        ``get_current_chat_provider_id``, which respects the bot's
-        global default. Returning None means no provider is wired
-        at all; callers raise ``chat_provider_not_configured``.
+        Three-tier resolution chain — first viable wins:
+
+          1. ``chat_provider_id`` (operator-pinned). Used if set AND
+             the id still resolves to a live provider.
+          2. ``chat_fallback_provider_id`` (operator-pinned mid-tier
+             safety net). Used if set AND the primary either wasn't
+             set or has disappeared AND the fallback id resolves to
+             a live provider.
+          3. AstrBot's ``get_current_chat_provider_id`` (bot global).
+             Always tried last so a deployment whose primary +
+             fallback have both vanished still serves /chat instead
+             of hard-failing every request with
+             ``chat_provider_not_configured``.
+
+        Each downward step emits ONE warning per (provider_id, role)
+        per process lifetime so operators see the configuration drift
+        without the log flooding on every chat call. Returning ``None``
+        means even the global default isn't wired — callers raise
+        ``chat_provider_not_configured``.
         """
         if self._chat_provider_override:
-            return self._chat_provider_override
+            if self._context.get_provider_by_id(
+                self._chat_provider_override
+            ) is not None:
+                return self._chat_provider_override
+            self._warn_provider_missing(
+                self._chat_provider_override, role="primary"
+            )
+        if self._chat_provider_fallback:
+            if self._context.get_provider_by_id(
+                self._chat_provider_fallback
+            ) is not None:
+                return self._chat_provider_fallback
+            self._warn_provider_missing(
+                self._chat_provider_fallback, role="fallback"
+            )
         return await self._context.get_current_chat_provider_id(umo=umo)
+
+    def _warn_provider_missing(self, provider_id: str, *, role: str) -> None:
+        """Log once-per-process that a configured provider can't be
+        resolved. Per-(id, role) memoisation: the bridge runs the
+        chain on every chat call, so without dedup a missing provider
+        spams a WARNING line per request and operators stop noticing.
+        First occurrence logs at WARNING with both fields so an alert
+        rule can pin them; subsequent occurrences are silent.
+        """
+        key = (provider_id, role)
+        if key in self._missing_provider_warned:
+            return
+        self._missing_provider_warned.add(key)
+        logger.warning(
+            "[WebChatGateway] configured %s chat provider not found, "
+            "falling back: provider_id=%s",
+            role,
+            provider_id,
+        )
 
     async def _resolve_persona(self) -> tuple[str | None, str | None]:
         if self._persona_cache is not None:

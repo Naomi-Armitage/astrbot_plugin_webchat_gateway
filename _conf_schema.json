@@ -110,6 +110,13 @@
     "default": "",
     "_special": "select_provider"
   },
+  "chat_fallback_provider_id": {
+    "type": "string",
+    "description": "对话模型降级备选 (Fallback Provider ID)",
+    "hint": "当上面那个 provider 在 AstrBot 中被删除 / 禁用 / 改名后，自动降级使用此 provider；如果备选也不可用，最终回退到 AstrBot 全局当前对话模型。留空表示不配置中间一级（直接跳到全局默认）。可从下拉选择。",
+    "default": "",
+    "_special": "select_provider"
+  },
   "default_daily_quota": {
     "type": "int",
     "description": "签发新 Token 时默认每日配额",
