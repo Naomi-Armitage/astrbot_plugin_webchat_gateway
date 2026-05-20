@@ -2,6 +2,7 @@ import {
   LS_TOKEN,
   LS_FAMILY,
   $,
+  applySiteIcon,
   modeFromTheme,
   paintBrowserChrome,
   reloadIOSChromeOnce,
@@ -2876,6 +2877,7 @@ async function loadChatSite(): Promise<void> {
     const name = (data.site_name || "").trim() || "WebChat Gateway";
     document.title = `${name} · Chat`;
     $("brandName").textContent = name;
+    applySiteIcon((data as SiteConfig).site_icon_url || "");
     const family = data.theme_family === "classic" ? "classic" : "notebook";
     if (localStorage.getItem(LS_FAMILY) === family) return;
     try { localStorage.setItem(LS_FAMILY, family); } catch {}

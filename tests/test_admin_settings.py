@@ -46,18 +46,74 @@ class TestFieldsAndBlacklist:
         from astrbot_plugin_webchat_gateway.core.settings_schema import BLACKLIST
 
         # Explicit per-key assertions so a missing member surfaces with a
-        # readable failure message (vs a single set-diff dump).
+        # readable failure message (vs a single set-diff dump). The
+        # canonical blacklist shrank in the "move everything possible
+        # into the web UI" pass — only true boot-time essentials remain.
         assert "host" in BLACKLIST
         assert "port" in BLACKLIST
         assert "master_admin_key" in BLACKLIST
         assert "endpoint_prefix" in BLACKLIST
+        assert "admin_ui_path" in BLACKLIST
         assert "storage.driver" in BLACKLIST
         assert "storage.sqlite_path" in BLACKLIST
         assert "storage.mysql_dsn" in BLACKLIST
-        assert "uploads.storage_driver" in BLACKLIST
-        assert "streaming.redis_dsn" in BLACKLIST
-        assert "uploads.r2.access_key_id" in BLACKLIST
-        assert "uploads.r2.secret_access_key" in BLACKLIST
+        assert "storage.mysql_pool_max" in BLACKLIST
+
+    def test_promoted_keys_are_no_longer_blacklisted(self):
+        """The following used to live in BLACKLIST and are now in the
+        whitelist (admin-editable, restart-to-apply). Pin the move so
+        a future refactor doesn't quietly re-blacklist them."""
+        from astrbot_plugin_webchat_gateway.core.settings_schema import (
+            BLACKLIST,
+            field_for_key,
+        )
+
+        promoted = [
+            "persona_id",
+            "streaming.redis_dsn",
+            "uploads.storage_driver",
+            "uploads.local_path",
+            "uploads.r2.account_id",
+            "uploads.r2.access_key_id",
+            "uploads.r2.secret_access_key",
+            "uploads.r2.bucket",
+            "uploads.r2.endpoint",
+            "site_icon_url",
+        ]
+        for key in promoted:
+            assert key not in BLACKLIST, (
+                f"{key!r} is supposed to be editable via /admin/settings now"
+            )
+            assert field_for_key(key) is not None, (
+                f"{key!r} promoted out of BLACKLIST but missing from FIELDS"
+            )
+
+    def test_secret_fields_marked(self):
+        """R2 credentials must carry secret=True so the UI renders them
+        as password inputs (and a future audit-log scrubber knows to
+        treat them as sensitive)."""
+        from astrbot_plugin_webchat_gateway.core.settings_schema import (
+            field_for_key,
+        )
+
+        assert field_for_key("uploads.r2.access_key_id").secret is True
+        assert field_for_key("uploads.r2.secret_access_key").secret is True
+        # Non-secret strings stay secret=False (default).
+        assert field_for_key("site_name").secret is False
+
+    def test_every_field_has_chinese_label(self):
+        """Spec says all field labels go Chinese — a missing or
+        ASCII-only label means a stale field was added without
+        following the convention."""
+        import re
+
+        from astrbot_plugin_webchat_gateway.core.settings_schema import FIELDS
+
+        for f in FIELDS:
+            assert f.label, f"{f.key!r} missing label"
+            assert re.search(r"[一-鿿]", f.label), (
+                f"{f.key!r} label {f.label!r} has no Chinese characters"
+            )
 
 
 class TestFieldForKey:

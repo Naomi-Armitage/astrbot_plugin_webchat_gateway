@@ -29,6 +29,7 @@ class SiteDeps:
     welcome_message: str
     show_github_link: bool
     privacy_url: str
+    site_icon_url: str
     theme_family: str
     allowed_origins: set[str]
     trust_referer_as_origin: bool
@@ -51,6 +52,7 @@ def make_site_handlers(deps: SiteDeps):
         "welcome_message": deps.welcome_message,
         "show_github_link": deps.show_github_link,
         "privacy_url": deps.privacy_url,
+        "site_icon_url": deps.site_icon_url,
         "theme_family": deps.theme_family,
         "uploads": {
             "enabled": deps.uploads_enabled,

@@ -8,6 +8,13 @@ Two flavors of refusal collapse to the same wire code so the admin UI
 doesn't need branching logic AND so the blacklist isn't leaked: both
 "never heard of this key" and "known but sensitive" return 400
 ``unknown_field``.
+
+Every `SettingField` carries a human-readable Chinese ``label`` so the
+admin UI shows "站点名称" instead of "site_name". Boolean ``secret``
+marks credentials (R2 keys, etc.) so the frontend can render
+``<input type="password">`` and not leave the value sitting in the DOM
+as plain text. The actual value is still returned in the GET payload —
+operators on this endpoint are already authenticated.
 """
 
 from __future__ import annotations
@@ -30,107 +37,140 @@ class SettingField:
     key: str
     section: str
     type: str  # "string" | "int" | "bool" | "options" | "csv"
+    label: str = ""  # Human-readable Chinese label rendered by the UI
     restart_required: bool = True
     min: int | None = None
     max: int | None = None
     options: tuple[str, ...] = ()
     hint: str = ""
+    secret: bool = False  # Render as password input in the UI
 
 
 # Whitelist. Sections in stable order; fields in spec-table order
 # within each section. Hint strings mirror `_conf_schema.json` so the
 # operator sees the same copy in admin UI as in the AstrBot sidebar.
 FIELDS: tuple[SettingField, ...] = (
-    # --- Branding -----------------------------------------------------------
+    # --- 站点信息 -----------------------------------------------------------
     SettingField(
         key="site_name",
-        section="Branding",
+        section="站点信息",
         type="string",
+        label="站点名称",
         hint="留空则使用默认 WebChat Gateway。",
     ),
     SettingField(
-        key="welcome_message",
-        section="Branding",
+        key="site_icon_url",
+        section="站点信息",
         type="string",
+        label="站点图标 / Favicon",
+        hint=(
+            "落地页、聊天页、管理页 favicon 与右上角图标。支持 http(s):// 完整 URL "
+            "或 /path 形式的同源路径；留空则使用默认气泡 SVG。"
+        ),
+    ),
+    SettingField(
+        key="welcome_message",
+        section="站点信息",
+        type="string",
+        label="落地页欢迎语",
         hint="可选；空则隐藏。建议 1-2 行简短文本，会显示在首页 hero 区。",
     ),
     SettingField(
         key="show_github_link",
-        section="Branding",
+        section="站点信息",
         type="bool",
+        label="显示 GitHub 链接",
         hint="私密部署可关闭，避免暴露项目来源。",
     ),
     SettingField(
         key="privacy_url",
-        section="Branding",
+        section="站点信息",
         type="string",
-        hint="落地页页脚显示；空则隐藏。",
+        label="隐私声明链接",
+        hint="落地页页脚显示；空则隐藏。支持 http(s):// 完整 URL 或 /path。",
     ),
     SettingField(
         key="theme_family",
-        section="Branding",
+        section="站点信息",
         type="options",
+        label="视觉主题",
         options=("notebook", "classic"),
         hint="classic = 经典 GitHub 风（默认），notebook = 手写笔记本风。",
     ),
-    # --- Behaviour ----------------------------------------------------------
+    # --- 对话行为 -----------------------------------------------------------
+    SettingField(
+        key="persona_id",
+        section="对话行为",
+        type="string",
+        label="LLM 人格 ID",
+        hint=(
+            "WebChat 使用的人格。粘贴已在 AstrBot 中配置的人格 ID；留空则使用"
+            "默认人格。修改后需重启服务才会读取新的人格定义。"
+        ),
+    ),
     SettingField(
         key="max_message_length",
-        section="Behaviour",
+        section="对话行为",
         type="int",
+        label="单条消息最大字符数",
         min=16,
         max=200_000,
         hint="超过此长度返回 400 message_too_long，防止 prompt 炸弹。",
     ),
     SettingField(
         key="history_turns",
-        section="Behaviour",
+        section="对话行为",
         type="int",
+        label="上下文保留轮数",
         min=0,
         max=50,
         hint="每次请求携带最近 N 轮历史，建议 4-12。",
     ),
     SettingField(
         key="auto_title_enabled",
-        section="Behaviour",
+        section="对话行为",
         type="bool",
+        label="启用自动生成会话标题",
         hint=(
             "若关闭，POST /api/webchat/title 直接返回 503 title_disabled。"
-            "前端会保持自动生成的“新会话”标题，用户仍可手动重命名。"
+            "前端会保持“新会话”标题，用户仍可手动重命名。"
         ),
     ),
     SettingField(
         key="llm_timeout_seconds",
-        section="Behaviour",
+        section="对话行为",
         type="int",
+        label="LLM 调用超时(秒)",
         min=5,
         max=600,
         hint="范围 5-600；超时返回错误并记录 audit 事件 llm_timeout。建议 30-120。",
     ),
     SettingField(
         key="llm_stream_total_timeout_seconds",
-        section="Behaviour",
+        section="对话行为",
         type="int",
+        label="流式总超时(秒)",
         min=0,
         max=7200,
         hint=(
             "流式回复的总 wall-clock 上限。0 表示使用默认"
-            "（min(8 × llm_timeout_seconds, 600)），负值禁用总超时；"
-            "UI 夹紧到 0-7200。"
+            "（min(8 × LLM 调用超时, 600)），范围 0-7200。"
         ),
     ),
     SettingField(
         key="default_daily_quota",
-        section="Behaviour",
+        section="对话行为",
         type="int",
+        label="默认每日配额",
         min=1,
         max=1_000_000,
         hint="签发新 Token 时默认每日配额。范围 1-1000000。",
     ),
     SettingField(
         key="audit_retention_days",
-        section="Behaviour",
+        section="对话行为",
         type="int",
+        label="审计日志保留天数",
         restart_required=False,
         min=1,
         max=3650,
@@ -139,33 +179,37 @@ FIELDS: tuple[SettingField, ...] = (
             "范围 1-3650，默认 7 天。修改后下一次清理迭代生效，无需重启。"
         ),
     ),
-    # --- Security -----------------------------------------------------------
+    # --- 安全 ---------------------------------------------------------------
     SettingField(
         key="allowed_origins",
-        section="Security",
+        section="安全",
         type="csv",
+        label="允许的网页来源(CORS)",
         hint="* 允许任意；或逗号分隔列表，如 http://localhost:1234,https://chat.example.com",
     ),
     SettingField(
         key="ip_brute_force_max_fails",
-        section="Security",
+        section="安全",
         type="int",
+        label="同 IP 失败封禁阈值",
         min=0,
         max=10_000,
         hint="防爆破阈值，0 表示禁用。",
     ),
     SettingField(
         key="ip_brute_force_block_seconds",
-        section="Security",
+        section="安全",
         type="int",
+        label="封禁时长(秒)",
         min=1,
         max=2_592_000,
         hint="触发封禁阈值后封禁该 IP 的持续时长，单位秒（默认 900 = 15 分钟）。",
     ),
     SettingField(
         key="trust_forwarded_for",
-        section="Security",
+        section="安全",
         type="bool",
+        label="信任 X-Forwarded-For",
         hint=(
             "仅当 AstrBot 部署在可信反向代理（Nginx/Caddy/Cloudflare）之后启用，"
             "否则攻击者可伪造 IP 绕过防爆破。"
@@ -173,8 +217,9 @@ FIELDS: tuple[SettingField, ...] = (
     ),
     SettingField(
         key="trust_referer_as_origin",
-        section="Security",
+        section="安全",
         type="bool",
+        label="缺 Origin 时回退 Referer",
         hint=(
             "默认关闭。开启后会削弱 Origin 白名单作为 CSRF 防护的强度"
             "（隐私模式或 no-referrer 策略下可绕过），仅在你了解风险并需要"
@@ -183,19 +228,32 @@ FIELDS: tuple[SettingField, ...] = (
     ),
     SettingField(
         key="allow_missing_origin",
-        section="Security",
+        section="安全",
         type="bool",
+        label="允许缺 Origin / Referer",
         hint=(
             "若为 false（默认），未携带 Origin / Referer 头的请求被视为违规，"
             "防止 curl/服务端脚本绕过 allow_origins。"
             "仅在你明确需要让非浏览器客户端访问 API 时打开。"
         ),
     ),
-    # --- Streaming ----------------------------------------------------------
+    # --- 流式缓冲 -----------------------------------------------------------
+    SettingField(
+        key="streaming.redis_dsn",
+        section="流式缓冲",
+        type="string",
+        label="Redis 连接串(可选)",
+        hint=(
+            "格式 redis://:password@host:port/db 或 rediss://...（TLS）；留空使用"
+            "内存缓冲。AstrBot 单进程部署留空即可，多实例或希望跨插件重启保留"
+            "in-flight 缓冲再配置。"
+        ),
+    ),
     SettingField(
         key="streaming.grace_seconds",
-        section="Streaming",
+        section="流式缓冲",
         type="int",
+        label="流终态缓冲秒数",
         min=5,
         max=300,
         hint=(
@@ -205,8 +263,9 @@ FIELDS: tuple[SettingField, ...] = (
     ),
     SettingField(
         key="streaming.max_per_token",
-        section="Streaming",
+        section="流式缓冲",
         type="int",
+        label="单 Token 缓冲上限",
         min=1,
         max=10,
         hint=(
@@ -216,8 +275,9 @@ FIELDS: tuple[SettingField, ...] = (
     ),
     SettingField(
         key="streaming.max_global",
-        section="Streaming",
+        section="流式缓冲",
         type="int",
+        label="全局缓冲上限",
         min=10,
         max=10_000,
         hint=(
@@ -225,44 +285,71 @@ FIELDS: tuple[SettingField, ...] = (
             "若全部仍活跃则拒绝新流。默认 200，范围 10-10000。"
         ),
     ),
-    # --- Uploads ------------------------------------------------------------
+    # --- 图片上传 -----------------------------------------------------------
     SettingField(
         key="uploads.enabled",
-        section="Uploads",
+        section="图片上传",
         type="bool",
+        label="启用图片上传",
         hint="关闭后上传接口直接拒绝，前端附件按钮也会变灰。",
     ),
     SettingField(
+        key="uploads.storage_driver",
+        section="图片上传",
+        type="options",
+        label="存储驱动",
+        options=("local", "r2"),
+        hint=(
+            "local 写入本地磁盘（默认，零配置）；r2 写入 Cloudflare R2，"
+            "需要安装 aiobotocore 并填写下面的 R2 凭证。切换后重启即可。"
+        ),
+    ),
+    SettingField(
+        key="uploads.local_path",
+        section="图片上传",
+        type="string",
+        label="本地存储根目录",
+        hint=(
+            "留空则使用 AstrBot 标准插件数据目录 data/plugin_data/"
+            "astrbot_plugin_webchat_gateway/webchat_uploads；填写绝对路径或"
+            "以 AstrBot 工作目录为基准的相对路径可自定义位置。"
+        ),
+    ),
+    SettingField(
         key="uploads.max_file_size_mb",
-        section="Uploads",
+        section="图片上传",
         type="int",
+        label="单文件最大 MB",
         min=1,
         max=200,
         hint="超过会返回 413 payload_too_large。建议 5-50，默认 20。",
     ),
     SettingField(
         key="uploads.per_token_storage_mb",
-        section="Uploads",
+        section="图片上传",
         type="int",
+        label="单 Token 累计存储 MB",
         min=1,
         max=1_000_000,
         hint=(
-            "已提交（committed）文件总大小达到该阈值后，新上传返回 429 "
-            "storage_quota_exceeded。未提交的临时文件不计入，由 GC 在 1 小时后清理。"
+            "已提交文件总大小达到该阈值后，新上传返回 429 "
+            "storage_quota_exceeded。未提交临时文件不计入。"
         ),
     ),
     SettingField(
         key="uploads.max_attachments_per_message",
-        section="Uploads",
+        section="图片上传",
         type="int",
+        label="单条消息最多附件数",
         min=1,
         max=16,
         hint="超过会返回 400 too_many_attachments。建议 1-8，默认 4 与主流 LLM 对齐。",
     ),
     SettingField(
         key="uploads.allowed_mime",
-        section="Uploads",
+        section="图片上传",
         type="csv",
+        label="允许的 MIME 类型",
         hint=(
             "默认 image/jpeg,image/png,image/webp,image/gif。"
             "不要包含 image/svg+xml（XSS）或 image/avif（解码器兼容性差）。"
@@ -270,27 +357,29 @@ FIELDS: tuple[SettingField, ...] = (
     ),
     SettingField(
         key="uploads.r2.serving_mode",
-        section="Uploads",
+        section="图片上传",
         type="options",
+        label="R2 下发模式",
         options=("proxy", "direct"),
         hint=(
-            "proxy（默认）= 走插件代理读 R2，下行带宽算自己服务器，但对国内"
-            "用户更快；direct = 302 跳转到 R2 预签名 URL，节省带宽但走 "
-            "Cloudflare 边缘。"
+            "proxy（默认）= 走插件代理读 R2；direct = 302 跳转到 R2 预签名 URL，"
+            "节省带宽但走 Cloudflare 边缘。"
         ),
     ),
     SettingField(
         key="uploads.r2.direct_link_ttl_seconds",
-        section="Uploads",
+        section="图片上传",
         type="int",
+        label="R2 direct 链接有效期(秒)",
         min=30,
         max=3600,
         hint="仅当 serving_mode=direct 时生效。30-3600，默认 300（5 分钟）。",
     ),
     SettingField(
         key="uploads.r2.cache_size_mb",
-        section="Uploads",
+        section="图片上传",
         type="int",
+        label="R2 本地缓存 MB",
         min=10,
         max=100_000,
         hint=(
@@ -298,12 +387,60 @@ FIELDS: tuple[SettingField, ...] = (
             "LRU 淘汰，默认 200。"
         ),
     ),
+    SettingField(
+        key="uploads.r2.account_id",
+        section="图片上传",
+        type="string",
+        label="R2 账户 ID",
+        hint="Cloudflare dashboard → R2 → Overview 顶部可见。仅当 storage_driver=r2 必填。",
+    ),
+    SettingField(
+        key="uploads.r2.bucket",
+        section="图片上传",
+        type="string",
+        label="R2 存储桶名称",
+        hint="建议为本插件单独建一个 bucket，与其他业务隔离。",
+    ),
+    SettingField(
+        key="uploads.r2.endpoint",
+        section="图片上传",
+        type="string",
+        label="R2 端点 URL",
+        hint="形如 https://<account_id>.r2.cloudflarestorage.com，可在 bucket settings 查看。",
+    ),
+    SettingField(
+        key="uploads.r2.access_key_id",
+        section="图片上传",
+        type="string",
+        label="R2 访问密钥 ID",
+        secret=True,
+        hint="R2 → Manage R2 API Tokens 创建后获取。仅授予该 bucket 的 Read & Write 权限。",
+    ),
+    SettingField(
+        key="uploads.r2.secret_access_key",
+        section="图片上传",
+        type="string",
+        label="R2 访问密钥 Secret",
+        secret=True,
+        hint="创建 token 时一次性显示，请妥善保存。请勿提交到代码仓库。",
+    ),
 )
 
 
 # Known but refused. Distinguishing this from "truly unknown" is useful
 # internally (debugging) but we deliberately collapse to the same
 # response code so the wire doesn't disclose which keys exist.
+#
+# Shrunk to bare-minimum boot-time essentials:
+#   * host/port — network binding, changing them would invalidate the
+#     very endpoint accepting the change.
+#   * endpoint_prefix / admin_ui_path — URL routing for the admin
+#     panel itself; circular dependency if changed via the panel.
+#   * master_admin_key — auth credential for the panel itself; changing
+#     it via the panel would lock the current session out and is best
+#     done via the AstrBot sidebar with the legacy key visible.
+#   * storage.* — schema migration risks (switching driver, moving
+#     sqlite_path) need an offline tool, not a live config swap.
 BLACKLIST: frozenset[str] = frozenset(
     {
         "host",
@@ -311,19 +448,10 @@ BLACKLIST: frozenset[str] = frozenset(
         "endpoint_prefix",
         "admin_ui_path",
         "master_admin_key",
-        "persona_id",
         "storage.driver",
         "storage.sqlite_path",
         "storage.mysql_dsn",
         "storage.mysql_pool_max",
-        "streaming.redis_dsn",
-        "uploads.storage_driver",
-        "uploads.local_path",
-        "uploads.r2.account_id",
-        "uploads.r2.access_key_id",
-        "uploads.r2.secret_access_key",
-        "uploads.r2.bucket",
-        "uploads.r2.endpoint",
     }
 )
 

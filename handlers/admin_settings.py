@@ -89,11 +89,13 @@ async def _read_json(request: web.Request) -> dict:
 def _field_payload(spec: SettingField, value: Any) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "key": spec.key,
+        "label": spec.label or spec.key,
         "section": spec.section,
         "type": spec.type,
         "value": value,
         "hint": spec.hint,
         "restart_required": spec.restart_required,
+        "secret": spec.secret,
     }
     if spec.type == "int":
         payload["min"] = spec.min

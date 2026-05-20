@@ -47,6 +47,12 @@
     "hint": "落地页页脚显示；空则隐藏。",
     "default": ""
   },
+  "site_icon_url": {
+    "type": "string",
+    "description": "站点图标 / Favicon",
+    "hint": "落地页、聊天页、管理页 favicon 与右上角图标。支持 http(s):// 完整 URL 或 /path 形式的同源路径；留空则使用默认气泡 SVG。",
+    "default": ""
+  },
   "theme_family": {
     "type": "string",
     "description": "落地页与聊天页视觉主题",

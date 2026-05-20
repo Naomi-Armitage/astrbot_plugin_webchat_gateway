@@ -262,6 +262,7 @@ def build_app(deps: ServerDeps) -> web.Application:
             welcome_message=cfg.welcome_message,
             show_github_link=cfg.show_github_link,
             privacy_url=cfg.privacy_url,
+            site_icon_url=cfg.site_icon_url,
             theme_family=cfg.theme_family,
             allowed_origins=cfg.allowed_origins,
             trust_referer_as_origin=deps.chat.trust_referer_as_origin,

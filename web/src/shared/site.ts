@@ -3,6 +3,7 @@ export interface SiteConfig {
   welcome_message?: string;
   show_github_link?: boolean;
   privacy_url?: string;
+  site_icon_url?: string;
   theme_family?: string;
 }
 
@@ -31,6 +32,37 @@ export const $ = <T extends Element = HTMLElement>(id: string): T => {
 // a self-typoed privacy_url a redirection foothold even though the
 // schemes look safe.
 export const HREF_OK = /^(?:https?:\/\/|\/(?!\/))/i;
+
+// Apply operator-configured favicon + brand-mark icon. When the URL is
+// empty / malformed, the default SVG already in markup stays put.
+export function applySiteIcon(rawUrl: string): void {
+  const url = (rawUrl || "").trim();
+  if (!url || !HREF_OK.test(url)) return;
+  // <link rel="icon"> — appended (or replaced) on the document head so
+  // the browser tab favicon picks up the operator's image.
+  let icon = document.querySelector<HTMLLinkElement>('link[rel="icon"]');
+  if (!icon) {
+    icon = document.createElement("link");
+    icon.rel = "icon";
+    document.head.appendChild(icon);
+  }
+  icon.href = url;
+  // In-page brand mark — every page renders a `.brand-mark` span with an
+  // inline SVG by default. Swap the SVG out for an <img> when an icon
+  // URL is configured so the operator's logo appears in the header.
+  document.querySelectorAll<HTMLElement>(".brand-mark").forEach((mark) => {
+    mark.innerHTML = "";
+    const img = document.createElement("img");
+    img.src = url;
+    img.alt = "";
+    img.decoding = "async";
+    img.loading = "eager";
+    img.style.width = "100%";
+    img.style.height = "100%";
+    img.style.objectFit = "contain";
+    mark.appendChild(img);
+  });
+}
 
 export function resolveTheme(family: string, mode: "light" | "dark"): string {
   if (family === "classic") return mode === "dark" ? "classic-dark" : "classic-light";
@@ -99,6 +131,7 @@ export async function loadSite(): Promise<void> {
     if (data.show_github_link) {
       $("githubLink").hidden = false;
     }
+    applySiteIcon(data.site_icon_url || "");
     const privacy = (data.privacy_url || "").trim();
     if (privacy && HREF_OK.test(privacy)) {
       const a = $<HTMLAnchorElement>("privacyLink");

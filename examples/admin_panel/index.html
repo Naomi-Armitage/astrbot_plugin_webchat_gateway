@@ -30,11 +30,23 @@
         --good: #3fb950;
         --warn: #d29922;
         --bad: #f85149;
+        /* Handwriting cascade matches the landing / login / chat
+           pages' --font-display, with kaiti additions so Chinese
+           characters render in handwriting too. Without the kaiti
+           fallbacks, Chinese glyphs drop through to system-ui and
+           the page reads as mixed handwriting (Latin) + sans (CJK).
+           "楷体" works on Windows; "Kaiti SC" / "STKaiti" on macOS;
+           "KaiTi" generic — all are CJK-handwriting. */
+        --font-handwriting:
+          "Comic Sans MS", "Comic Neue", "Chalkboard SE", "Marker Felt",
+          "Kaiti SC", "STKaiti", "KaiTi", "楷体", "楷体_GB2312",
+          system-ui, -apple-system, "Segoe UI", "PingFang SC",
+          "Microsoft YaHei", Roboto, sans-serif;
       }
       * { box-sizing: border-box; }
       body {
         margin: 0;
-        font: 14px/1.55 "Comic Sans MS", "Comic Neue", "Chalkboard SE", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+        font: 14px/1.55 var(--font-handwriting);
         background: var(--bg);
         color: var(--text);
         -webkit-font-smoothing: antialiased;
@@ -261,7 +273,7 @@
         color: var(--warn);
         display: block;
         margin-bottom: 6px;
-        font-family: "Comic Sans MS", "Comic Neue", "Chalkboard SE", system-ui, sans-serif;
+        font-family: var(--font-handwriting);
         font-weight: 600;
         font-size: 12px;
       }
@@ -619,12 +631,20 @@
         gap: 12px;
       }
       .settings-group h3 {
+        /* Section headings are Chinese now (站点信息 / 对话行为 / …),
+           so the uppercase + letter-spacing treatment that suited
+           Latin headings makes the Chinese glyphs look spaced-out
+           and weird. Drop both, raise size, lean into the handwriting
+           cascade so the heading reads as a hand-written section
+           marker — matching the notebook-style vibe of the rest of
+           the panel. */
         margin: 0;
-        font-size: 11px;
-        color: var(--muted);
-        text-transform: uppercase;
-        letter-spacing: 0.08em;
+        font-size: 16px;
         font-weight: 600;
+        font-family: var(--font-handwriting);
+        color: var(--text);
+        letter-spacing: 0;
+        text-transform: none;
       }
       .settings-fields {
         display: grid;
@@ -643,22 +663,26 @@
         display: flex;
         align-items: center;
         gap: 8px;
-        font-size: 11px;
-        color: var(--muted);
-        font-weight: 500;
-        letter-spacing: 0.02em;
+        font-family: var(--font-handwriting);
+        font-size: 14px;
+        color: var(--text);
+        font-weight: 600;
+        letter-spacing: 0;
       }
       .settings-field label.field-label .key {
-        font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-        font-size: 11px;
-        color: var(--text);
-        font-weight: 500;
+        /* Inherit handwriting + size from the label; the dotted-path
+           key isn't shown anymore (the Chinese label replaced it),
+           but the span survives for the dirty-dot anchor. */
+        font: inherit;
+        color: inherit;
+        font-weight: inherit;
       }
       .settings-field label.field-label .badge {
         font-size: 10px;
         padding: 1px 7px;
       }
       .settings-field input[type="text"],
+      .settings-field input[type="password"],
       .settings-field input[type="number"],
       .settings-field textarea,
       .settings-field select {
@@ -667,7 +691,13 @@
         color: var(--text);
         border: 1px solid var(--border);
         border-radius: 7px;
-        font: inherit;
+        /* Pin handwriting + CJK-kaiti directly so input UA defaults
+           don't strip the body font. font-size at 14px matches the
+           body so a "label / input" pair reads as one consistent
+           handwritten row. */
+        font-family: var(--font-handwriting);
+        font-size: 14px;
+        line-height: 1.4;
         width: 100%;
       }
       .settings-field textarea {
@@ -686,6 +716,43 @@
       .settings-field.dirty select {
         border-color: var(--accent);
       }
+      .settings-field.dirty label.field-label::after {
+        /* Subtle dot so an operator scanning the form can spot which
+           rows they touched without relying on the border-color. */
+        content: "";
+        width: 6px;
+        height: 6px;
+        background: var(--accent);
+        border-radius: 50%;
+        margin-left: 4px;
+      }
+      .settings-field .secret-row {
+        position: relative;
+        display: flex;
+        align-items: center;
+        gap: 0;
+      }
+      .settings-field .secret-row input {
+        padding-right: 56px;
+      }
+      .settings-field .secret-toggle {
+        position: absolute;
+        right: 6px;
+        top: 50%;
+        transform: translateY(-50%);
+        background: transparent;
+        color: var(--muted);
+        border: 1px solid var(--border);
+        border-radius: 5px;
+        padding: 3px 9px;
+        font-size: 11px;
+        font-weight: 500;
+        cursor: pointer;
+      }
+      .settings-field .secret-toggle:hover {
+        color: var(--text-strong);
+        border-color: var(--accent);
+      }
       .settings-field .bool-row {
         display: flex;
         align-items: center;
@@ -697,8 +764,38 @@
         margin: 0;
       }
       .settings-field .hint {
-        font-size: 11px;
+        font-family: var(--font-handwriting);
+        font-size: 12px;
         color: var(--muted);
+        line-height: 1.5;
+      }
+      /* Restart button is a hot-secondary action. Sits inside the
+         settings status bar alongside refresh / save so the operator's
+         attention stays in one place after a save. */
+      #restartFromSettingsBtn {
+        color: var(--accent-strong);
+        border-color: rgba(163, 113, 247, .45);
+        background: var(--accent-soft);
+      }
+      #restartFromSettingsBtn:hover:not(:disabled) {
+        color: #fff;
+        background: var(--accent);
+        border-color: var(--accent);
+      }
+      #restartFromSettingsBtn:disabled {
+        opacity: 0.55;
+        cursor: progress;
+      }
+      /* Global "保存全部修改" button: lit up only when there's at
+         least one dirty field. Counter chip rendered inline. */
+      #saveAllSettings:disabled {
+        opacity: 0.55;
+        cursor: not-allowed;
+      }
+      #saveAllSettings .count {
+        font-size: 11px;
+        opacity: 0.85;
+        margin-left: 6px;
       }
       .settings-actions {
         display: flex;
@@ -787,23 +884,6 @@
         color: var(--text-strong);
         border-color: var(--accent);
       }
-      header #restartBtn {
-        /* Sits in the same logout-btn slot but reads as a hot action.
-           Subtle accent-tinted background so it's visually distinct
-           from 登出 without screaming "danger". */
-        color: var(--accent-strong);
-        border-color: rgba(163, 113, 247, .35);
-        background: var(--accent-soft);
-      }
-      header #restartBtn:hover:not(:disabled) {
-        color: #fff;
-        background: var(--accent);
-        border-color: var(--accent);
-      }
-      header #restartBtn:disabled {
-        opacity: 0.55;
-        cursor: progress;
-      }
 
       @media (max-width: 720px) {
         .conn { grid-template-columns: 1fr; }
@@ -848,7 +928,6 @@
         </a>
         <h1>WebChat Gateway · Admin Panel</h1>
         <span class="pill" id="sessionPill">session</span>
-        <button id="restartBtn" class="logout-btn" type="button" title="停止并重启 WebChat 服务（生效全部已保存设置）">重启服务</button>
         <button id="logoutBtn" class="logout-btn" type="button">登出</button>
         <a class="back" href="/">← 首页</a>
       </header>
@@ -1006,10 +1085,12 @@
         <div class="status-bar">
           <h2>插件设置</h2>
           <div>
-            <button id="refreshSettings" class="ghost">刷新</button>
+            <span id="settingsStatus" class="status"></span>
+            <button id="refreshSettings" class="ghost" type="button">刷新</button>
+            <button id="restartFromSettingsBtn" class="ghost" type="button" title="停止并重启 WebChat 服务（保存后点这里使配置生效）">重启服务</button>
+            <button id="saveAllSettings" type="button" disabled>保存全部修改</button>
           </div>
         </div>
-        <span id="settingsStatus" class="status"></span>
         <div id="settingsContainer"></div>
       </section>
     </div>
@@ -1214,67 +1295,11 @@
         showLogin("已登出。");
       };
 
-      // ----- Restart service -----
-      // POST /admin/restart kicks off a full _stop + _start cycle on the
-      // server side. The handler returns 202 BEFORE the lifecycle bounce
-      // so this fetch always succeeds; the server then drops the socket
-      // a moment later, so subsequent requests will fail for ~1-3s
-      // while routes re-register. We poll /admin/me once a second to
-      // detect when the server is back, then surface a success state.
-      $("restartBtn").onclick = async () => {
-        const btn = $("restartBtn");
-        if (btn.disabled) return;
-        const ok = confirm(
-          "重启 WebChat 服务？\n" +
-          "\n" +
-          "• 所有正在进行的对话流会被中断（聊天页会自动重连）。\n" +
-          "• 几乎所有设置项只有重启后才会生效，这是常规操作。\n" +
-          "• 若重启失败，请到 AstrBot 后台手动重载本插件。"
-        );
-        if (!ok) return;
-        btn.disabled = true;
-        const originalText = btn.textContent;
-        btn.textContent = "重启中...";
-        try {
-          const resp = await fetch(buildUrl("/api/webchat/admin/restart"), {
-            method: "POST",
-            credentials: "include",
-          });
-          if (!resp.ok && resp.status !== 202) {
-            const data = await resp.json().catch(() => ({}));
-            alert(`重启请求失败：${data.error || resp.status}`);
-            btn.textContent = originalText;
-            btn.disabled = false;
-            return;
-          }
-          // Poll for the server coming back. 30 attempts × ~1s ≈ 30s
-          // ceiling — generous so a slow storage init doesn't trip
-          // a false negative.
-          for (let i = 0; i < 30; i++) {
-            await new Promise((r) => setTimeout(r, 1000));
-            try {
-              const me = await fetch(buildUrl("/api/webchat/admin/me"), {
-                credentials: "include",
-              });
-              if (me.ok) {
-                btn.textContent = originalText;
-                btn.disabled = false;
-                alert("WebChat 服务已重启完成。");
-                return;
-              }
-            } catch (e) {
-              // Socket refused / DNS hiccup → not back yet, keep polling.
-            }
-          }
-          btn.textContent = originalText;
-          btn.disabled = false;
-          alert("等待服务恢复超时。请检查 AstrBot 日志，并视情况手动重载插件。");
-        } catch (e) {
-          btn.textContent = originalText;
-          btn.disabled = false;
-          alert(`重启失败：${e.message}`);
-        }
-      };
+      // Restart service is wired inside the Settings panel (further
+      // down). It used to live in the header but per-field "需重启"
+      // chips + a hot button in the header read as more alarming than
+      // they should — the single 重启服务 button next to 保存全部修改
+      // groups the affordance with the action that actually needs it.
 
       // tab switching
       const tabs = document.querySelectorAll(".tabs button");
@@ -1696,8 +1721,15 @@
       // PATCH /api/webchat/admin/settings with {updates: {key: value}}.
       // Sections render in the order they appear in the response; we trust
       // the server to emit Branding -> Behaviour -> Security -> Streaming
-      // -> Uploads as the spec pins it.
-      const SECTION_ORDER = ["Branding", "Behaviour", "Security", "Streaming", "Uploads"];
+      // -> Uploads as the spec pins it. Section names are now Chinese
+      // (e.g. "站点信息") since the schema labels everything in Chinese.
+      const SECTION_ORDER = [
+        "站点信息",
+        "对话行为",
+        "安全",
+        "流式缓冲",
+        "图片上传",
+      ];
       const settingsState = {
         // key -> { field (server descriptor), control (input element),
         //          read () => raw value, dirty: bool, section: string }
@@ -1729,15 +1761,41 @@
         return String(raw);
       }
 
+      function settingsDirtyCount() {
+        let n = 0;
+        for (const e of settingsState.fields.values()) if (e.dirty) n++;
+        return n;
+      }
+
+      function settingsRefreshSaveButton() {
+        const btn = document.getElementById("saveAllSettings");
+        if (!btn) return;
+        const n = settingsDirtyCount();
+        // Use textContent so we don't have to escape anything, and a
+        // count chip span when there's at least one dirty field.
+        btn.textContent = "";
+        btn.appendChild(document.createTextNode("保存全部修改"));
+        if (n > 0) {
+          const count = document.createElement("span");
+          count.className = "count";
+          count.textContent = `(${n})`;
+          btn.appendChild(count);
+        }
+        btn.disabled = n === 0;
+      }
+
       function settingsMarkDirty(entry) {
         if (entry.dirty) return;
         entry.dirty = true;
         entry.row.classList.add("dirty");
+        settingsRefreshSaveButton();
       }
 
       function settingsClearDirty(entry) {
+        if (!entry.dirty) return;
         entry.dirty = false;
         entry.row.classList.remove("dirty");
+        settingsRefreshSaveButton();
       }
 
       function buildSettingsField(field) {
@@ -1749,14 +1807,18 @@
         label.className = "field-label";
         const labelText = document.createElement("span");
         labelText.className = "key";
-        labelText.textContent = field.key;
+        labelText.textContent = field.label || field.key;
         label.appendChild(labelText);
         // Per-field 需重启 badges removed: nearly every whitelisted field
-        // requires a restart, so a badge per row was visual noise. The
-        // saved-status line below summarises restart-required keys, and
-        // the header has a one-click 重启服务 button. The
-        // `restart_required` flag is still kept on the field object for
-        // the save-status classification.
+        // requires a restart, so a per-row chip was visual noise.
+        // The 状态栏 status line + the 重启服务 button cover the
+        // affordance once at the top instead of per-row. `field.label`
+        // (Chinese) is what operators read now; `field.key` (dotted
+        // path) is still attached as a `title` so an operator can hover
+        // to confirm the underlying config key.
+        if (field.label && field.label !== field.key) {
+          label.title = field.key;
+        }
         row.appendChild(label);
 
         let control;
@@ -1810,6 +1872,36 @@
           control.id = ctrlId;
           label.setAttribute("for", ctrlId);
           row.appendChild(control);
+        } else if (field.secret) {
+          // Secret string: password-typed input + 显示/隐藏 toggle so
+          // the operator can verify they pasted the right thing without
+          // leaving the value rendered as plain text in the DOM. The
+          // value is still in the GET payload (admin is already
+          // authenticated), but the UI doesn't broadcast it on screen.
+          const wrap = document.createElement("div");
+          wrap.className = "secret-row";
+          control = document.createElement("input");
+          control.type = "password";
+          control.autocomplete = "new-password";
+          control.spellcheck = false;
+          control.value = field.value == null ? "" : String(field.value);
+          const ctrlId = `set-${field.key.replace(/\./g, "_")}`;
+          control.id = ctrlId;
+          label.setAttribute("for", ctrlId);
+          const toggle = document.createElement("button");
+          toggle.type = "button";
+          toggle.className = "secret-toggle";
+          toggle.textContent = "显示";
+          toggle.setAttribute("aria-pressed", "false");
+          toggle.onclick = () => {
+            const showing = control.type === "text";
+            control.type = showing ? "password" : "text";
+            toggle.textContent = showing ? "显示" : "隐藏";
+            toggle.setAttribute("aria-pressed", String(!showing));
+          };
+          wrap.appendChild(control);
+          wrap.appendChild(toggle);
+          row.appendChild(wrap);
         } else {
           // string fallback
           control = document.createElement("input");
@@ -1851,6 +1943,7 @@
         status.className = "status";
         container.innerHTML = "";
         settingsState.fields.clear();
+        settingsRefreshSaveButton();
         try {
           const data = await api("/api/webchat/admin/settings");
           const fields = Array.isArray(data.fields) ? data.fields : [];
@@ -1860,7 +1953,8 @@
             bySection.get(f.section).push(f);
           }
           // Render in pinned order first, then any unexpected section the
-          // server emits (defensive — spec says only these five).
+          // server emits (defensive — schema fixes the five canonical
+          // groups but a future addition shouldn't drop off the page).
           const sectionsSeen = new Set();
           const sectionOrder = [];
           for (const s of SECTION_ORDER) {
@@ -1887,19 +1981,9 @@
               grid.appendChild(buildSettingsField(field));
             }
             group.appendChild(grid);
-
-            const actions = document.createElement("div");
-            actions.className = "settings-actions";
-            const sectionStatus = document.createElement("span");
-            sectionStatus.className = "status";
-            actions.appendChild(sectionStatus);
-            const saveBtn = document.createElement("button");
-            saveBtn.type = "button";
-            saveBtn.textContent = "保存本节";
-            saveBtn.onclick = () => saveSettingsSection(sectionName, saveBtn, sectionStatus);
-            actions.appendChild(saveBtn);
-            group.appendChild(actions);
-
+            // Per-section save buttons removed: one global 保存全部修改
+            // in the panel header handles batching. Operators get a
+            // single submit point + a single batch validation result.
             container.appendChild(group);
           }
           status.textContent = `共 ${fields.length} 项配置`;
@@ -1910,23 +1994,24 @@
         }
       }
 
-      async function saveSettingsSection(sectionName, saveBtn, sectionStatus) {
+      async function saveAllSettings() {
+        const status = $("settingsStatus");
+        const btn = $("saveAllSettings");
         const updates = {};
         const dirtyEntries = [];
         for (const entry of settingsState.fields.values()) {
-          if (entry.section !== sectionName) continue;
           if (!entry.dirty) continue;
           updates[entry.field.key] = settingsCoerce(entry.field, entry.read());
           dirtyEntries.push(entry);
         }
         if (dirtyEntries.length === 0) {
-          sectionStatus.textContent = "无改动";
-          sectionStatus.className = "status";
+          status.textContent = "无改动";
+          status.className = "status";
           return;
         }
-        saveBtn.disabled = true;
-        sectionStatus.textContent = "保存中...";
-        sectionStatus.className = "status";
+        btn.disabled = true;
+        status.textContent = "保存中...";
+        status.className = "status";
         try {
           const result = await api("/api/webchat/admin/settings", {
             method: "PATCH",
@@ -1940,26 +2025,93 @@
           }
           const restartCount = restartList.length;
           if (restartCount > 0) {
-            // Most whitelisted fields are boot-snapshotted; surface
-            // the one-click "重启服务" affordance in the header rather
-            // than leaving the operator wondering whether they need
-            // to round-trip through AstrBot.
-            sectionStatus.textContent = `已保存 ${saved.length} 项 · 点击右上角“重启服务”使配置生效`;
+            status.textContent = `已保存 ${saved.length} 项 · 点击「重启服务」使配置生效`;
           } else {
-            sectionStatus.textContent = `已保存 ${saved.length} 项（已生效）`;
+            status.textContent = `已保存 ${saved.length} 项（已生效）`;
           }
-          sectionStatus.className = "status success";
+          status.className = "status success";
         } catch (e) {
           const code = (e.payload && e.payload.error) || e.message;
           const detail = e.payload && e.payload.detail ? ` (${e.payload.detail})` : "";
-          sectionStatus.textContent = `失败: ${code}${detail}`;
-          sectionStatus.className = "status error";
+          status.textContent = `失败: ${code}${detail}`;
+          status.className = "status error";
         } finally {
-          saveBtn.disabled = false;
+          // saveAllSettings's enabled state is driven by settingsDirtyCount
+          // via settingsRefreshSaveButton — call it AFTER finally so
+          // the post-save state (some entries cleaned, some still
+          // dirty if the server rejected them) is reflected.
+          settingsRefreshSaveButton();
         }
       }
 
       $("refreshSettings").onclick = () => loadSettings();
+      $("saveAllSettings").onclick = saveAllSettings;
+
+      // ----- Restart service (inside Settings panel) -----
+      // POST /admin/restart triggers a full _stop + _start cycle on the
+      // server. The handler 202's before the lifecycle bounce so this
+      // fetch always succeeds; the server drops the socket a moment
+      // later, so subsequent requests fail for ~1-3s while routes
+      // re-register. Poll /admin/me once a second up to 30 attempts to
+      // detect recovery, then surface the result inline in the
+      // settings status line instead of a modal alert (the operator is
+      // already focused on this panel).
+      $("restartFromSettingsBtn").onclick = async () => {
+        const btn = $("restartFromSettingsBtn");
+        const status = $("settingsStatus");
+        if (btn.disabled) return;
+        const okGo = confirm(
+          "重启 WebChat 服务？\n" +
+          "\n" +
+          "• 所有正在进行的对话流会被中断（聊天页会自动重连）。\n" +
+          "• 几乎所有设置项只有重启后才会生效，这是常规操作。\n" +
+          "• 若重启失败，请到 AstrBot 后台手动重载本插件。"
+        );
+        if (!okGo) return;
+        btn.disabled = true;
+        const originalText = btn.textContent;
+        btn.textContent = "重启中…";
+        status.textContent = "正在重启服务…";
+        status.className = "status";
+        try {
+          const resp = await fetch(buildUrl("/api/webchat/admin/restart"), {
+            method: "POST",
+            credentials: "include",
+          });
+          if (!resp.ok && resp.status !== 202) {
+            const data = await resp.json().catch(() => ({}));
+            status.textContent = `重启请求失败: ${data.error || resp.status}`;
+            status.className = "status error";
+            btn.textContent = originalText;
+            btn.disabled = false;
+            return;
+          }
+          for (let i = 0; i < 30; i++) {
+            await new Promise((r) => setTimeout(r, 1000));
+            try {
+              const me = await fetch(buildUrl("/api/webchat/admin/me"), {
+                credentials: "include",
+              });
+              if (me.ok) {
+                btn.textContent = originalText;
+                btn.disabled = false;
+                status.textContent = "WebChat 服务已重启完成";
+                status.className = "status success";
+                return;
+              }
+            } catch (e) { /* socket refused / DNS hiccup — keep polling */ }
+          }
+          btn.textContent = originalText;
+          btn.disabled = false;
+          status.textContent = "等待服务恢复超时，请到 AstrBot 后台手动重载插件";
+          status.className = "status error";
+        } catch (e) {
+          btn.textContent = originalText;
+          btn.disabled = false;
+          status.textContent = `重启失败: ${e.message}`;
+          status.className = "status error";
+        }
+      };
 
       // ----- Editor modal -----
       const editorModal = $("editorModal");
