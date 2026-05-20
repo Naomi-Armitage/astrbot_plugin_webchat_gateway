@@ -75,6 +75,19 @@ def make_chat_handler(deps: ChatDeps):
         data = prepared.data
         attachment_rows = prepared.attachment_rows
 
+        # Operational log for the admin panel's live log viewer. INFO
+        # so a quiet plugin still has visible activity, but no user
+        # content or full message — token name + length only. The
+        # audit_log captures the same event with structured fields;
+        # this is the human-readable mirror.
+        logger.info(
+            "[WebChatGateway] /chat received name=%s session=%s msg_len=%d attachments=%d",
+            token.name,
+            data.session_id,
+            len(data.message),
+            len(attachment_rows),
+        )
+
         # 5. Concurrency lock
         async with deps.concurrency.acquire(token.name) as acquired:
             if not acquired:
@@ -277,6 +290,15 @@ def make_chat_handler(deps: ChatDeps):
                         "file_id": attachment["file_id"],
                     },
                 )
+                logger.info(
+                    "[WebChatGateway] image generated name=%s model=%s "
+                    "size=%s bytes=%d file_id=%s",
+                    token.name,
+                    deps.image_bridge.model,
+                    deps.image_bridge.size,
+                    len(result.content),
+                    attachment["file_id"],
+                )
                 return json_response(
                     {
                         "reply": assistant_text,
@@ -427,6 +449,14 @@ def make_chat_handler(deps: ChatDeps):
                     "reply_len": len(reply),
                     "remaining": remaining,
                 },
+            )
+            logger.info(
+                "[WebChatGateway] /chat ok name=%s session=%s "
+                "reply_len=%d remaining=%d",
+                token.name,
+                data.session_id,
+                len(reply),
+                remaining,
             )
             return json_response(
                 {

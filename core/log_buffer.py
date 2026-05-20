@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import os
 import threading
 import traceback
 from collections import deque
@@ -219,14 +220,54 @@ class LogBufferHandler(logging.Handler):
     deliberate: the admin viewer is a window into the SAME log stream
     operators see in the AstrBot main log, not a privileged tap that
     bypasses level config.
+
+    Filters records by the calling source file (``record.pathname``):
+    only records whose source lives under ``plugin_dir`` end up in
+    the buffer. AstrBot's logger is a shared singleton — every plugin
+    and the framework itself emits through it — so without this
+    filter the admin panel's log viewer would mix every other
+    plugin's output into a "per-plugin" view. ``record.pathname`` is
+    always the caller's source file (Python logging sets it from
+    the call-time frame), so the filter is robust even across
+    threads / `asyncio.to_thread` / background tasks.
     """
 
-    def __init__(self, buffer: LogBuffer) -> None:
+    def __init__(
+        self,
+        buffer: LogBuffer,
+        *,
+        plugin_dir: str | None = None,
+    ) -> None:
         super().__init__()
         self._buffer = buffer
+        if plugin_dir is None:
+            # Default to this module's parent package directory —
+            # `core/log_buffer.py` lives directly under the plugin
+            # root, so two ``dirname`` calls land on the plugin root
+            # itself. Operators with an unusual install layout can
+            # override via the constructor arg.
+            plugin_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self._plugin_dir = (
+            os.path.normpath(plugin_dir).rstrip(os.sep) + os.sep
+        )
+
+    def _is_plugin_record(self, record: logging.LogRecord) -> bool:
+        pathname = getattr(record, "pathname", "") or ""
+        if not pathname:
+            return False
+        try:
+            normalised = os.path.normpath(pathname)
+        except Exception:
+            return False
+        return (normalised + os.sep).startswith(self._plugin_dir)
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
+            # Reject framework / other-plugin records. The shared
+            # `astrbot.api.logger` carries everyone's traffic; the
+            # admin viewer wants a per-plugin lens.
+            if not self._is_plugin_record(record):
+                return
             try:
                 message = record.getMessage()
             except Exception:

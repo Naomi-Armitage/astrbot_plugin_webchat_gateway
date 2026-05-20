@@ -252,6 +252,81 @@ class TestLogBufferHandler:
         entries, _ = buf.snapshot(since=0, limit=10)
         assert len(entries) == 1
 
+    def test_filter_drops_records_outside_plugin_dir(self):
+        """`astrbot.api.logger` is shared across the whole bot — other
+        plugins and framework code emit through it too. The handler
+        must filter to records whose source file lives under the
+        configured plugin_dir, otherwise the admin panel's "本插件
+        日志" tab would mix everyone's output together."""
+        from astrbot_plugin_webchat_gateway.core.log_buffer import (
+            LogBuffer,
+            LogBufferHandler,
+        )
+
+        buf = LogBuffer(capacity=10)
+        # Pin plugin_dir to the test file's parent (the tests/ dir
+        # itself) so any path outside is "foreign". With this scope,
+        # a record from /tmp/other_plugin.py must be dropped.
+        import os
+
+        handler = LogBufferHandler(
+            buf, plugin_dir=os.path.dirname(__file__)
+        )
+
+        foreign = logging.LogRecord(
+            name="astrbot.other",
+            level=logging.WARNING,
+            pathname="/tmp/some_other_plugin/main.py",
+            lineno=10,
+            msg="not us",
+            args=(),
+            exc_info=None,
+        )
+        handler.emit(foreign)
+        # Buffer is empty — record was filtered out.
+        entries, _ = buf.snapshot(since=0, limit=10)
+        assert entries == []
+
+        # Sanity: a record FROM this test file does land in the
+        # buffer, so the filter isn't dropping everything.
+        own = logging.LogRecord(
+            name="astrbot.plugin.webchat_gateway",
+            level=logging.WARNING,
+            pathname=__file__,
+            lineno=10,
+            msg="us",
+            args=(),
+            exc_info=None,
+        )
+        handler.emit(own)
+        entries, _ = buf.snapshot(since=0, limit=10)
+        assert len(entries) == 1
+        assert entries[0].message == "us"
+
+    def test_filter_drops_empty_pathname(self):
+        """A LogRecord without a pathname (rare, but possible from
+        some logging adapters / threading shims) can't be classified
+        as "ours" and should be dropped — defensive default."""
+        from astrbot_plugin_webchat_gateway.core.log_buffer import (
+            LogBuffer,
+            LogBufferHandler,
+        )
+
+        buf = LogBuffer(capacity=10)
+        handler = LogBufferHandler(buf)
+        record = logging.LogRecord(
+            name="astrbot.test",
+            level=logging.WARNING,
+            pathname="",
+            lineno=10,
+            msg="no path",
+            args=(),
+            exc_info=None,
+        )
+        handler.emit(record)
+        entries, _ = buf.snapshot(since=0, limit=10)
+        assert entries == []
+
 
 # ---------------------------------------------------------------------
 # HTTP handlers

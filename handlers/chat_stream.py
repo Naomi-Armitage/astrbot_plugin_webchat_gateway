@@ -310,6 +310,16 @@ def make_chat_stream_handler(deps: ChatDeps):
             # Comment frame so the browser sees bytes immediately and any
             # transparent proxy flushes its buffer.
             await response.write(b": ready\n\n")
+            # Operational log for the admin panel's live viewer. Pairs
+            # with the close_ok / close_failed lines so an operator
+            # scanning the log can see when a stream opened and how
+            # it ended.
+            logger.info(
+                "[WebChatGateway] /chat/stream open name=%s session=%s sid=%s",
+                token.name,
+                data.session_id,
+                handle_obj.stream_id,
+            )
             # First data frame announces the stream_id so the client can
             # persist it and reconnect via /resume on transient failure.
             await response.write(
@@ -807,6 +817,14 @@ def make_chat_stream_handler(deps: ChatDeps):
                 user_attachments=user_attachments_payload,
             )
             terminal_emitted = True
+            logger.info(
+                "[WebChatGateway] /chat/stream close_ok name=%s sid=%s "
+                "reply_len=%d remaining=%d",
+                token.name,
+                handle_obj.stream_id,
+                len(full_reply),
+                remaining,
+            )
             if not client_gone:
                 done_frame = (
                     "data: "
