@@ -262,8 +262,19 @@ async def gate_request(
         and token.expires_at <= now_ts
     )
     if token is None or token.revoked_at is not None or expired:
-        if token is None:
-            await deps.ip_guard.record_failure(ip)
+        # Brute-force accounting fires for all three "credential
+        # presented but unusable" cases — invalid, revoked, expired.
+        # A leaked-but-revoked token would otherwise be a free
+        # liveness/identity oracle: the attacker pings /chat at
+        # unlimited rate and learns whether the bearer is still
+        # known to the gateway without ever costing them a probe.
+        # Comment at handlers/files.py phrases the inverse rule
+        # (don't count cookie failures); here the user owns the
+        # bearer secret and is responsible for not leaking it, so
+        # treating revoke/expired as failures is the same posture
+        # the original `if token is None: record_failure` branch
+        # intended — just complete.
+        await deps.ip_guard.record_failure(ip)
         if token is None:
             reason = "invalid"
         elif token.revoked_at is not None:

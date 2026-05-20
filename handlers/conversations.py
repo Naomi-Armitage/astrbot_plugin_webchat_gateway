@@ -485,10 +485,15 @@ def make_conversation_handlers(
             `llm_timeout` / `llm_call_failed` / `regenerate_failed` /
             `internal_error`.
 
-        Before SSE handshake (auth / parse errors) the response is a
-        plain JSON error (same as the previous handler). Once `prepare`
-        has flushed the 200 + event-stream headers, ALL further errors
-        come back as SSE `{"type": "error", ...}` frames.
+        Before SSE handshake (auth / parse / lock / quota / message-not-
+        found errors) the response is a plain JSON error with the
+        appropriate HTTP status (same as the previous JSON handler).
+        Cheap pre-flight checks (concurrency lock, quota, target
+        message lookup) are pulled forward via `__anext__()` on the
+        service generator — that resolves them BEFORE `prepare()`
+        flushes the 200 + event-stream headers. Once the handshake
+        completes, ALL further errors come back as SSE
+        `{"type": "error", ...}` frames.
         """
         gated = await gate_request(request, deps)
         if isinstance(gated, web.Response):
@@ -524,6 +529,55 @@ def make_conversation_handlers(
             # caught downstream as message_not_found.
             return _err(
                 request, gated.origin, ServiceError("invalid_payload", status=400)
+            )
+
+        # Pre-flight: pull the first frame BEFORE preparing the SSE
+        # response. The service generator acquires the per-token lock,
+        # resolves the target message, and runs the quota check before
+        # yielding its first `chunk`. Any of those failure modes raises
+        # ServiceError, which we translate to a real HTTP 4xx instead
+        # of masking it as a 200-with-error-frame (clients using
+        # `fetch().ok` would otherwise see the regenerate as a
+        # successful stream).
+        #
+        # Generator must be aclose()d on every error path so the
+        # per-token lock the `_with_concurrency` context held doesn't
+        # leak. Without an explicit aclose, the lock would survive
+        # until the generator's GC, which can be arbitrarily delayed.
+        gen = service.regenerate_assistant_message_stream(
+            token_name=gated.token.name,
+            session_id=session_id,
+            message_index=raw_index,
+            token_daily_quota=gated.token.daily_quota,
+            ip=gated.ip,
+        )
+        first_frame: dict | None = None
+        try:
+            first_frame = await gen.__anext__()
+        except ServiceError as exc:
+            await gen.aclose()
+            return _err(request, gated.origin, exc)
+        except StopAsyncIteration:
+            # Generator returned without yielding anything — defensive
+            # branch; the service contract is "raise OR yield ≥1 frame".
+            await gen.aclose()
+            return _err(
+                request,
+                gated.origin,
+                ServiceError("internal_error", status=500),
+            )
+        except (ConnectionResetError, asyncio.CancelledError):
+            await gen.aclose()
+            raise
+        except Exception:
+            logger.exception(
+                "[WebChatGateway] regenerate pre-flight failed"
+            )
+            await gen.aclose()
+            return _err(
+                request,
+                gated.origin,
+                ServiceError("internal_error", status=500),
             )
 
         cors = build_cors_headers(
@@ -574,22 +628,25 @@ def make_conversation_handlers(
             await response.prepare(request)
             await response.write(b": ready\n\n")
         except (ConnectionResetError, asyncio.CancelledError):
+            await gen.aclose()
             return response
         except Exception:
             logger.exception(
                 "[WebChatGateway] regenerate SSE handshake failed"
             )
+            await gen.aclose()
             return response
 
         client_connected = True
+        # Replay the first (already-pulled) chunk through write_frame
+        # so peer ordering is correct. The rest of the iterator drives
+        # the LLM + persistence side-effects identically to the
+        # original code.
         try:
-            async for evt in service.regenerate_assistant_message_stream(
-                token_name=gated.token.name,
-                session_id=session_id,
-                message_index=raw_index,
-                token_daily_quota=gated.token.daily_quota,
-                ip=gated.ip,
-            ):
+            ok = await write_frame(first_frame)
+            if not ok:
+                client_connected = False
+            async for evt in gen:
                 if not client_connected:
                     # Client gone — keep draining the generator so the
                     # CM write + event emission still happen, but stop
@@ -607,6 +664,7 @@ def make_conversation_handlers(
             # Either way, just bail — service-side persistence either
             # already happened or will be rolled back by exception
             # propagation.
+            await gen.aclose()
             return response
         except Exception:
             logger.exception(
@@ -614,6 +672,12 @@ def make_conversation_handlers(
             )
             if client_connected:
                 await write_frame({"type": "error", "code": "internal_error"})
+        finally:
+            # Ensure the generator's `_with_concurrency` lock is always
+            # released, even if the loop exited cleanly via
+            # StopAsyncIteration (aclose on an exhausted generator is a
+            # no-op so calling it unconditionally is safe).
+            await gen.aclose()
 
         try:
             await response.write_eof()

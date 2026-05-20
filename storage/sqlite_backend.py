@@ -437,31 +437,39 @@ class SqliteStorage(AbstractStorage):
     ) -> int:
         if max_fails <= 0:
             return 0
+        # Single-statement UPSERT. The previous SELECT-then-(INSERT|UPDATE)
+        # pattern was atomic only against the in-process `_write_lock`,
+        # which an operator running multiple AstrBot workers against the
+        # same sqlite file does NOT share. Two workers could each observe
+        # "ip not seen" and race to INSERT, producing IntegrityError on
+        # the second one. ON CONFLICT(ip) DO UPDATE collapses both paths
+        # into one atomic statement that SQLite executes as a single
+        # write, so the multi-process case stops needing the in-process
+        # lock to be the only line of defence.
+        #
+        # The "blocked_until rolls forward each time we cross max_fails"
+        # behaviour is preserved via the CASE expression: bump
+        # blocked_until ONLY when the post-increment count meets the
+        # threshold. `fail_count + 1` runs against the row's prior value
+        # (so a fresh row lands at 1, an existing-and-failed row at
+        # prior+1), matching the previous semantics exactly.
         async with self._write_lock:
             async with self._db.execute(
-                "SELECT fail_count, first_fail_ts FROM ip_failures WHERE ip = ?",
-                (ip,),
+                "INSERT INTO ip_failures(ip, fail_count, first_fail_ts, last_fail_ts, blocked_until) "
+                "VALUES (?, 1, ?, ?, 0) "
+                "ON CONFLICT(ip) DO UPDATE SET "
+                "  fail_count = fail_count + 1, "
+                "  last_fail_ts = excluded.last_fail_ts, "
+                "  blocked_until = CASE "
+                "    WHEN fail_count + 1 >= ? THEN excluded.last_fail_ts + ? "
+                "    ELSE blocked_until "
+                "  END "
+                "RETURNING fail_count",
+                (ip, now, now, max_fails, block_seconds),
             ) as cursor:
                 row = await cursor.fetchone()
-            if row is None:
-                await self._db.execute(
-                    "INSERT INTO ip_failures(ip, fail_count, first_fail_ts, last_fail_ts, blocked_until) "
-                    "VALUES (?, 1, ?, ?, 0)",
-                    (ip, now, now),
-                )
-                new_count = 1
-            else:
-                new_count = int(row["fail_count"]) + 1
-                new_blocked_until = now + block_seconds if new_count >= max_fails else None
-                await self._db.execute(
-                    "UPDATE ip_failures "
-                    "SET fail_count = ?, last_fail_ts = ?, "
-                    "    blocked_until = CASE WHEN ? >= ? THEN ? ELSE blocked_until END "
-                    "WHERE ip = ?",
-                    (new_count, now, new_count, max_fails, new_blocked_until or 0, ip),
-                )
             await self._db.commit()
-        return new_count
+            return int(row["fail_count"]) if row else 0
 
     async def is_ip_blocked(self, ip: str, *, now: int) -> tuple[bool, int]:
         async with self._db.execute(

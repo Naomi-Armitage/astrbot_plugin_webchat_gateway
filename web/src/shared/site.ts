@@ -25,7 +25,12 @@ export const $ = <T extends Element = HTMLElement>(id: string): T => {
 
 // Refuse anything that's not http(s) or root-relative. Operator config is
 // trusted, but `javascript:` / `data:` URLs would still execute on click.
-export const HREF_OK = /^(https?:\/\/|\/)/i;
+// The `\/(?!\/)` clause matches a single leading slash but NOT `//…` —
+// protocol-relative URLs would otherwise resolve to a cross-origin host
+// (browser parses `<a href="//evil.com">` as `https://evil.com`), giving
+// a self-typoed privacy_url a redirection foothold even though the
+// schemes look safe.
+export const HREF_OK = /^(?:https?:\/\/|\/(?!\/))/i;
 
 export function resolveTheme(family: string, mode: "light" | "dark"): string {
   if (family === "classic") return mode === "dark" ? "classic-dark" : "classic-light";

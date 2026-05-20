@@ -40,6 +40,7 @@ async def commit_attachments_or_release(
     file_store: FileStore,
     rows: list[FileRow],
     log_label: str,
+    audit: Any = None,
 ) -> bool:
     """Mark `rows` as committed=1. On failure, release files and return False.
 
@@ -56,6 +57,15 @@ async def commit_attachments_or_release(
     effort) — the caller should surface an error response. Either way,
     files in `rows` end up in a consistent state from the user's
     quota perspective.
+
+    When BOTH the commit AND the release fail (e.g. R2 fully down),
+    we emit a `file_release_failed` audit event so operators have a
+    breadcrumb for the rare-but-irrecoverable case: any rows that the
+    commit partially flipped to committed=1 are now permanently
+    outside the orphan-GC sweep's filter, occupying the user's
+    per-token storage quota until manually cleaned up. Without the
+    audit event the only signal was a logged exception that's easy
+    to miss.
     """
     if not rows:
         return True
@@ -70,18 +80,48 @@ async def commit_attachments_or_release(
             "[WebChatGateway] %s: mark_files_committed failed",
             log_label,
         )
+        released_ok = 0
+        release_raised = False
         try:
-            await release_files_safely(
+            released_ok = await release_files_safely(
                 storage=storage,
                 file_store=file_store,
                 rows=rows,
                 log_label=f"{log_label}_commit_fail",
             )
         except Exception:
+            release_raised = True
             logger.exception(
                 "[WebChatGateway] %s: release on commit-fail raised",
                 log_label,
             )
+        # Double-failure detection. `release_files_safely` is
+        # best-effort and swallows per-row failures (returning a
+        # partial count) AND the bulk DB-delete failure (returning
+        # 0). Either path leaves rows that mark_files_committed
+        # may have partially flipped to committed=1 stranded
+        # outside the orphan-GC sweep's filter — permanently
+        # occupying the user's per-token storage quota until
+        # manually cleaned up. Surface as `file_release_failed`
+        # so operators have a discoverable signal.
+        if (release_raised or released_ok < len(rows)) and audit is not None:
+            try:
+                await audit.write(
+                    "file_release_failed",
+                    detail={
+                        "label": log_label,
+                        "row_count": len(rows),
+                        "released_ok": released_ok,
+                        "release_raised": release_raised,
+                        "file_ids": [r.file_id for r in rows][:20],
+                    },
+                )
+            except Exception:
+                logger.exception(
+                    "[WebChatGateway] %s: file_release_failed audit "
+                    "write itself failed",
+                    log_label,
+                )
         return False
 
 

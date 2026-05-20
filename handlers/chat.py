@@ -168,6 +168,7 @@ def make_chat_handler(deps: ChatDeps):
                     file_store=deps.file_store,
                     rows=attachment_rows,
                     log_label="non_stream_chat",
+                    audit=deps.audit,
                 ):
                     # Commit failed AND the release attempt completed.
                     # 500 the request so the user retries; CM stays

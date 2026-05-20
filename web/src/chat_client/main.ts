@@ -9,6 +9,7 @@ import {
   setupThemeToggle,
 } from "../shared/site";
 import type { SiteConfig } from "../shared/site";
+import { installFocusTrap, type FocusTrap } from "../shared/focus-trap";
 import { marked } from "marked";
 import markedAlert from "marked-alert";
 import markedFootnote from "marked-footnote";
@@ -2797,16 +2798,33 @@ function newSession(): void {
   saveStore(); replayActive(); renderSessionList(); closeMobileSidebar(); inputEl.focus();
 }
 
+let sidebarFocusTrap: FocusTrap | null = null;
+
 function openMobileSidebar(): void {
   sidebarEl.classList.add("open");
   sidebarBackdrop.hidden = false;
   sidebarToggleBtn.setAttribute("aria-expanded", "true");
-  sessionListEl.querySelector<HTMLButtonElement>("button")?.focus();
+  // Trap Tab inside the drawer so it can't escape into the (visually-
+  // dimmed) chat panel beneath. Initial focus lands on the first
+  // session button when present, falling back to the trap's default
+  // (first focusable in container) otherwise.
+  const firstSessionBtn =
+    sessionListEl.querySelector<HTMLButtonElement>("button");
+  sidebarFocusTrap?.release();
+  sidebarFocusTrap = installFocusTrap(sidebarEl, {
+    onEscape: () => {
+      closeMobileSidebar();
+      sidebarToggleBtn.focus();
+    },
+    initialFocus: firstSessionBtn,
+  });
 }
 function closeMobileSidebar(): void {
   sidebarEl.classList.remove("open");
   sidebarBackdrop.hidden = true;
   sidebarToggleBtn.setAttribute("aria-expanded", "false");
+  sidebarFocusTrap?.release();
+  sidebarFocusTrap = null;
 }
 
 async function loadChatSite(): Promise<void> {
@@ -3533,6 +3551,7 @@ function updateSendButtonState(): void {
 // ---------- Lightbox ----------
 
 let lightboxKeydown: ((e: KeyboardEvent) => void) | null = null;
+let lightboxFocusTrap: FocusTrap | null = null;
 function openLightbox(attachments: AttachmentRef[], startIndex: number): void {
   if (!attachments.length) return;
   let idx = Math.max(0, Math.min(startIndex, attachments.length - 1));
@@ -3587,6 +3606,8 @@ function openLightbox(attachments: AttachmentRef[], startIndex: number): void {
       document.removeEventListener("keydown", lightboxKeydown);
       lightboxKeydown = null;
     }
+    lightboxFocusTrap?.release();
+    lightboxFocusTrap = null;
     overlay.remove();
     document.body.classList.remove("lightbox-open");
   };
@@ -3606,8 +3627,9 @@ function openLightbox(attachments: AttachmentRef[], startIndex: number): void {
   overlay.addEventListener("click", closeOverlay);
 
   lightboxKeydown = (e: KeyboardEvent): void => {
-    if (e.key === "Escape") { e.preventDefault(); closeOverlay(); }
-    else if (e.key === "ArrowLeft" && !showSingle) { e.preventDefault(); goPrev(); }
+    // Tab + Escape are owned by the focus trap installed below. Only
+    // arrow-key carousel navigation lives here to keep concerns split.
+    if (e.key === "ArrowLeft" && !showSingle) { e.preventDefault(); goPrev(); }
     else if (e.key === "ArrowRight" && !showSingle) { e.preventDefault(); goNext(); }
   };
   document.addEventListener("keydown", lightboxKeydown);
@@ -3615,6 +3637,13 @@ function openLightbox(attachments: AttachmentRef[], startIndex: number): void {
   overlay.append(img, close, prev, next, counter);
   document.body.appendChild(overlay);
   document.body.classList.add("lightbox-open");
+  // Trap focus inside the lightbox so Tab can't escape into the chat
+  // page underneath. Initial focus on the close button — most common
+  // first action and avoids a confusing focus ring on the arrow nav.
+  lightboxFocusTrap = installFocusTrap(overlay, {
+    onEscape: closeOverlay,
+    initialFocus: close,
+  });
 }
 
 function isStreamCircuitOpen(): boolean {
@@ -4447,12 +4476,9 @@ sidebarToggleBtn.addEventListener("click", () => {
   else openMobileSidebar();
 });
 sidebarBackdrop.addEventListener("click", closeMobileSidebar);
-document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && sidebarEl.classList.contains("open")) {
-    closeMobileSidebar();
-    sidebarToggleBtn.focus();
-  }
-});
+// Escape-to-close is owned by the sidebar's focus trap (installed in
+// openMobileSidebar). No global listener here — it would race with the
+// trap's onEscape and double-fire closeMobileSidebar.
 
 inputEl.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {

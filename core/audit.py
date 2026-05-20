@@ -30,6 +30,17 @@ Chat path (per request):
     llm_timeout     — provider call exceeded llm_timeout_seconds; detail: {msg_len}
     chat_error      — provider call failed; detail: {error: <truncated>}
     chat_ok         — request completed; detail: {msg_len, reply_len, remaining}
+    file_release_failed — `commit_attachments_or_release` hit the double-
+                      failure path: mark_files_committed raised AND the
+                      compensating release also raised. Detail:
+                      {label, row_count, file_ids[≤20]}. Surface for
+                      operator: any rows the commit partially flipped
+                      to committed=1 are now permanently outside the
+                      orphan-GC sweep and occupy the user's quota
+                      until manually cleaned up. Rare — usually
+                      requires the storage backend (R2 / local FS) to
+                      be fully unavailable AND the DB write to fail at
+                      the same time.
 
 Detail values are JSON-serialized strings, truncated to 1024 chars.
 """

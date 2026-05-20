@@ -3,6 +3,15 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      Defence-in-depth CSP. JS + CSS are inlined into this file, so
+      'unsafe-inline' is required to keep the bundle loadable; the
+      rest is tightened. connect-src includes https: so an operator
+      can set apiBase to a cross-origin admin host (the field exists
+      precisely for that deployment shape).
+    -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; connect-src 'self' https:; font-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none';" />
+    <meta name="referrer" content="strict-origin-when-cross-origin" />
     <title>WebChat Gateway · Admin Panel</title>
     <style>
       :root {
@@ -1303,7 +1312,14 @@
         tbody.innerHTML = "";
         for (const item of data.history) {
           const tr = document.createElement("tr");
-          tr.innerHTML = `<td>${item.day}</td><td>${item.count}</td>`;
+          // Server currently sends `day` as a YYYY-MM-DD string and
+          // `count` as a number, so the values look benign — but other
+          // dynamic innerHTML in this file routes through escape()
+          // (the token/audit tables). Keeping ONE template literal
+          // raw is exactly the shape a future XSS regression would
+          // exploit; route through escape() uniformly so this row
+          // never becomes an exception worth auditing again.
+          tr.innerHTML = `<td>${escape(item.day)}</td><td>${escape(String(item.count))}</td>`;
           tbody.appendChild(tr);
         }
         drawChart(data.history, data.daily_quota);

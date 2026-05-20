@@ -20,7 +20,7 @@ from ..core.audit import AuditLogger
 from ..core.ip_guard import IpGuard
 from ..core.llm_bridge import LlmBridge
 from ..storage.base import AbstractStorage
-from .common import extract_origin, gate_request, json_response
+from .common import gate_request, json_response
 
 
 @dataclass
@@ -77,21 +77,25 @@ def _parse_payload(
 
 def make_title_handler(deps: TitleDeps):
     async def handle(request: web.Request) -> web.Response:
-        if not deps.auto_title_enabled:
-            # Skip auth: no point spending a quota slot when titling is off.
-            return json_response(
-                {"error": "title_disabled"},
-                status=503,
-                origin=extract_origin(
-                    request, trust_referer_as_origin=deps.trust_referer_as_origin
-                ),
-                allowed_origins=deps.allowed_origins,
-                same_origin_host=request.host,
-            )
-
+        # gate_request runs FIRST (origin allow-list + IP guard +
+        # bearer auth) so that an unauthenticated cross-origin probe
+        # cannot use the response shape to learn whether titling is
+        # enabled — both `auto_title_enabled=False` and an unrelated
+        # gate failure now produce the same 401/403/429 surface.
+        # Quota debit is still skipped when titling is off; that was
+        # the original intent.
         gated = await gate_request(request, deps)
         if isinstance(gated, web.Response):
             return gated
+
+        if not deps.auto_title_enabled:
+            return json_response(
+                {"error": "title_disabled"},
+                status=503,
+                origin=gated.origin,
+                allowed_origins=gated.allowed,
+                same_origin_host=gated.same_host,
+            )
 
         def err(payload: dict, status: int) -> web.Response:
             return json_response(

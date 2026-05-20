@@ -3,6 +3,16 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      Defence-in-depth CSP. Vite's singlefile build inlines our own JS
+      and CSS, so 'unsafe-inline' for script/style is required to keep
+      the bundle loadable; the rest is tightened. img-src allows https:
+      because /files/{id} can 302-redirect to R2 in direct mode.
+      connect-src allows https: for the same reason and for cross-
+      origin admin hosting via the apiBase field.
+    -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; connect-src 'self' https:; font-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none';" />
+    <meta name="referrer" content="strict-origin-when-cross-origin" />
     <title>WebChat Gateway</title>
     <meta name="description" content="WebChat Gateway 入口" />
     <meta name="robots" content="noindex" />

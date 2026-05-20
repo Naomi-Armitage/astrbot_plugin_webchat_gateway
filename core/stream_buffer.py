@@ -572,6 +572,32 @@ _ENTRY_FINAL = "final"  # tombstone marker
 _REDIS_BLOCK_MS = 5000
 
 
+# Atomic "check state then xadd" for `append_chunk`. Without this the
+# read-then-write was open to interleaving with close()'s
+# `HSET state=closed_* + XADD final`, allowing a chunk to land AFTER
+# the tombstone — which iter_subscribe's xrange loop drops because it
+# break's on the first `_ENTRY_FINAL`. Inside Lua the whole sequence
+# runs single-threaded on the server, so either we observe a
+# non-terminal state and our XADD is sequenced before any concurrent
+# close() tombstone, or we observe terminal and skip.
+#
+# KEYS[1] = meta_key, KEYS[2] = stream_key
+# ARGV[1] = seq (string), ARGV[2] = chunk text
+# ARGV[3] = META_STATE field name, ARGV[4]/ARGV[5] = ENTRY_SEQ/_TEXT
+# Returns: 1 if the chunk was appended, 0 if skipped.
+_APPEND_CHUNK_LUA = (
+    "local state = redis.call('HGET', KEYS[1], ARGV[3]) "
+    "if not state then return 0 end "
+    "if state == 'closed_ok' or state == 'closed_incomplete' "
+    "or state == 'closed_failed' then return 0 end "
+    "redis.call('XADD', KEYS[2], '*', ARGV[4], ARGV[1], ARGV[5], ARGV[2]) "
+    "if state ~= 'streaming' then "
+    "  redis.call('HSET', KEYS[1], ARGV[3], 'streaming') "
+    "end "
+    "return 1"
+)
+
+
 class RedisBuffer:
     """StreamBuffer implementation backed by Redis Streams + hashes.
 
@@ -869,29 +895,39 @@ class RedisBuffer:
     async def append_chunk(
         self, stream_id: str, seq: int, text: str
     ) -> None:
+        # State check + chunk write MUST be one atomic Redis operation,
+        # otherwise an `append_chunk` racing with `close()` can end up
+        # xadd-ing AFTER the close()'s tombstone — and `iter_subscribe`
+        # short-circuits the FIRST time it sees `_ENTRY_FINAL` in
+        # xrange order, silently dropping any chunk that landed past
+        # the tombstone. The previous code was a Python-side hget +
+        # pipeline(transaction=False) xadd, which left the read and
+        # the write open to interleaving with a parallel close's
+        # `HSET state=closed_*` + `XADD final` pipeline; the two
+        # XADDs could reorder relative to the chunk and the
+        # tombstone.
+        #
+        # Lua keeps everything single-threaded on the Redis server:
+        # if the script observes a terminal state, the XADD never
+        # runs (chunk dropped — the safe choice; close already won);
+        # if it observes a non-terminal state, the XADD lands before
+        # any close() racing in could write its own tombstone in a
+        # subsequent server-side command.
         client = await self._get_client()
         meta_key = self._meta_key(stream_id)
+        stream_key = self._stream_key(stream_id)
         try:
-            state = await client.hget(meta_key, _META_STATE)
-        except Exception:
-            logger.exception(
-                "[WebChatGateway] redis stream-buffer state read failed sid=%s",
-                stream_id,
+            await client.eval(
+                _APPEND_CHUNK_LUA,
+                2,
+                meta_key,
+                stream_key,
+                str(seq),
+                text,
+                _META_STATE,
+                _ENTRY_SEQ,
+                _ENTRY_TEXT,
             )
-            return
-        if state is None:
-            return
-        if state in _TERMINAL_STATES:
-            return
-        try:
-            pipe = client.pipeline(transaction=False)
-            pipe.xadd(
-                self._stream_key(stream_id),
-                {_ENTRY_SEQ: str(seq), _ENTRY_TEXT: text},
-            )
-            if state != "streaming":
-                pipe.hset(meta_key, _META_STATE, "streaming")
-            await pipe.execute()
         except Exception:
             logger.exception(
                 "[WebChatGateway] redis stream-buffer append failed sid=%s",
