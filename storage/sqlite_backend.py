@@ -12,6 +12,7 @@ from astrbot.api import logger
 
 from .base import (
     _UNSET,
+    AUDIT_DETAIL_MAX,
     AbstractStorage,
     AuditRow,
     FileRow,
@@ -534,10 +535,16 @@ class SqliteStorage(AbstractStorage):
         event: str,
         detail: str,
     ) -> None:
+        # AuditLogger already truncates detail at AUDIT_DETAIL_MAX; the
+        # cap here is belt-and-braces so a caller bypassing AuditLogger
+        # (test, ad-hoc tool, future refactor) can't pin a 1 MB row.
+        # SQLite TEXT is unbounded, so without this we'd silently
+        # store whatever the caller sends.
+        detail_capped = (detail or "")[:AUDIT_DETAIL_MAX]
         async with self._write_lock:
             await self._db.execute(
                 "INSERT INTO audit_log(ts, name, ip, event, detail) VALUES (?, ?, ?, ?, ?)",
-                (ts, name, ip, event, detail or ""),
+                (ts, name, ip, event, detail_capped),
             )
             await self._db.commit()
 

@@ -138,6 +138,25 @@ def make_chat_stream_handler(deps: ChatDeps):
                 same_origin_host=same_host,
             )
 
+        # Register the driver Task IMMEDIATELY after open() returns a
+        # handle, BEFORE any other awaitable (quota lookup, SSE setup).
+        # The previous ordering called register_driver only at SSE
+        # response setup time — so a shutdown landing in the gap
+        # between open() and register_driver wouldn't see this driver
+        # in `cancel_all_drivers()` and the handler kept writing SSE
+        # bytes / appending chunks into a registry mid-teardown. The
+        # window was small but spanned `storage.get_today_usage`, which
+        # is exactly the kind of await that lets a shutdown sneak in.
+        # The matching `unregister_driver` runs in the outermost
+        # finally so the entry never outlives the request task.
+        driver_task = asyncio.current_task()
+        if driver_task is not None:
+            deps.registry.register_driver(
+                stream_id=handle_obj.stream_id,
+                token_name=token.name,
+                task=driver_task,
+            )
+
         # Step 6: quota check — under the registry lock, before any SSE
         # bytes hit the wire so we can still return a JSON 429.
         today = date.today()
@@ -166,19 +185,8 @@ def make_chat_stream_handler(deps: ChatDeps):
                 same_origin_host=same_host,
             )
 
-        # Step 7: open SSE response.
-        # Register this request's driving Task with the registry BEFORE
-        # the SSE handshake so a cancel landing during the handshake
-        # window still finds the driver and aborts it; the matching
-        # `unregister_driver` runs in the outermost finally below so the
-        # entry never outlives the request task.
-        driver_task = asyncio.current_task()
-        if driver_task is not None:
-            deps.registry.register_driver(
-                stream_id=handle_obj.stream_id,
-                token_name=token.name,
-                task=driver_task,
-            )
+        # Step 7: open SSE response. (Driver registration moved up to
+        # immediately after open() — see the block above.)
         cors = build_cors_headers(origin, allowed, same_origin_host=same_host)
         response = web.StreamResponse(
             status=200,

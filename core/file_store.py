@@ -39,6 +39,20 @@ from urllib.parse import urlparse
 from astrbot.api import logger
 
 
+class FileStoreUnavailable(RuntimeError):
+    """Raised by `FileStore.read` when the backend itself is unreachable
+    (network error, auth failure, malformed bucket, etc.) — distinct
+    from a genuine "object missing", which is signalled by a `None`
+    return.
+
+    The /files serve handler treats this as 503 (transient: the file
+    may exist, just not reachable right now) rather than 404 (definitive:
+    object isn't there). Operators tailing the audit log can then tell
+    "R2 outage" apart from "row exists but bytes are gone", which the
+    previous swallow-everything-to-None contract conflated.
+    """
+
+
 class FileStore(Protocol):
     """Storage-driver-agnostic surface for image files.
 
@@ -47,6 +61,11 @@ class FileStore(Protocol):
     callers — for LocalFileStore it's a relative path under the
     configured root; for R2FileStore it's the object key in the bucket.
     Callers persist the key in the DB and pass it back to read/delete.
+
+    `read` returns the bytes on success, `None` when the object is
+    confirmed missing, and raises `FileStoreUnavailable` when the
+    backend itself can't be reached (so the handler can return 503
+    instead of conflating it with a 404).
     """
 
     async def save(
@@ -445,16 +464,20 @@ class R2FileStore:
                 async with resp["Body"] as body_stream:
                     return await body_stream.read()
         except Exception as exc:
-            # NoSuchKey is the common-and-expected miss. Other failures
-            # (network, auth, malformed bucket name) still surface via
-            # logger.exception so they don't get hidden behind the same
-            # return-None envelope.
+            # NoSuchKey is the common-and-expected miss — return None
+            # so callers (the serve handler) can map it to 404. Any
+            # other failure (network, auth, malformed bucket name) is
+            # a backend-unavailability signal: raise `FileStoreUnavailable`
+            # so the handler can surface it as 503 instead of pretending
+            # the object isn't there.
             if _is_no_such_key(exc):
                 return None
             logger.exception(
                 "[WebChatGateway] R2FileStore.read failed key=%s", storage_key
             )
-            return None
+            raise FileStoreUnavailable(
+                f"R2 read failed for key={storage_key!r}"
+            ) from exc
 
     async def open_local_path(
         self, *, storage_key: str
@@ -698,6 +721,7 @@ def make_file_store_from_config(uploads_cfg: Any) -> FileStore:
 
 __all__ = [
     "FileStore",
+    "FileStoreUnavailable",
     "LocalFileStore",
     "R2FileStore",
     "make_file_store_from_config",

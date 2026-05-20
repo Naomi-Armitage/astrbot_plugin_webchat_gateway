@@ -12,6 +12,7 @@ from pymysql.constants import CLIENT as _MYSQL_CLIENT_FLAGS
 
 from .base import (
     _UNSET,
+    AUDIT_DETAIL_MAX,
     AbstractStorage,
     AuditRow,
     FileRow,
@@ -586,12 +587,17 @@ class MysqlStorage(AbstractStorage):
         event: str,
         detail: str,
     ) -> None:
+        # See SqliteStorage.write_audit — same belt-and-braces cap.
+        # MySQL TEXT tops out at 64KB; without the cap a bypass-the-
+        # logger caller could trip a runtime error instead of a clean
+        # truncate.
+        detail_capped = (detail or "")[:AUDIT_DETAIL_MAX]
         async with self._write_tx() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     "INSERT INTO audit_log(ts, name, ip, event, detail) "
                     "VALUES (%s, %s, %s, %s, %s)",
-                    (ts, name, ip, event, detail or ""),
+                    (ts, name, ip, event, detail_capped),
                 )
 
     async def get_recent_audit(self, *, limit: int) -> list[AuditRow]:

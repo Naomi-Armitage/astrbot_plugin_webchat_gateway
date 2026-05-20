@@ -53,7 +53,7 @@ from typing import Any
 
 from astrbot.api import logger
 
-from ..storage.base import AbstractStorage
+from ..storage.base import AUDIT_DETAIL_MAX, AbstractStorage
 
 
 class AuditLogger:
@@ -77,8 +77,12 @@ class AuditLogger:
                 detail_str = json.dumps(detail, ensure_ascii=False, default=str)
             except (TypeError, ValueError):
                 detail_str = str(detail)
-        if len(detail_str) > 1024:
-            detail_str = detail_str[:1024]
+        # Defence in depth: storage.write_audit also caps to
+        # AUDIT_DETAIL_MAX, but truncating here avoids serialising a
+        # huge JSON blob into the network/storage path only to have
+        # the backend slice off the tail.
+        if len(detail_str) > AUDIT_DETAIL_MAX:
+            detail_str = detail_str[:AUDIT_DETAIL_MAX]
         try:
             await self._storage.write_audit(
                 ts=int(time.time()),

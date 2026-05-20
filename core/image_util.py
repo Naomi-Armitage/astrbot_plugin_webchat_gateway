@@ -26,6 +26,7 @@ and the handler only cares about the binary pass/fail signal. Returning
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 from io import BytesIO
 
 from PIL import Image
@@ -53,11 +54,31 @@ ALLOWED_MIME_TO_EXT: dict[str, str] = {
 # still refusing the classic "100 KB PNG that decodes to 1 GB" payload.
 PIL_MAX_PIXELS = 50_000_000
 
-# Apply globally at module load — Pillow's check looks at the class
-# attribute on every Image instance, so a single assignment covers
-# every call site that imports this module (which the upload handler
-# does first thing at startup).
-Image.MAX_IMAGE_PIXELS = PIL_MAX_PIXELS
+
+@contextmanager
+def _scoped_max_pixels(target: int):
+    """Temporarily set `Image.MAX_IMAGE_PIXELS` for one validation call.
+
+    The previous module-level assignment polluted every other AstrBot
+    plugin loaded in the same process: anyone using PIL.Image inherited
+    OUR threshold whether they wanted it or not. Scoping the override
+    to the actual call window restores the prior value on exit so
+    other plugins keep whatever policy they configured.
+
+    Not thread-safe in the strict sense — concurrent calls from
+    `detect_image_mime_async` (running on the default thread pool)
+    will all read/write the same class attribute. In practice every
+    one of our concurrent calls sets the SAME value, so the race is
+    benign for us; a co-resident plugin running PIL concurrently
+    would see our value during our window. Acceptable trade-off
+    vs. permanent global pollution.
+    """
+    saved = Image.MAX_IMAGE_PIXELS
+    Image.MAX_IMAGE_PIXELS = target
+    try:
+        yield
+    finally:
+        Image.MAX_IMAGE_PIXELS = saved
 
 
 # Pillow's `.format` strings → canonical MIME the spec accepts.
@@ -85,23 +106,24 @@ def detect_image_mime(content: bytes) -> str | None:
     """
     if not content:
         return None
-    try:
-        # First pass: verify integrity without decoding pixels. After
-        # verify() the file handle is consumed; Pillow forbids any
-        # further read on the same Image instance.
-        probe = Image.open(BytesIO(content))
-        probe.verify()
-    except Exception:
-        return None
-    try:
-        # Second pass: re-open on a fresh BytesIO to inspect .format
-        # (verify() left the previous handle unusable). We don't call
-        # .load() — .format is populated lazily from the header and
-        # doesn't need a full decode.
-        reopened = Image.open(BytesIO(content))
-        fmt = (reopened.format or "").upper()
-    except Exception:
-        return None
+    with _scoped_max_pixels(PIL_MAX_PIXELS):
+        try:
+            # First pass: verify integrity without decoding pixels. After
+            # verify() the file handle is consumed; Pillow forbids any
+            # further read on the same Image instance.
+            probe = Image.open(BytesIO(content))
+            probe.verify()
+        except Exception:
+            return None
+        try:
+            # Second pass: re-open on a fresh BytesIO to inspect .format
+            # (verify() left the previous handle unusable). We don't call
+            # .load() — .format is populated lazily from the header and
+            # doesn't need a full decode.
+            reopened = Image.open(BytesIO(content))
+            fmt = (reopened.format or "").upper()
+        except Exception:
+            return None
     return _FORMAT_TO_MIME.get(fmt)
 
 

@@ -43,7 +43,7 @@ from ..core.file_cookie import (
     FILE_AUTH_COOKIE_NAME,
     verify as verify_file_cookie,
 )
-from ..core.file_store import FileStore
+from ..core.file_store import FileStore, FileStoreUnavailable
 from ..core.image_util import (
     ALLOWED_MIME_TO_EXT,
     detect_image_mime_async,
@@ -681,6 +681,23 @@ def make_serve_handler(deps: UploadDeps):
 
         try:
             payload = await deps.file_store.read(storage_key=row.storage_key)
+        except FileStoreUnavailable:
+            # Backend unreachable (R2 outage, transient network) — 503
+            # so the client knows to retry rather than caching the
+            # error like a 404 would (browsers cache 404 on <img> for
+            # several minutes, which would visually break the chat
+            # for the duration of any flaky R2 incident).
+            logger.exception(
+                "[WebChatGateway] file_store.read backend unavailable"
+            )
+            return json_response(
+                {"error": "file_store_unavailable"},
+                status=503,
+                origin=origin,
+                allowed_origins=allowed,
+                same_origin_host=same_host,
+                extra_headers={"Retry-After": "5"},
+            )
         except Exception:
             logger.exception("[WebChatGateway] file_store.read failed")
             return json_response(

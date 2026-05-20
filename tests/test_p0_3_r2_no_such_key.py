@@ -220,12 +220,20 @@ class TestRealErrorsStillSurface:
     async def test_read_logs_on_unrelated_error(
         self, tmp_path: Any, caplog: pytest.LogCaptureFixture
     ):
+        from astrbot_plugin_webchat_gateway.core.file_store import (
+            FileStoreUnavailable,
+        )
+
         client = _StubClient(get_exc=_ClientErrorWithCode("AccessDenied"))
         store = _TestableR2FileStore(client=client, tmp_path=tmp_path)
         with caplog.at_level(logging.DEBUG, logger="astrbot.stub"):
-            result = await store.read(storage_key="some/key")
+            # Genuine backend errors now raise `FileStoreUnavailable` so
+            # the serve handler can 503 instead of conflating with a
+            # 404. logger.exception still fires so ops have the
+            # traceback in the AstrBot log.
+            with pytest.raises(FileStoreUnavailable):
+                await store.read(storage_key="some/key")
 
-        assert result is None
         exception_records = [
             r for r in caplog.records if r.exc_info is not None
         ]

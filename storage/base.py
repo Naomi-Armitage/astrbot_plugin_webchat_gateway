@@ -27,6 +27,16 @@ UNSET: _Sentinel = _Sentinel()
 _UNSET: _Sentinel = UNSET  # deprecated alias — prefer `UNSET`
 
 
+# Belt-and-braces cap on `audit_log.detail`. `core/audit.py` already
+# truncates to this length before calling write_audit, but the storage
+# layer enforces the same bound so any future caller that bypasses
+# AuditLogger (a test, a one-off admin tool, a refactor) can't write
+# a 1 MB row into SQLite (unbounded TEXT) or hit MySQL's TEXT 64KB
+# cap with a transient client-side surprise. Constant lives here so
+# both backends agree on the same number.
+AUDIT_DETAIL_MAX = 1024
+
+
 @dataclass(frozen=True)
 class TokenRow:
     name: str
