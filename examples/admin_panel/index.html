@@ -972,6 +972,26 @@
             <button id="refreshList" class="ghost">刷新</button>
           </div>
         </div>
+        <div class="filter-row">
+          <label>Name
+            <input id="listFilterName" type="text" placeholder="模糊匹配" autocomplete="off" spellcheck="false" />
+          </label>
+          <label>状态
+            <select id="listFilterStatus">
+              <option value="">全部</option>
+              <option value="active">active</option>
+              <option value="revoked">已撤销</option>
+              <option value="expired">已过期</option>
+            </select>
+          </label>
+          <label>备注
+            <input id="listFilterNote" type="text" placeholder="模糊匹配" autocomplete="off" spellcheck="false" />
+          </label>
+          <div class="filter-actions">
+            <button id="listApplyFilter" type="button">筛选</button>
+            <button id="listClearFilter" class="ghost" type="button">清除</button>
+          </div>
+        </div>
         <table>
           <thead>
             <tr>
@@ -1420,6 +1440,32 @@
       // ----- List -----
       let lastList = [];
       let listPageState = { page: 1, pageSize: 50 };
+
+      function applyListFilter(rows) {
+        // Client-side filter on the already-fetched dataset. The
+        // `含已撤销` checkbox is still the server-side toggle; this
+        // overlay narrows from there. Status is computed off the same
+        // `revoked_at` + `expires_at` rules `renderList` paints with,
+        // so badges and the dropdown stay in lockstep.
+        const name = ($("listFilterName").value || "").trim().toLowerCase();
+        const status = $("listFilterStatus").value;
+        const note = ($("listFilterNote").value || "").trim().toLowerCase();
+        if (!name && !status && !note) return rows;
+        const now = Date.now();
+        return rows.filter((t) => {
+          if (name && !String(t.name || "").toLowerCase().includes(name)) return false;
+          if (note && !String(t.note || "").toLowerCase().includes(note)) return false;
+          if (status) {
+            const expiredNow = t.expires_at != null && t.expires_at * 1000 <= now;
+            const actual = t.revoked_at
+              ? "revoked"
+              : (expiredNow ? "expired" : "active");
+            if (actual !== status) return false;
+          }
+          return true;
+        });
+      }
+
       async function loadList(resetPage = true) {
         const status = $("listStatus");
         status.textContent = "加载中...";
@@ -1439,22 +1485,34 @@
       }
       function renderListPage() {
         const { page, pageSize } = listPageState;
-        const total = lastList.length;
+        const filtered = applyListFilter(lastList);
+        const total = filtered.length;
+        const grand = lastList.length;
         const totalPages = Math.max(1, Math.ceil(total / pageSize));
         const curPage = Math.min(page, totalPages);
         listPageState.page = curPage;
         const start = (curPage - 1) * pageSize;
-        const slice = lastList.slice(start, start + pageSize);
+        const slice = filtered.slice(start, start + pageSize);
         renderList(slice);
         const pagination = $("listPagination");
         if (total === 0) {
           pagination.hidden = true;
+          // Surface "filter narrowed to zero" so an operator who
+          // typo'd a name doesn't think the dataset is empty.
+          if (grand > 0) {
+            const status = $("listStatus");
+            status.textContent = `当前筛选无匹配（数据集共 ${grand} 个 token）`;
+            status.className = "status";
+          }
         } else {
           pagination.hidden = false;
           const fromIdx = start + 1;
           const toIdx = Math.min(start + slice.length, total);
+          const filteredSuffix = total !== grand
+            ? ` · 筛选自 <strong>${grand}</strong>`
+            : "";
           $("listSummary").innerHTML =
-            `第 <strong>${fromIdx}-${toIdx}</strong> 条 / 共 <strong>${total}</strong> 条 · 第 <strong>${curPage}</strong> / ${totalPages} 页`;
+            `第 <strong>${fromIdx}-${toIdx}</strong> 条 / 共 <strong>${total}</strong> 条${filteredSuffix} · 第 <strong>${curPage}</strong> / ${totalPages} 页`;
           renderPager($("listPager"), curPage, totalPages, (p) => {
             listPageState.page = p;
             renderListPage();
@@ -1505,6 +1563,33 @@
         listPageState.page = 1;
         renderListPage();
       };
+      $("listApplyFilter").onclick = () => {
+        listPageState.page = 1;
+        renderListPage();
+      };
+      $("listClearFilter").onclick = () => {
+        $("listFilterName").value = "";
+        $("listFilterStatus").value = "";
+        $("listFilterNote").value = "";
+        listPageState.page = 1;
+        renderListPage();
+      };
+      // Enter inside any of the text filter fields applies; the
+      // status dropdown's change event already fires a re-render
+      // via the same path below.
+      ["listFilterName", "listFilterNote"].forEach((id) => {
+        $(id).addEventListener("keydown", (e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            listPageState.page = 1;
+            renderListPage();
+          }
+        });
+      });
+      $("listFilterStatus").addEventListener("change", () => {
+        listPageState.page = 1;
+        renderListPage();
+      });
 
       // ----- Stats -----
       function populateNames() {
