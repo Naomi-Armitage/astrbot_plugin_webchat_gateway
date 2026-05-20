@@ -777,6 +777,21 @@ function addMessageBubble(
   const hasImages = (role === "user" || role === "bot")
     && Array.isArray(attachments)
     && attachments.length > 0;
+  // Telegram-style image bubble classification:
+  //   has-image       — image + text. Image flushes to the bubble's
+  //                     top + sides; text continues below with the
+  //                     bubble's normal padding.
+  //   has-image-only  — image, no text. Drop the bubble chrome
+  //                     entirely (no background, no border, no
+  //                     padding); the image floats naked at the
+  //                     msg-row's edge alignment.
+  // Text emptiness is the discriminator. /image command generations
+  // come through with text="" (the image IS the reply), so they
+  // become has-image-only automatically.
+  if (hasImages) {
+    div.classList.add("has-image");
+    if (!text) div.classList.add("has-image-only");
+  }
   if (hasImages) {
     const list = attachments as AttachmentRef[];
     const count = Math.min(list.length, MAX_ATTACHMENTS_PER_MESSAGE);

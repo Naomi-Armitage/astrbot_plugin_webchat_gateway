@@ -1009,18 +1009,22 @@ footer button:disabled { opacity: .5; cursor: not-allowed; }
   box-shadow: 0 2px 6px var(--shadow-strong);
 }
 
-/* ----- user message image grid ----- */
-.msg.user .msg-attachments {
+/* ----- message attachment grid (user + bot) -----
+   The grid layout itself is symmetric across roles — user uploads and
+   bot /image generations both render through the same `.msg-attachments`
+   element. The bubble-chrome treatment (padding, background, border)
+   is what changes, and that's driven by the `.has-image` /
+   `.has-image-only` classes the JS toggles on `.msg` itself. */
+.msg .msg-attachments {
   display: grid;
   gap: 4px;
-  margin-bottom: 6px;
   border-radius: 10px;
   overflow: hidden;
 }
-.msg.user .msg-attachments.cnt-1 { grid-template-columns: 1fr; max-width: 320px; }
-.msg.user .msg-attachments.cnt-2 { grid-template-columns: 1fr 1fr; max-width: 320px; }
-.msg.user .msg-attachments.cnt-3 { grid-template-columns: 1fr 1fr 1fr; max-width: 360px; }
-.msg.user .msg-attachments.cnt-4 { grid-template-columns: 1fr 1fr; max-width: 320px; }
+.msg .msg-attachments.cnt-1 { grid-template-columns: 1fr; max-width: 320px; }
+.msg .msg-attachments.cnt-2 { grid-template-columns: 1fr 1fr; max-width: 320px; }
+.msg .msg-attachments.cnt-3 { grid-template-columns: 1fr 1fr 1fr; max-width: 360px; }
+.msg .msg-attachments.cnt-4 { grid-template-columns: 1fr 1fr; max-width: 320px; }
 .msg-image {
   width: 100%;
   height: 100%;
@@ -1030,23 +1034,57 @@ footer button:disabled { opacity: .5; cursor: not-allowed; }
   display: block;
   background: var(--paper-deep);
 }
-.msg.user .msg-attachments.cnt-1 .msg-image {
+.msg .msg-attachments.cnt-1 .msg-image {
   aspect-ratio: auto;
   max-height: 320px;
   object-fit: contain;
 }
-.msg.user .msg-text {
+.msg .msg-text {
   white-space: pre-wrap;
   overflow-wrap: break-word;
   word-break: normal;
 }
-.msg.user:has(.msg-attachments) {
-  /* User bubbles with attachments tighten the inner padding so the grid
-     sits flush with the bubble edges. */
-  padding: 6px;
+
+/* Image + text bubble — Telegram-style flush-to-edge image.
+   Bubble padding collapses to zero so the attachment grid touches the
+   bubble's outer border on top + left + right; the text wrapper inside
+   re-introduces its own padding so the caption keeps breathing room.
+   `overflow: hidden` keeps the image's corners clipped to the bubble's
+   `border-radius` instead of poking past the rounded outline. */
+.msg.has-image {
+  padding: 0;
+  overflow: hidden;
 }
-.msg.user:has(.msg-attachments) .msg-text {
-  padding: 2px 6px 4px;
+.msg.has-image .msg-attachments {
+  /* Grid fills the bubble; no inner gap to the bubble border.
+     `border-radius: 0` here lets the bubble's own radius do the
+     corner-clipping via the parent's overflow:hidden. */
+  border-radius: 0;
+  margin: 0;
+}
+.msg.has-image .msg-text,
+.msg.has-image .msg-text.md {
+  padding: 6px 12px 8px;
+  margin: 0;
+}
+
+/* Image-only bubble — no bubble chrome at all.
+   Image floats naked at the row's alignment edge (right for user,
+   left for bot). Removing background/border/padding/shadow + restoring
+   the grid's own border-radius gives the "no bubble" feel from
+   Telegram and modern iMessage. */
+.msg.has-image-only {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+  padding: 0;
+  /* Border-radius on the bubble itself becomes irrelevant once the
+     background and border are gone, but keep overflow:hidden off so
+     the grid's own 10px radius shows cleanly. */
+  overflow: visible;
+}
+.msg.has-image-only .msg-attachments {
+  border-radius: 12px;
 }
 
 /* ----- lightbox ----- */

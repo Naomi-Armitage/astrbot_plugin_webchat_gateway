@@ -266,12 +266,15 @@ def make_chat_handler(deps: ChatDeps):
                     token.name, day=today
                 )
                 remaining = max(0, token.daily_quota - new_count)
-                # CM history can't usefully store binary image bytes,
-                # so the assistant_text is a brief Chinese tag and the
-                # actual image surfaces through the assistant_attachments
-                # field that record_chat_pair forwards into the
-                # message_added event.
-                assistant_text = "[已生成 1 张图片]"
+                # Empty assistant text — the image IS the reply. A
+                # placeholder string like "[已生成 1 张图片]" reads
+                # as awkward filler in the chat bubble, and the
+                # client renders the attachment grid as a Telegram-
+                # style image-only bubble when the text is empty.
+                # CM history sees an empty assistant turn here; the
+                # next turn's prompt builder treats it the same as
+                # any empty-content row (no context contribution).
+                assistant_text = ""
                 await deps.conv_service.record_chat_pair(
                     token_name=token.name,
                     session_id=data.session_id,
