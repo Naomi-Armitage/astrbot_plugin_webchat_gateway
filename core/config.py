@@ -255,6 +255,10 @@ class ConfigView:
         return f"{self.endpoint_prefix}/admin/settings"
 
     @property
+    def admin_restart_path(self) -> str:
+        return f"{self.endpoint_prefix}/admin/restart"
+
+    @property
     def admin_login_path(self) -> str:
         return f"{self.endpoint_prefix}/admin/login"
 

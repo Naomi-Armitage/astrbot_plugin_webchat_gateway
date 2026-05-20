@@ -234,6 +234,8 @@ def build_app(deps: ServerDeps) -> web.Application:
     app.router.add_get(cfg.admin_settings_path, settings_handlers["get_settings"])
     app.router.add_patch(cfg.admin_settings_path, settings_handlers["patch_settings"])
     app.router.add_options(cfg.admin_settings_path, settings_handlers["preflight"])
+    app.router.add_post(cfg.admin_restart_path, settings_handlers["post_restart"])
+    app.router.add_options(cfg.admin_restart_path, settings_handlers["preflight"])
 
     auth = make_auth_handlers(
         AuthRouteDeps(

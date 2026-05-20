@@ -722,3 +722,201 @@ async def test_patch_without_auth_returns_401():
     assert config["audit_retention_days"] == 7
     events = [ev for ev, _ in audit.writes]
     assert "admin_settings_update" not in events
+
+
+# ---------------------------------------------------------------------
+# Restart endpoint
+# ---------------------------------------------------------------------
+
+
+async def _make_restart_client(deps):
+    """Same shape as `_make_client` but also wires the restart route so
+    the integration test can POST /admin/restart."""
+    from astrbot_plugin_webchat_gateway.handlers.admin_settings import (
+        make_admin_settings_handlers,
+    )
+
+    handlers = make_admin_settings_handlers(deps)
+    app = web.Application()
+    app.router.add_get("/api/webchat/admin/settings", handlers["get_settings"])
+    app.router.add_patch(
+        "/api/webchat/admin/settings", handlers["patch_settings"]
+    )
+    app.router.add_options(
+        "/api/webchat/admin/settings", handlers["preflight"]
+    )
+    app.router.add_post(
+        "/api/webchat/admin/restart", handlers["post_restart"]
+    )
+    app.router.add_options(
+        "/api/webchat/admin/restart", handlers["preflight"]
+    )
+    server = TestServer(app)
+    await server.start_server()
+    client = TestClient(server)
+    await client.start_server()
+    return client, server
+
+
+def _build_deps_with_restart(
+    *, config, audit, ip_guard, on_restart=None, on_reload=None
+):
+    from astrbot_plugin_webchat_gateway.handlers.admin_settings import (
+        AdminSettingsDeps,
+    )
+
+    return AdminSettingsDeps(
+        config=config,
+        audit=audit,
+        allowed_origins={"*"},
+        master_admin_key=_ADMIN_KEY,
+        ip_guard=ip_guard,
+        trust_forwarded_for=False,
+        trust_referer_as_origin=False,
+        allow_missing_origin=True,
+        on_reload=on_reload,
+        on_restart=on_restart,
+    )
+
+
+@pytest.mark.asyncio
+async def test_restart_schedules_callback_and_returns_202():
+    """Happy path: a valid POST returns 202 immediately AND schedules
+    the restart callback in a background task. The handler must NOT
+    block on the callback — otherwise the response can't make it out
+    before _stop tears down the aiohttp server."""
+    import asyncio as _asyncio
+
+    audit = _RecordingAudit()
+    guard = _StubIpGuard()
+    restart_done = _asyncio.Event()
+    restart_calls = []
+
+    async def _restart():
+        restart_calls.append(True)
+        restart_done.set()
+
+    deps = _build_deps_with_restart(
+        config=_StubConfig(), audit=audit, ip_guard=guard, on_restart=_restart
+    )
+    client, server = await _make_restart_client(deps)
+    try:
+        resp = await client.post(
+            "/api/webchat/admin/restart", headers=_auth_headers()
+        )
+        assert resp.status == 202
+        body = await resp.json()
+        assert body == {"status": "restarting"}
+        # At response time the callback hasn't run yet (the handler
+        # sleeps 0.25s before invoking it).
+        assert restart_calls == []
+        # The background task should fire within ~1s.
+        await _asyncio.wait_for(restart_done.wait(), timeout=2.0)
+        assert restart_calls == [True]
+    finally:
+        await client.close()
+        await server.close()
+    # Audit row written BEFORE the lifecycle bounce so the breadcrumb
+    # survives even if _stop kills the writer.
+    events = [ev for ev, _ in audit.writes]
+    assert "admin_restart" in events
+    detail = next(kw["detail"] for ev, kw in audit.writes if ev == "admin_restart")
+    assert detail == {"phase": "requested"}
+
+
+@pytest.mark.asyncio
+async def test_restart_without_auth_returns_401():
+    audit = _RecordingAudit()
+    guard = _StubIpGuard()
+    fired = []
+
+    async def _restart():
+        fired.append(True)
+
+    deps = _build_deps_with_restart(
+        config=_StubConfig(), audit=audit, ip_guard=guard, on_restart=_restart
+    )
+    client, server = await _make_restart_client(deps)
+    try:
+        resp = await client.post("/api/webchat/admin/restart")
+        assert resp.status == 401
+    finally:
+        await client.close()
+        await server.close()
+    # Unauthenticated request must NOT schedule the restart callback
+    # and must NOT emit an admin_restart audit row.
+    assert fired == []
+    events = [ev for ev, _ in audit.writes]
+    assert "admin_restart" not in events
+
+
+@pytest.mark.asyncio
+async def test_restart_returns_503_when_callback_not_wired():
+    """If the host plugin didn't supply ``on_restart`` (e.g. a test
+    deployment, or a future variant without lifecycle access), the
+    handler must surface a clear 503 instead of silently succeeding."""
+    audit = _RecordingAudit()
+    guard = _StubIpGuard()
+    deps = _build_deps_with_restart(
+        config=_StubConfig(), audit=audit, ip_guard=guard, on_restart=None
+    )
+    client, server = await _make_restart_client(deps)
+    try:
+        resp = await client.post(
+            "/api/webchat/admin/restart", headers=_auth_headers()
+        )
+        assert resp.status == 503
+        body = await resp.json()
+        assert body.get("error") == "restart_not_supported"
+    finally:
+        await client.close()
+        await server.close()
+    # No admin_restart row when we couldn't actually restart.
+    events = [ev for ev, _ in audit.writes]
+    assert "admin_restart" not in events
+
+
+@pytest.mark.asyncio
+async def test_restart_response_does_not_block_on_slow_callback():
+    """Even a callback that takes seconds (or hangs) must not delay
+    the 202. The handler dispatches the callback in a fire-and-forget
+    task so the response writes out cleanly."""
+    import asyncio as _asyncio
+    import time as _time
+
+    audit = _RecordingAudit()
+    guard = _StubIpGuard()
+    started = _asyncio.Event()
+
+    async def _slow_restart():
+        started.set()
+        # Long enough that a synchronous-await handler would obviously
+        # blow past the response timeout, short enough that the test
+        # still finishes promptly.
+        await _asyncio.sleep(2.0)
+
+    deps = _build_deps_with_restart(
+        config=_StubConfig(),
+        audit=audit,
+        ip_guard=guard,
+        on_restart=_slow_restart,
+    )
+    client, server = await _make_restart_client(deps)
+    try:
+        t0 = _time.monotonic()
+        resp = await client.post(
+            "/api/webchat/admin/restart", headers=_auth_headers()
+        )
+        elapsed = _time.monotonic() - t0
+        assert resp.status == 202
+        # Response must arrive well before the 2.0s the callback
+        # actually takes (with margin for the 0.25s pre-call sleep
+        # the handler does AFTER the response goes out).
+        assert elapsed < 1.0, f"handler blocked on slow callback: {elapsed:.2f}s"
+    finally:
+        await client.close()
+        await server.close()
+    # And the callback did start (proving fire-and-forget actually
+    # scheduled it — not just that we skipped it).
+    await _asyncio.wait_for(started.wait(), timeout=2.0)
+

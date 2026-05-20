@@ -297,6 +297,7 @@ class WebChatGatewayPlugin(Star):
                 trust_referer_as_origin=cfg.trust_referer_as_origin,
                 allow_missing_origin=cfg.allow_missing_origin,
                 on_reload=self._reload_cfg,
+                on_restart=self._restart,
             )
             title_deps = TitleDeps(
                 storage=storage,
@@ -404,6 +405,38 @@ class WebChatGatewayPlugin(Star):
         operator which fields need a restart to be observed.
         """
         self._cfg = ConfigView.from_raw(self.config)
+
+    async def _restart(self) -> None:
+        """Full ``_stop`` + ``_start`` cycle in response to the admin
+        panel's "重启服务" action.
+
+        Used by the ``POST /admin/restart`` handler so an operator can
+        apply boot-time config changes (almost everything except
+        ``audit_retention_days``) without a round-trip through the
+        AstrBot dashboard. The handler schedules this in a background
+        task AFTER returning its 202, so the response itself is sent
+        before the aiohttp server starts tearing down.
+
+        Exceptions from ``_start`` are logged but not re-raised — there
+        is no caller to catch them anyway, and at this point the plugin
+        is between lifecycles. The operator's recovery path is the
+        AstrBot plugin-reload UI, which we can't substitute for.
+        """
+        logger.info("[WebChatGateway] admin restart: stopping")
+        try:
+            await self._stop()
+        except Exception:
+            logger.exception(
+                "[WebChatGateway] admin restart: _stop raised"
+            )
+        logger.info("[WebChatGateway] admin restart: starting")
+        try:
+            await self._start()
+        except Exception:
+            logger.exception(
+                "[WebChatGateway] admin restart: _start raised — plugin is "
+                "stopped. Use AstrBot's plugin-reload UI to recover."
+            )
 
     async def _chat_sync_prune_loop(self) -> None:
         """Drive `PruneOrchestrator.run_iteration` on the configured

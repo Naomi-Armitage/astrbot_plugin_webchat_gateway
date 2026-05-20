@@ -1,4 +1,4 @@
-"""Admin HTTP handlers: settings whitelist GET + PATCH.
+"""Admin HTTP handlers: settings whitelist GET + PATCH + service restart.
 
 Operates on the live ``AstrBotConfig`` mapping (dict-like) passed in
 through ``AdminSettingsDeps.config``. Writes go through the schema
@@ -8,10 +8,19 @@ dotted-path navigation stay in one place.
 PATCH is atomic: every key in ``updates`` is validated first, and only
 if ALL validate does the handler call ``config.save_config()`` and the
 optional reload callback. A single bad key rejects the whole batch.
+
+POST /admin/restart triggers the plugin's own ``_stop`` + ``_start``
+in a fire-and-forget background task — boot-time config (host/port/
+storage stay frozen anyway) makes a full lifecycle bounce the only
+way to surface most settings changes without operator intervention
+on the AstrBot side. The handler returns 202 BEFORE the restart runs
+so the response itself isn't cancelled by the server shutting down
+mid-write.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
@@ -56,6 +65,13 @@ class AdminSettingsDeps:
     # next read (audit_retention_days, et al.). Optional so tests can
     # stub it out.
     on_reload: Callable[[], Awaitable[None]] | None = None
+    # Called when the operator clicks "重启服务" in the admin panel.
+    # Should perform a full `_stop` + `_start` cycle. The handler
+    # schedules this as a background task AFTER it returns the 202
+    # response (otherwise the in-flight response would be cancelled
+    # by the aiohttp server going away mid-restart). Optional so
+    # tests can stub it out.
+    on_restart: Callable[[], Awaitable[None]] | None = None
 
 
 async def _read_json(request: web.Request) -> dict:
@@ -234,8 +250,69 @@ def make_admin_settings_handlers(deps: AdminSettingsDeps):
             same_origin_host=request.host,
         )
 
+    async def post_restart(request: web.Request) -> web.Response:
+        origin = _origin(request)
+        ip = client_ip(request, trust_forwarded_for=deps.trust_forwarded_for)
+        try:
+            await _gate(
+                request, ip, origin, allow_missing=deps.allow_missing_origin
+            )
+        except ServiceError as exc:
+            return _err(request, origin, exc)
+        except Exception:
+            logger.exception("[WebChatGateway] admin restart gate failed")
+            return _err(request, origin, ServiceError("internal_error", status=500))
+
+        if deps.on_restart is None:
+            # Restart wiring is optional — if the plugin host didn't
+            # supply a callback, surface 503 rather than pretending it
+            # worked. UI can fall back to "请联系管理员" or read the
+            # AstrBot logs.
+            return _err(
+                request, origin, ServiceError("restart_not_supported", status=503)
+            )
+
+        try:
+            await deps.audit.write(
+                "admin_restart",
+                ip=ip,
+                detail={"phase": "requested"},
+            )
+        except Exception:
+            logger.exception("[WebChatGateway] admin_restart audit write failed")
+
+        # Schedule the actual stop+start in a background task so this
+        # handler can finish writing its 202 first. A small initial
+        # sleep gives aiohttp time to flush the response onto the
+        # socket before the server lifecycle starts tearing it down.
+        async def _delayed_restart() -> None:
+            try:
+                await asyncio.sleep(0.25)
+                await deps.on_restart()  # type: ignore[misc]
+            except Exception:
+                # The restart implementation should already log its own
+                # exceptions; this is the last-resort net. Operator
+                # falls back to AstrBot's plugin-reload to recover.
+                logger.exception("[WebChatGateway] admin restart failed")
+
+        # We deliberately don't track the task — the new lifecycle
+        # will be installed by _start anyway, and we don't want the
+        # outgoing 202 to block on it.
+        asyncio.create_task(
+            _delayed_restart(), name="webchat-admin-restart"
+        )
+
+        return json_response(
+            {"status": "restarting"},
+            status=202,
+            origin=origin,
+            allowed_origins=allowed,
+            same_origin_host=request.host,
+        )
+
     return {
         "get_settings": get_settings,
         "patch_settings": patch_settings,
+        "post_restart": post_restart,
         "preflight": preflight,
     }

@@ -787,6 +787,23 @@
         color: var(--text-strong);
         border-color: var(--accent);
       }
+      header #restartBtn {
+        /* Sits in the same logout-btn slot but reads as a hot action.
+           Subtle accent-tinted background so it's visually distinct
+           from 登出 without screaming "danger". */
+        color: var(--accent-strong);
+        border-color: rgba(163, 113, 247, .35);
+        background: var(--accent-soft);
+      }
+      header #restartBtn:hover:not(:disabled) {
+        color: #fff;
+        background: var(--accent);
+        border-color: var(--accent);
+      }
+      header #restartBtn:disabled {
+        opacity: 0.55;
+        cursor: progress;
+      }
 
       @media (max-width: 720px) {
         .conn { grid-template-columns: 1fr; }
@@ -831,6 +848,7 @@
         </a>
         <h1>WebChat Gateway · Admin Panel</h1>
         <span class="pill" id="sessionPill">session</span>
+        <button id="restartBtn" class="logout-btn" type="button" title="停止并重启 WebChat 服务（生效全部已保存设置）">重启服务</button>
         <button id="logoutBtn" class="logout-btn" type="button">登出</button>
         <a class="back" href="/">← 首页</a>
       </header>
@@ -1194,6 +1212,68 @@
           // Cookie clear-on-error is the server's job; we still show login.
         }
         showLogin("已登出。");
+      };
+
+      // ----- Restart service -----
+      // POST /admin/restart kicks off a full _stop + _start cycle on the
+      // server side. The handler returns 202 BEFORE the lifecycle bounce
+      // so this fetch always succeeds; the server then drops the socket
+      // a moment later, so subsequent requests will fail for ~1-3s
+      // while routes re-register. We poll /admin/me once a second to
+      // detect when the server is back, then surface a success state.
+      $("restartBtn").onclick = async () => {
+        const btn = $("restartBtn");
+        if (btn.disabled) return;
+        const ok = confirm(
+          "重启 WebChat 服务？\n" +
+          "\n" +
+          "• 所有正在进行的对话流会被中断（聊天页会自动重连）。\n" +
+          "• 几乎所有设置项只有重启后才会生效，这是常规操作。\n" +
+          "• 若重启失败，请到 AstrBot 后台手动重载本插件。"
+        );
+        if (!ok) return;
+        btn.disabled = true;
+        const originalText = btn.textContent;
+        btn.textContent = "重启中...";
+        try {
+          const resp = await fetch(buildUrl("/api/webchat/admin/restart"), {
+            method: "POST",
+            credentials: "include",
+          });
+          if (!resp.ok && resp.status !== 202) {
+            const data = await resp.json().catch(() => ({}));
+            alert(`重启请求失败：${data.error || resp.status}`);
+            btn.textContent = originalText;
+            btn.disabled = false;
+            return;
+          }
+          // Poll for the server coming back. 30 attempts × ~1s ≈ 30s
+          // ceiling — generous so a slow storage init doesn't trip
+          // a false negative.
+          for (let i = 0; i < 30; i++) {
+            await new Promise((r) => setTimeout(r, 1000));
+            try {
+              const me = await fetch(buildUrl("/api/webchat/admin/me"), {
+                credentials: "include",
+              });
+              if (me.ok) {
+                btn.textContent = originalText;
+                btn.disabled = false;
+                alert("WebChat 服务已重启完成。");
+                return;
+              }
+            } catch (e) {
+              // Socket refused / DNS hiccup → not back yet, keep polling.
+            }
+          }
+          btn.textContent = originalText;
+          btn.disabled = false;
+          alert("等待服务恢复超时。请检查 AstrBot 日志，并视情况手动重载插件。");
+        } catch (e) {
+          btn.textContent = originalText;
+          btn.disabled = false;
+          alert(`重启失败：${e.message}`);
+        }
       };
 
       // tab switching
@@ -1671,13 +1751,12 @@
         labelText.className = "key";
         labelText.textContent = field.key;
         label.appendChild(labelText);
-        if (field.restart_required) {
-          const badge = document.createElement("span");
-          badge.className = "badge expired";
-          badge.textContent = "需重启";
-          badge.title = "保存后需重启 AstrBot 才能生效";
-          label.appendChild(badge);
-        }
+        // Per-field 需重启 badges removed: nearly every whitelisted field
+        // requires a restart, so a badge per row was visual noise. The
+        // saved-status line below summarises restart-required keys, and
+        // the header has a one-click 重启服务 button. The
+        // `restart_required` flag is still kept on the field object for
+        // the save-status classification.
         row.appendChild(label);
 
         let control;
@@ -1861,7 +1940,11 @@
           }
           const restartCount = restartList.length;
           if (restartCount > 0) {
-            sectionStatus.textContent = `已保存 ${saved.length} 项（${restartCount} 项需重启生效）`;
+            // Most whitelisted fields are boot-snapshotted; surface
+            // the one-click "重启服务" affordance in the header rather
+            // than leaving the operator wondering whether they need
+            // to round-trip through AstrBot.
+            sectionStatus.textContent = `已保存 ${saved.length} 项 · 点击右上角“重启服务”使配置生效`;
           } else {
             sectionStatus.textContent = `已保存 ${saved.length} 项（已生效）`;
           }

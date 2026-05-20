@@ -19,6 +19,10 @@ Admin reads (audit-trail-only, mirrors lifecycle vocabulary):
                       welcome messages, and similar fields may contain
                       operator-typed text or non-public infrastructure
                       hostnames that shouldn't enter the audit log.
+    admin_restart   — admin triggered a service restart via the panel's
+                      "重启服务" action; detail: {phase: "requested"}.
+                      Emitted BEFORE the actual _stop/_start cycle so
+                      the row survives the lifecycle bounce.
     admin_auth_fail — admin auth attempt failed at the gate;
                       detail: {reason: no_token|invalid_key|admin_disabled|ip_blocked,
                                retry_after?: int}
