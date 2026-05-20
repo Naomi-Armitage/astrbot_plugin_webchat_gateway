@@ -491,6 +491,7 @@ def make_serve_handler(deps: UploadDeps):
         token = None
         token_name_via_cookie: str | None = None
         presented = extract_bearer(request)
+        cookie_value: str | None = None
         if presented:
             # Header path — full gate_request gives us a uniform
             # GatePass. We use it directly.
@@ -562,31 +563,34 @@ def make_serve_handler(deps: UploadDeps):
                             ):
                                 token = None
         if token is None:
-            # No bearer AND no/invalid cookie — record IP failure so an
-            # attacker probing /files/{id} at unlimited rate gets the
-            # same brute-force cost as probing /chat. Without this the
-            # serve endpoint is a quieter enumeration channel than the
-            # other auth-gated routes; the file_id space is 96 bits
-            # (infeasible to brute-force) but the missing accounting
-            # weakens the gateway's overall deterrent contract.
-            #
-            # We do NOT count failures where a cookie WAS present but
-            # didn't verify — that's covered by the file_cookie_secret
-            # rotation + token-hash binding contract (an attacker who
-            # forges a sig has bigger problems than IP-guard) and we
-            # want token revocation to be observable without instantly
-            # locking out the user's other IP.
-            try:
-                await deps.ip_guard.record_failure(ip)
-            except Exception:
-                logger.exception(
-                    "[WebChatGateway] /files ip_guard.record_failure failed"
-                )
+            # Brute-force accounting only fires when NEITHER credential
+            # type was presented — bearer absent AND no file-auth cookie
+            # on the request. A cookie that was present but failed to
+            # verify (bad sig, expired, logout-invalidated, sig over a
+            # rotated token_hash, or covering a revoked/expired token)
+            # is NOT counted: those are the user's own cookies racing
+            # against admin-side state changes (e.g. regenerate_token
+            # rotates the hash → every open tab fails HMAC at once →
+            # IP self-lockout). The 96-bit file_id space already makes
+            # serve enumeration infeasible without a cookie; the
+            # brute-force deterrent is only meaningful against
+            # unauthenticated probes, which is the case we count here.
+            no_credential_presented = (not presented) and (not cookie_value)
+            if no_credential_presented:
+                try:
+                    await deps.ip_guard.record_failure(ip)
+                except Exception:
+                    logger.exception(
+                        "[WebChatGateway] /files ip_guard.record_failure failed"
+                    )
             try:
                 await deps.audit.write(
                     "auth_fail",
                     ip=ip,
-                    detail={"reason": "no_token", "endpoint": "files"},
+                    detail={
+                        "reason": "no_token" if no_credential_presented else "bad_cookie",
+                        "endpoint": "files",
+                    },
                 )
             except Exception:
                 pass

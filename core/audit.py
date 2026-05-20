@@ -18,7 +18,13 @@ Admin reads (audit-trail-only, mirrors lifecycle vocabulary):
                                retry_after?: int}
 
 Chat path (per request):
-    auth_fail       — bearer missing/invalid/revoked; detail: {reason}
+    auth_fail       — bearer missing/invalid/revoked; detail: {reason}.
+                      `/files/{id}` adds `endpoint: "files"` and uses
+                      `reason: bad_cookie` for cookies that were
+                      presented but didn't verify (sig mismatch / exp /
+                      logout-invalidated / token rotated / revoked).
+                      Only `no_token` (no credential at all) increments
+                      IP-guard counters.
     concurrent_block — per-token concurrency lock rejected the request
     quota_exceeded  — daily quota hit; detail: {today_count, quota}
     llm_timeout     — provider call exceeded llm_timeout_seconds; detail: {msg_len}
