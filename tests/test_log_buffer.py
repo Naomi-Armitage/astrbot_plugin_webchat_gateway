@@ -540,3 +540,81 @@ class TestAdminLogsGet:
         # supplied 99999 — defensive against a polling client with
         # a busted query.
         assert len(data["entries"]) == 5
+
+
+@pytest.mark.asyncio
+class TestAdminLogsStreamShutdown:
+    """Regression test for the SSE-pump teardown hang.
+
+    Before the shutdown_event hook, `/admin/logs/stream` ran
+    `while True: await buffer.wait_for_new(timeout=20s)`. When the
+    plugin's `_stop` called `runner.cleanup()`, aiohttp waited the
+    full TCPSite shutdown_timeout (default 60s) for every open SSE
+    connection to drain — which never happened, because the pump
+    didn't watch any shutdown signal. AstrBot's "正在终止插件 ..."
+    retry storm on a ~minute cadence is the operational signature.
+
+    This test pins that the shutdown_event short-circuits the loop:
+    the request handler returns within milliseconds of `event.set()`,
+    so `runner.cleanup()` can complete promptly.
+    """
+
+    async def test_shutdown_event_short_circuits_stream(self):
+        import asyncio
+
+        from astrbot_plugin_webchat_gateway.core.log_buffer import LogBuffer
+        from astrbot_plugin_webchat_gateway.handlers.admin_logs import (
+            AdminLogsDeps,
+            make_admin_logs_handlers,
+        )
+
+        buf = LogBuffer(capacity=10)
+        event = asyncio.Event()
+        deps = AdminLogsDeps(
+            buffer=buf,
+            audit=_RecordingAudit(),
+            allowed_origins={"*"},
+            master_admin_key=_ADMIN_KEY,
+            ip_guard=_StubIpGuard(),
+            trust_forwarded_for=False,
+            trust_referer_as_origin=False,
+            allow_missing_origin=True,
+            shutdown_event=event,
+        )
+        handlers = make_admin_logs_handlers(deps)
+        app = web.Application()
+        app.router.add_get(
+            "/api/webchat/admin/logs/stream", handlers["stream_logs"]
+        )
+        server = TestServer(app)
+        await server.start_server()
+        client = TestClient(server)
+        await client.start_server()
+        try:
+            # Kick off the SSE subscription. We don't await the body —
+            # we want the pump running so we can race the shutdown
+            # event against it.
+            resp_task = asyncio.create_task(
+                client.get(
+                    "/api/webchat/admin/logs/stream",
+                    headers=_auth_headers(),
+                )
+            )
+            # Let the handler reach its main `while True` loop.
+            await asyncio.sleep(0.1)
+            # Fire shutdown. The pump should exit on the next tick,
+            # NOT after the 20s keepalive timer.
+            event.set()
+            # Generous wall-clock budget — the pump's
+            # `_SSE_KEEPALIVE_SECONDS` is 20s, so anything well below
+            # that proves the shutdown-event path triggered. 2s gives
+            # plenty of headroom for slow CI.
+            resp = await asyncio.wait_for(resp_task, timeout=2.0)
+            # Consume the streamed body so the connection closes
+            # cleanly — otherwise the TestClient teardown can hang
+            # waiting for the read.
+            await resp.read()
+            assert resp.status == 200
+        finally:
+            await client.close()
+            await server.close()

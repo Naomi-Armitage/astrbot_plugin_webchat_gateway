@@ -96,6 +96,11 @@ class WebChatGatewayPlugin(Star):
         # so a subsequent reload doesn't double-handle records.
         self._log_buffer: LogBuffer | None = None
         self._log_handler: LogBufferHandler | None = None
+        # Plugin-level shutdown signal. The admin /logs/stream SSE pump
+        # races this against `buffer.wait_for_new` so it exits promptly
+        # when `_stop` fires it. Re-created each `_start` cycle so a
+        # hot reload doesn't reuse a stuck-set event.
+        self._log_shutdown_event: asyncio.Event | None = None
 
     async def initialize(self) -> None:
         await self._start()
@@ -156,6 +161,9 @@ class WebChatGatewayPlugin(Star):
                 )
             self._log_buffer = log_buffer
             self._log_handler = log_handler
+            # Fresh shutdown event per `_start` so a previous `_stop`
+            # that set it doesn't immediately drop the next subscriber.
+            self._log_shutdown_event = asyncio.Event()
 
             token_service = TokenService(
                 storage,
@@ -354,6 +362,7 @@ class WebChatGatewayPlugin(Star):
                 trust_forwarded_for=cfg.trust_forwarded_for,
                 trust_referer_as_origin=cfg.trust_referer_as_origin,
                 allow_missing_origin=cfg.allow_missing_origin,
+                shutdown_event=self._log_shutdown_event,
             )
             title_deps = TitleDeps(
                 storage=storage,
@@ -608,6 +617,16 @@ class WebChatGatewayPlugin(Star):
                 logger.exception(
                     "[WebChatGateway] driver cancel-all raised on shutdown"
                 )
+        # Signal active /admin/logs/stream SSE pumps to drop their
+        # connections BEFORE `lifecycle.stop()` calls `runner.cleanup()`.
+        # Otherwise aiohttp would block on those handlers for the full
+        # TCPSite shutdown_timeout (60s by default) — which is what
+        # produced the "正在终止插件 ..." retry loop in AstrBot.
+        if self._log_shutdown_event is not None:
+            try:
+                self._log_shutdown_event.set()
+            except Exception:
+                pass
         await self._lifecycle.stop()
         if self._storage is not None:
             try:
@@ -632,6 +651,7 @@ class WebChatGatewayPlugin(Star):
                 pass
             self._log_handler = None
         self._log_buffer = None
+        self._log_shutdown_event = None
 
     # ----- AstrBot in-bot admin commands -----
 

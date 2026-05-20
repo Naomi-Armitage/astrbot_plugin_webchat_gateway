@@ -338,7 +338,16 @@ class ServerLifecycle:
             runner = web.AppRunner(app)
             await runner.setup()
             try:
-                site = web.TCPSite(runner, host, port)
+                # `shutdown_timeout` caps how long `runner.cleanup()`
+                # will wait for in-flight handlers to return before
+                # force-closing their sockets. Default is 60s, which
+                # is fine for short request/response handlers but is
+                # catastrophic for SSE / long-poll handlers — the
+                # plugin's `terminate()` would block for 60s per open
+                # stream, and AstrBot would retry termination on a
+                # ~minute cadence. We signal SSE pumps to exit
+                # explicitly in `_stop`, so this is just a safety net.
+                site = web.TCPSite(runner, host, port, shutdown_timeout=5.0)
                 await site.start()
             except BaseException:
                 # AppRunner.setup() succeeded — if TCPSite construction or

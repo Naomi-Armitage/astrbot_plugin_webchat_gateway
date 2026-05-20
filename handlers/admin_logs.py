@@ -74,6 +74,13 @@ class AdminLogsDeps:
     trust_forwarded_for: bool
     trust_referer_as_origin: bool = False
     allow_missing_origin: bool = False
+    # Plugin-level "we're shutting down, drop your SSE" signal. The
+    # SSE pump races this against `buffer.wait_for_new` so it exits
+    # promptly when `_stop` fires it; without this hook the pump
+    # would only exit on connection-reset, and `runner.cleanup()`
+    # would block for the full `shutdown_timeout` waiting for the
+    # request handler to return.
+    shutdown_event: asyncio.Event | None = None
 
 
 def _parse_int(value, default: int, lo: int, hi: int) -> int:
@@ -222,6 +229,7 @@ def make_admin_logs_handlers(deps: AdminLogsDeps):
 
         cursor = since
         last_keepalive = time.monotonic()
+        shutdown_event = deps.shutdown_event
         try:
             # Initial backfill: drain whatever the buffer already has
             # past `since` so the browser doesn't have to make a
@@ -237,9 +245,40 @@ def make_admin_logs_handlers(deps: AdminLogsDeps):
                     f"data: {payload}\n\n".encode("utf-8")
                 )
             while True:
-                await deps.buffer.wait_for_new(
-                    timeout=_SSE_KEEPALIVE_SECONDS
+                # Race the buffer wakeup against the plugin's shutdown
+                # event so `_stop` can drop this connection promptly.
+                # Without this, `runner.cleanup()` blocks for the full
+                # TCPSite shutdown_timeout (default 60s) on every
+                # subscriber — and on a chatty admin panel that means
+                # multi-minute teardowns and AstrBot's "正在终止插件"
+                # retry storm.
+                if shutdown_event is not None and shutdown_event.is_set():
+                    break
+                wakeup = asyncio.create_task(
+                    deps.buffer.wait_for_new(timeout=_SSE_KEEPALIVE_SECONDS)
                 )
+                waiters: list = [wakeup]
+                shutdown_waiter: asyncio.Task | None = None
+                if shutdown_event is not None:
+                    shutdown_waiter = asyncio.create_task(shutdown_event.wait())
+                    waiters.append(shutdown_waiter)
+                try:
+                    done, _pending = await asyncio.wait(
+                        waiters, return_when=asyncio.FIRST_COMPLETED
+                    )
+                finally:
+                    # Cancel the loser so it doesn't leak past loop tick.
+                    for w in waiters:
+                        if not w.done():
+                            w.cancel()
+                    # Drain cancellations to surface only meaningful errors.
+                    for w in waiters:
+                        try:
+                            await w
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                if shutdown_waiter is not None and shutdown_waiter in done:
+                    break
                 now = time.monotonic()
                 entries, cursor = deps.buffer.snapshot(
                     since=cursor,
