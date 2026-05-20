@@ -30,6 +30,8 @@ import asyncio
 import base64
 
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
 
 
 # ---------------------------------------------------------------------
@@ -523,3 +525,226 @@ class TestImageGenConfig:
         # api_key is the only secret in the group.
         assert field_for_key("image_gen.api_key").secret is True
         assert field_for_key("image_gen.endpoint").secret is False
+
+    def test_image_gen_fields_hot_reload(self):
+        """All six image_gen.* fields must be restart_required=False
+        — the bug they fix was 'operator enabled the feature, saved,
+        but the chat kept returning image_disabled' because
+        ImageBridge captured the boot-time empty api_key in closure.
+        main.py's _reload_cfg now rebuilds the bridge from the live
+        ConfigView and swaps it into ChatDeps, so a save should be
+        immediately observable in /chat behaviour."""
+        from astrbot_plugin_webchat_gateway.core.settings_schema import (
+            field_for_key,
+        )
+
+        for key in (
+            "image_gen.enabled",
+            "image_gen.endpoint",
+            "image_gen.api_key",
+            "image_gen.model",
+            "image_gen.size",
+            "image_gen.timeout_seconds",
+        ):
+            spec = field_for_key(key)
+            assert spec is not None
+            assert spec.restart_required is False, (
+                f"{key!r} is supposed to be hot-reloadable now"
+            )
+
+
+# ---------------------------------------------------------------------
+# chat_provider_id override
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("tmp_data_dir")
+class TestChatProviderId:
+    def test_default_empty(self):
+        from astrbot_plugin_webchat_gateway.core.config import ConfigView
+
+        cfg = ConfigView.from_raw({})
+        assert cfg.chat_provider_id == ""
+
+    def test_strips_whitespace(self):
+        from astrbot_plugin_webchat_gateway.core.config import ConfigView
+
+        cfg = ConfigView.from_raw({"chat_provider_id": "  my-provider  "})
+        assert cfg.chat_provider_id == "my-provider"
+
+    def test_in_settings_whitelist(self):
+        from astrbot_plugin_webchat_gateway.core.settings_schema import (
+            field_for_key,
+        )
+
+        spec = field_for_key("chat_provider_id")
+        assert spec is not None
+        assert spec.section == "对话行为"
+        assert spec.type == "string"
+
+
+@pytest.mark.asyncio
+class TestLlmBridgeProviderOverride:
+    async def test_override_takes_precedence(self):
+        """When `chat_provider_id` is set in config, LlmBridge
+        returns it verbatim and skips the AstrBot context lookup —
+        which is the whole point of having the override."""
+        from astrbot_plugin_webchat_gateway.core.llm_bridge import LlmBridge
+
+        context_calls: list[str] = []
+
+        class _Ctx:
+            async def get_current_chat_provider_id(self, *, umo):
+                context_calls.append(umo)
+                return "fallback-provider"
+
+        bridge = LlmBridge(
+            _Ctx(),
+            history_turns=4,
+            persona_id="",
+            chat_provider_id="custom-llm",
+        )
+        result = await bridge._resolve_provider_id(umo="webchat_gateway:alice:s1")
+        assert result == "custom-llm"
+        assert context_calls == [], (
+            "override should short-circuit before the AstrBot lookup"
+        )
+
+    async def test_no_override_falls_back_to_context(self):
+        from astrbot_plugin_webchat_gateway.core.llm_bridge import LlmBridge
+
+        class _Ctx:
+            async def get_current_chat_provider_id(self, *, umo):
+                return "astrbot-default"
+
+        bridge = LlmBridge(
+            _Ctx(),
+            history_turns=4,
+            persona_id="",
+            chat_provider_id="",  # empty
+        )
+        result = await bridge._resolve_provider_id(umo="webchat_gateway:alice:s1")
+        assert result == "astrbot-default"
+
+    async def test_whitespace_only_override_falls_back(self):
+        """A config value that's just whitespace should be treated as
+        unset, not as a literal provider id (which would never match
+        anything and break the chat entirely)."""
+        from astrbot_plugin_webchat_gateway.core.llm_bridge import LlmBridge
+
+        class _Ctx:
+            async def get_current_chat_provider_id(self, *, umo):
+                return "astrbot-default"
+
+        bridge = LlmBridge(
+            _Ctx(),
+            history_turns=4,
+            persona_id="",
+            chat_provider_id="   ",
+        )
+        result = await bridge._resolve_provider_id(umo="webchat_gateway:alice:s1")
+        assert result == "astrbot-default"
+
+
+# ---------------------------------------------------------------------
+# /site exposes image_gen.enabled (live)
+# ---------------------------------------------------------------------
+
+
+def _make_site_deps(provider):
+    from astrbot_plugin_webchat_gateway.handlers.site import SiteDeps
+
+    return SiteDeps(
+        site_name="Demo",
+        welcome_message="",
+        show_github_link=False,
+        privacy_url="",
+        site_icon_url="",
+        theme_family="classic",
+        allowed_origins={"*"},
+        trust_referer_as_origin=False,
+        uploads_enabled=True,
+        uploads_max_file_size_mb=20,
+        uploads_max_attachments_per_message=4,
+        uploads_allowed_mime=("image/png",),
+        image_gen_enabled_provider=provider,
+    )
+
+
+async def _site_client(deps):
+    from astrbot_plugin_webchat_gateway.handlers.site import make_site_handlers
+
+    handlers = make_site_handlers(deps)
+    app = web.Application()
+    app.router.add_get("/api/webchat/site", handlers["get_site"])
+    server = TestServer(app)
+    await server.start_server()
+    client = TestClient(server)
+    await client.start_server()
+    return client, server
+
+
+@pytest.mark.asyncio
+class TestSiteImageGenFlag:
+    async def test_image_gen_enabled_reflects_provider_true(self):
+        deps = _make_site_deps(lambda: True)
+        client, server = await _site_client(deps)
+        try:
+            resp = await client.get("/api/webchat/site")
+            data = await resp.json()
+        finally:
+            await client.close()
+            await server.close()
+        assert data["image_gen"]["enabled"] is True
+
+    async def test_image_gen_enabled_reflects_provider_false(self):
+        deps = _make_site_deps(lambda: False)
+        client, server = await _site_client(deps)
+        try:
+            resp = await client.get("/api/webchat/site")
+            data = await resp.json()
+        finally:
+            await client.close()
+            await server.close()
+        assert data["image_gen"]["enabled"] is False
+
+    async def test_provider_called_per_request(self):
+        """The chat client polls /site to learn whether to show the
+        生图 button; the value MUST be re-resolved per request so a
+        hot-reload (operator saves new api_key in admin panel) is
+        visible without a chat-page refresh."""
+        calls = []
+
+        def provider():
+            calls.append(True)
+            return len(calls) >= 2  # first call False, second True
+
+        deps = _make_site_deps(provider)
+        client, server = await _site_client(deps)
+        try:
+            r1 = await (await client.get("/api/webchat/site")).json()
+            r2 = await (await client.get("/api/webchat/site")).json()
+        finally:
+            await client.close()
+            await server.close()
+        assert r1["image_gen"]["enabled"] is False
+        assert r2["image_gen"]["enabled"] is True
+        assert len(calls) == 2
+
+    async def test_provider_exception_falls_back_to_false(self):
+        """A broken provider must NOT 500 the public /site endpoint —
+        it should degrade to image_gen.enabled=False so the chat
+        client hides the button instead of crashing."""
+        def provider():
+            raise RuntimeError("bad provider")
+
+        deps = _make_site_deps(provider)
+        client, server = await _site_client(deps)
+        try:
+            resp = await client.get("/api/webchat/site")
+            assert resp.status == 200
+            data = await resp.json()
+        finally:
+            await client.close()
+            await server.close()
+        assert data["image_gen"]["enabled"] is False

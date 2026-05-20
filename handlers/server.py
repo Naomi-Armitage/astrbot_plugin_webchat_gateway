@@ -270,6 +270,16 @@ def build_app(deps: ServerDeps) -> web.Application:
             uploads_max_file_size_mb=cfg.uploads.max_file_size_mb,
             uploads_max_attachments_per_message=cfg.uploads.max_attachments_per_message,
             uploads_allowed_mime=tuple(cfg.uploads.allowed_mime),
+            # `image_gen.enabled` hot-reloads via ChatDeps.image_bridge,
+            # so we resolve liveness off the bridge itself rather than
+            # the boot-time cfg snapshot. The bridge's `.enabled`
+            # property also gates on api_key/endpoint presence, which
+            # is what /chat actually uses — so this matches the
+            # behaviour the operator observes.
+            image_gen_enabled_provider=lambda: (
+                deps.chat.image_bridge is not None
+                and deps.chat.image_bridge.enabled
+            ),
         )
     )
     app.router.add_get(cfg.site_info_path, site["get_site"])

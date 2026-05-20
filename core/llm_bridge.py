@@ -58,10 +58,19 @@ class LlmBridge:
         persona_id: str,
         timeout_seconds: float = 60.0,
         total_stream_timeout_seconds: float | None = None,
+        chat_provider_id: str = "",
     ) -> None:
         self._context = context
         self._history_turns = max(0, history_turns)
         self._persona_id_cfg = (persona_id or "").strip()
+        # Operator-pinned chat provider override. When non-empty,
+        # ``_resolve_provider_id`` returns this verbatim instead of
+        # asking AstrBot which provider is "current" — useful for
+        # deployments where the WebChat plugin needs to target a
+        # specific model independent of the bot's global default
+        # (e.g. cheaper model for chat, GPT-Image-1 still set as the
+        # global). Empty string keeps the legacy fallback behaviour.
+        self._chat_provider_override = (chat_provider_id or "").strip()
         self._timeout = float(timeout_seconds) if timeout_seconds else None
         # Total wall-clock budget for streaming responses. Without this,
         # a misbehaving provider that emits one byte every (per-chunk
@@ -82,6 +91,20 @@ class LlmBridge:
         else:
             self._total_stream_timeout = float(total_stream_timeout_seconds)
         self._persona_cache: tuple[str | None, str | None] | None = None
+
+    async def _resolve_provider_id(self, *, umo: str) -> str | None:
+        """Return the chat provider id to use for ``umo``.
+
+        Operator-pinned override (``chat_provider_id`` config) wins
+        when set — it's the whole point of having the override. Empty
+        string / not set → fall back to AstrBot's
+        ``get_current_chat_provider_id``, which respects the bot's
+        global default. Returning None means no provider is wired
+        at all; callers raise ``chat_provider_not_configured``.
+        """
+        if self._chat_provider_override:
+            return self._chat_provider_override
+        return await self._context.get_current_chat_provider_id(umo=umo)
 
     async def _resolve_persona(self) -> tuple[str | None, str | None]:
         if self._persona_cache is not None:
@@ -197,9 +220,7 @@ class LlmBridge:
         # Namespace by token so two callers passing the same sessionId never
         # share conversation history across tokens.
         unified_origin = f"webchat_gateway:{token_name}:{session_id}"
-        provider_id = await self._context.get_current_chat_provider_id(
-            umo=unified_origin
-        )
+        provider_id = await self._resolve_provider_id(umo=unified_origin)
         if not provider_id:
             raise RuntimeError("chat_provider_not_configured")
 
@@ -302,9 +323,7 @@ class LlmBridge:
         # layer treats them identically.
         async def _runner() -> AsyncIterator[str]:
             unified_origin = f"webchat_gateway:{token_name}:{session_id}"
-            provider_id = await self._context.get_current_chat_provider_id(
-                umo=unified_origin
-            )
+            provider_id = await self._resolve_provider_id(umo=unified_origin)
             if not provider_id:
                 raise RuntimeError("chat_provider_not_configured")
             provider = self._context.get_provider_by_id(provider_id)
@@ -517,9 +536,7 @@ class LlmBridge:
             "",
         )
         try:
-            provider_id = await self._context.get_current_chat_provider_id(
-                umo=unified_origin
-            )
+            provider_id = await self._resolve_provider_id(umo=unified_origin)
             if not provider_id:
                 raise RuntimeError("chat_provider_not_configured")
             resp = await asyncio.wait_for(

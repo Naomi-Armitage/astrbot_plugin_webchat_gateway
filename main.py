@@ -84,6 +84,11 @@ class WebChatGatewayPlugin(Star):
         self._registry: StreamRegistry | None = None
         self._cookie_logout_tracker: CookieLogoutTracker | None = None
         self._event_bus: EventBus | None = None
+        # Held so _reload_cfg can swap a fresh ImageBridge in after an
+        # admin settings save — without this the live ChatDeps would
+        # still point at the pre-edit bridge and /image would keep
+        # returning ``image_disabled`` until a restart.
+        self._chat_deps: Any | None = None
 
     async def initialize(self) -> None:
         await self._start()
@@ -146,6 +151,7 @@ class WebChatGatewayPlugin(Star):
                     if cfg.llm_stream_total_timeout_seconds
                     else None
                 ),
+                chat_provider_id=cfg.chat_provider_id,
             )
 
             event_bus = EventBus()
@@ -285,6 +291,7 @@ class WebChatGatewayPlugin(Star):
                 trust_referer_as_origin=cfg.trust_referer_as_origin,
                 allow_missing_origin=cfg.allow_missing_origin,
             )
+            self._chat_deps = chat_deps
             admin_deps = AdminDeps(
                 storage=storage,
                 audit=audit,
@@ -400,20 +407,42 @@ class WebChatGatewayPlugin(Star):
         )
 
     async def _reload_cfg(self) -> None:
-        """Rebuild ``self._cfg`` from the live ``self.config`` mapping.
+        """Rebuild ``self._cfg`` from the live ``self.config`` mapping
+        and swap any hot-reloadable runtime objects that capture
+        config values into their constructor.
 
         Called by the admin settings PATCH handler after a successful
-        ``save_config``. Only hot-reloadable fields (currently just
-        ``audit_retention_days``) actually take effect immediately —
-        the prune loop reads ``self._cfg.audit_retention_days`` on every
-        iteration, so the next tick picks up the new value. The rest
-        of the runtime (HTTP server, registered handlers, allowed
-        origins) is bound at boot and remains on the old values until
-        the plugin is restarted; the response payload's
-        ``restart_required`` list is what the UI uses to tell the
-        operator which fields need a restart to be observed.
+        ``save_config``. Hot-reloadable today:
+          * ``audit_retention_days`` — prune loop reads
+            ``self._cfg.audit_retention_days`` on every iteration.
+          * ``image_gen.*`` — a fresh ImageBridge is built with the
+            new values and swapped into ``self._chat_deps`` so the
+            next /image request picks up the change without a
+            restart. Previously this was the source of "enabled the
+            feature but the chat still says image_disabled" — the
+            bridge held the boot-time empty api_key in closure.
+
+        The rest of the runtime (HTTP server, registered handlers,
+        allowed origins, the LLM bridge / chat provider override) is
+        still boot-bound; the response payload's ``restart_required``
+        list is what the UI uses to tell the operator which fields
+        need a restart to be observed.
         """
         self._cfg = ConfigView.from_raw(self.config)
+        if self._chat_deps is not None:
+            try:
+                self._chat_deps.image_bridge = ImageBridge(
+                    enabled=self._cfg.image_gen.enabled,
+                    endpoint=self._cfg.image_gen.endpoint,
+                    api_key=self._cfg.image_gen.api_key,
+                    model=self._cfg.image_gen.model,
+                    size=self._cfg.image_gen.size,
+                    timeout_seconds=self._cfg.image_gen.timeout_seconds,
+                )
+            except Exception:
+                logger.exception(
+                    "[WebChatGateway] image-bridge hot-reload failed"
+                )
 
     async def _restart(self) -> None:
         """Full ``_stop`` + ``_start`` cycle in response to the admin
@@ -551,6 +580,7 @@ class WebChatGatewayPlugin(Star):
         self._registry = None
         self._cookie_logout_tracker = None
         self._event_bus = None
+        self._chat_deps = None
 
     # ----- AstrBot in-bot admin commands -----
 

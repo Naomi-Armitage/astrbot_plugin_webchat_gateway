@@ -9,6 +9,7 @@ displayed publicly to anyone who reaches the page.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 
 from aiohttp import web
 
@@ -41,13 +42,26 @@ class SiteDeps:
     uploads_max_file_size_mb: int
     uploads_max_attachments_per_message: int
     uploads_allowed_mime: tuple[str, ...]
+    # Live read of `image_gen.enabled`. Resolved on every /site
+    # request rather than snapshotted at construct time because the
+    # image_gen.* fields hot-reload (admin panel save → no restart)
+    # and the chat client's 生图 button visibility needs to track
+    # the live state. Default factory returns False so a deployment
+    # that forgets to wire the callback degrades safely (button
+    # hidden) instead of false-positive (button shown, sends fail).
+    image_gen_enabled_provider: Callable[[], bool] = lambda: False
 
 
 def make_site_handlers(deps: SiteDeps):
     allowed = deps.allowed_origins
     trust_referer = deps.trust_referer_as_origin
 
-    payload = {
+    # Branding strings stay snapshot-style — site_name / welcome /
+    # privacy_url are restart-required in the schema, so re-resolving
+    # them per request would be wasted work. image_gen.enabled is the
+    # one field that's expected to flip live, so we read it inside
+    # the handler.
+    static_payload = {
         "site_name": deps.site_name or _DEFAULT_SITE_NAME,
         "welcome_message": deps.welcome_message,
         "show_github_link": deps.show_github_link,
@@ -72,6 +86,14 @@ def make_site_handlers(deps: SiteDeps):
                 allowed_origins=allowed,
                 same_origin_host=request.host,
             )
+        try:
+            image_gen_enabled = bool(deps.image_gen_enabled_provider())
+        except Exception:
+            image_gen_enabled = False
+        payload = {
+            **static_payload,
+            "image_gen": {"enabled": image_gen_enabled},
+        }
         return json_response(
             payload,
             origin=origin,

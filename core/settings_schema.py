@@ -109,6 +109,16 @@ FIELDS: tuple[SettingField, ...] = (
         ),
     ),
     SettingField(
+        key="chat_provider_id",
+        section="对话行为",
+        type="string",
+        label="对话模型 (Provider ID)",
+        hint=(
+            "WebChat 使用的对话模型。留空则跟随 AstrBot 全局当前对话模型；"
+            "填入已在 AstrBot 中配置的 provider id 即可在本插件单独切换模型。"
+        ),
+    ),
+    SettingField(
         key="max_message_length",
         section="对话行为",
         type="int",
@@ -425,11 +435,17 @@ FIELDS: tuple[SettingField, ...] = (
         hint="创建 token 时一次性显示，请妥善保存。请勿提交到代码仓库。",
     ),
     # --- 生图 ---------------------------------------------------------------
+    # All image_gen.* fields hot-reload: main.py's `_reload_cfg`
+    # rebuilds the ImageBridge from the live ConfigView and swaps it
+    # into ChatDeps, so an operator who saves a fresh API key sees the
+    # /image button stop returning ``image_disabled`` immediately —
+    # no restart round-trip required.
     SettingField(
         key="image_gen.enabled",
         section="生图",
         type="bool",
         label="启用生图",
+        restart_required=False,
         hint=(
             "关闭后聊天里的 /image 命令直接返回 image_disabled，"
             "composer 生图按钮变灰。"
@@ -440,6 +456,7 @@ FIELDS: tuple[SettingField, ...] = (
         section="生图",
         type="string",
         label="兼容 OpenAI 的 base URL",
+        restart_required=False,
         hint=(
             "形如 https://api.openai.com/v1，或自建兼容网关。"
             "POST {endpoint}/images/generations。"
@@ -451,6 +468,7 @@ FIELDS: tuple[SettingField, ...] = (
         type="string",
         label="API 密钥",
         secret=True,
+        restart_required=False,
         hint="Bearer token；留空视为未启用，请勿提交到代码仓库。",
     ),
     SettingField(
@@ -458,6 +476,7 @@ FIELDS: tuple[SettingField, ...] = (
         section="生图",
         type="string",
         label="生图模型",
+        restart_required=False,
         hint=(
             "dall-e-3 / gpt-image-1 / 或网关支持的其它模型。"
             "响应统一按 b64_json 解析。"
@@ -468,6 +487,7 @@ FIELDS: tuple[SettingField, ...] = (
         section="生图",
         type="string",
         label="图片尺寸",
+        restart_required=False,
         hint="DALL-E 3 支持 1024x1024 / 1024x1792 / 1792x1024；其它模型按各家文档。",
     ),
     SettingField(
@@ -475,6 +495,7 @@ FIELDS: tuple[SettingField, ...] = (
         section="生图",
         type="int",
         label="请求总超时(秒)",
+        restart_required=False,
         min=5,
         max=600,
         hint="生图通常 5-30 秒，默认 60 秒留有余量。",

@@ -2631,6 +2631,16 @@ function switchSession(id: string): void {
     // send under the new session). Revoke the object URLs and clear
     // the queue so the user starts the new session fresh.
     clearComposerAttachments();
+    // Reset image-mode too: the composer is global but 生图 mode is
+    // a per-turn intent. Carrying a /image prefix into a fresh
+    // session is almost never what the user wants (the .active
+    // chip would also remain lit). Strip the prefix and refresh
+    // the button state so the new session opens clean.
+    if (isImageCommand(inputEl.value)) {
+      inputEl.value = inputEl.value.replace(IMAGE_CMD_RE, "").replace(/^\s+/, "");
+      autosizeInput();
+    }
+    refreshImageBtnState();
     store.activeId = id;
     saveStore();
     replayActive();
@@ -2844,7 +2854,24 @@ async function loadChatSite(): Promise<void> {
         max_attachments_per_message?: number;
         allowed_mime?: string[];
       };
+      image_gen?: { enabled?: boolean };
     };
+    // 生图按钮的可见性按服务端配置切换。服务端的 image_gen.enabled
+    // 是基于 ImageBridge.enabled 读出来的（同时要求 endpoint + api_key
+    // 都非空），所以这里的可见性与 /chat 实际行为一致。关闭后顺手
+    // 抹掉 composer 里可能残留的 /image 前缀，避免用户按下后停留在
+    // image 模式但按钮不见了。
+    const imageEnabled = !!(data.image_gen && data.image_gen.enabled);
+    if (imageEnabled) {
+      imageBtn.hidden = false;
+    } else {
+      imageBtn.hidden = true;
+      if (isImageCommand(inputEl.value)) {
+        inputEl.value = inputEl.value.replace(IMAGE_CMD_RE, "").replace(/^\s+/, "");
+        autosizeInput();
+      }
+      refreshImageBtnState();
+    }
     // Apply server-driven upload caps (overrides hardcoded defaults).
     // An operator who edits config to raise max_attachments_per_message
     // from 4 to 8 expects the UI to follow without a code change.
@@ -3689,6 +3716,10 @@ async function send(): Promise<void> {
   if (composerAttachments.some((a) => a.state === "uploading")) return;
   inputEl.value = "";
   autosizeInput();
+  // Programmatic value change doesn't fire 'input' — refresh the
+  // image-button .active class explicitly so it doesn't stay lit
+  // after the /image prompt has already been sent.
+  refreshImageBtnState();
   // Clear chips post-render — the optimistic bubble already references the
   // file_ids, so revoking the local preview URLs is safe and we want the
   // composer empty for the next turn.
