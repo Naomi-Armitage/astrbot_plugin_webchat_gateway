@@ -23,8 +23,8 @@ from ..core.ip_guard import IpGuard
 from ..core.llm_bridge import LlmBridge
 from ..core.ratelimit import PerTokenConcurrency
 from ..core.stream_registry import StreamRegistry
-from ..storage.base import AbstractStorage, TokenRow
-from .common import json_response
+from ..storage.base import AbstractStorage, FileRow, TokenRow
+from .common import gate_request, json_response
 
 if TYPE_CHECKING:
     from .conversations import ConversationService
@@ -186,3 +186,92 @@ async def _parse_chat_body(
             origin=origin, allowed_origins=allowed, same_origin_host=same_host,
         )
     return data
+
+
+@dataclass
+class PreparedChatRequest:
+    """Output of the shared /chat & /chat/stream preamble.
+
+    Bundles the gate result + parsed body + attachment ownership rows so
+    both handlers can drop straight into their lock-acquisition step.
+    `attachment_rows` mirrors `data.attachments` ordering and is empty
+    when the body carries no file_ids.
+    """
+
+    token: TokenRow
+    ip: str
+    origin: str | None
+    allowed: set[str]
+    same_host: str
+    data: _ParsedRequest
+    attachment_rows: list[FileRow]
+
+
+async def prepare_chat_request(
+    request: web.Request, deps: ChatDeps
+) -> PreparedChatRequest | web.Response:
+    """Run the gate → body-parse → attachment-ownership preamble shared
+    by /chat and /chat/stream.
+
+    Returns a `PreparedChatRequest` bundle on success, or an already-
+    CORS'd error Response on any short-circuit. Mirrors the original
+    inline sequence verbatim — ordering matters because each step
+    short-circuits before the next can pin a per-token slot, and any
+    drift between the two handlers reintroduces the bugs the dedup
+    was meant to retire.
+    """
+    gated = await gate_request(request, deps)
+    if isinstance(gated, web.Response):
+        return gated
+
+    parsed = await _parse_chat_body(
+        request, deps.max_message_length,
+        max_attachments=deps.max_attachments_per_message,
+        origin=gated.origin, allowed=gated.allowed, same_host=gated.same_host,
+    )
+    if isinstance(parsed, web.Response):
+        return parsed
+
+    # Validate attachment ownership before any per-token lock is taken so
+    # a stale or cross-token file_id can't pin a chat / streaming slot
+    # during the storage round trip. Each attachment must belong to THIS
+    # token AND THIS session — cross-session reuse is rejected to prevent
+    # a token from leaking a file_id into another's session via the wire.
+    attachment_rows: list[FileRow] = []
+    for fid in parsed.attachments:
+        try:
+            row = await deps.storage.get_file(fid)
+        except Exception:
+            logger.exception(
+                "[WebChatGateway] get_file failed file_id=%s", fid
+            )
+            return json_response(
+                {"error": "internal_error"},
+                status=500,
+                origin=gated.origin,
+                allowed_origins=gated.allowed,
+                same_origin_host=gated.same_host,
+            )
+        if (
+            row is None
+            or row.token_name != gated.token.name
+            or row.session_id != parsed.session_id
+        ):
+            return json_response(
+                {"error": "invalid_attachment"},
+                status=400,
+                origin=gated.origin,
+                allowed_origins=gated.allowed,
+                same_origin_host=gated.same_host,
+            )
+        attachment_rows.append(row)
+
+    return PreparedChatRequest(
+        token=gated.token,
+        ip=gated.ip,
+        origin=gated.origin,
+        allowed=gated.allowed,
+        same_host=gated.same_host,
+        data=parsed,
+        attachment_rows=attachment_rows,
+    )

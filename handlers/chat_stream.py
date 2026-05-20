@@ -17,17 +17,188 @@ from aiohttp import web
 from astrbot.api import logger
 
 from ..core.stream_registry import STREAM_ID_PATTERN
-from ..storage.base import FileRow
 from .chat_common import (
     ChatDeps,
     _HEARTBEAT_INTERVAL,
-    _parse_chat_body,
+    prepare_chat_request,
 )
 from .common import (
     build_cors_headers,
     gate_request,
     json_response,
 )
+
+
+async def _open_stream_or_429(
+    deps: ChatDeps,
+    prepared,
+    user_attachments_payload: list[dict],
+):
+    """Open the stream on the registry. Returns the StreamHandle on
+    success, or an already-CORS'd 429 JSON Response when the per-token
+    concurrency slot is held by another caller.
+
+    Lock contention is a precondition failure, not a stream error: the
+    client never gets a 200 SSE response. Returning JSON keeps parity
+    with /chat so the frontend's existing 429 handler covers both
+    endpoints.
+    """
+    handle_obj = await deps.registry.open(
+        token_name=prepared.token.name,
+        session_id=prepared.data.session_id,
+        attachments=user_attachments_payload,
+        attachment_file_ids=[r.file_id for r in prepared.attachment_rows],
+    )
+    if handle_obj is None:
+        await deps.audit.write(
+            "concurrent_block", name=prepared.token.name, ip=prepared.ip, detail=None
+        )
+        return json_response(
+            {"error": "concurrent_request"},
+            status=429,
+            origin=prepared.origin,
+            allowed_origins=prepared.allowed,
+            same_origin_host=prepared.same_host,
+        )
+    return handle_obj
+
+
+async def _check_daily_quota_or_429(
+    deps: ChatDeps,
+    handle_obj,
+    prepared,
+    today,
+):
+    """Check the per-token daily quota under the registry lock, before
+    any SSE byte hits the wire. Returns the current `today_count` on
+    success, or a JSON 429 Response when the quota is already exhausted
+    (the handle is `close_failed("quota_exceeded")` first so the lock
+    releases and any peer subscriber sees the terminal frame).
+    """
+    try:
+        today_count = await deps.storage.get_today_usage(
+            prepared.token.name, day=today
+        )
+    except Exception:
+        logger.exception("[WebChatGateway] get_today_usage failed")
+        today_count = 0
+    if today_count >= prepared.token.daily_quota:
+        await deps.registry.close_failed(handle_obj, error_code="quota_exceeded")
+        await deps.audit.write(
+            "quota_exceeded",
+            name=prepared.token.name,
+            ip=prepared.ip,
+            detail={
+                "today_count": today_count,
+                "quota": prepared.token.daily_quota,
+            },
+        )
+        return json_response(
+            {
+                "error": "quota_exceeded",
+                "remaining": 0,
+                "daily_quota": prepared.token.daily_quota,
+            },
+            status=429,
+            origin=prepared.origin,
+            allowed_origins=prepared.allowed,
+            same_origin_host=prepared.same_host,
+        )
+    return today_count
+
+
+async def _resolve_attachment_image_urls(file_store, attachment_rows) -> list[str]:
+    """Resolve attachments to provider-visible URLs (local paths or
+    file:// URLs). `open_local_path` lazily fetches the bytes for R2
+    before returning a path; for LocalFileStore it's a no-op. A partial
+    set on failure is accepted (e.g. one of three images can't be
+    resolved) — the provider gets the others, the user sees the bubble
+    with all three thumbnails (rendered from `attachments`, not
+    image_urls), and the failure is logged for the operator.
+    """
+    image_urls: list[str] = []
+    for row in attachment_rows:
+        try:
+            local_path = await file_store.open_local_path(storage_key=row.storage_key)
+        except Exception:
+            logger.exception(
+                "[WebChatGateway] open_local_path failed key=%s", row.storage_key
+            )
+            local_path = None
+        if local_path:
+            image_urls.append(local_path)
+        else:
+            logger.warning(
+                "[WebChatGateway] attachment unresolved file_id=%s", row.file_id
+            )
+    return image_urls
+
+
+async def _close_failed_quietly(
+    deps: ChatDeps, handle_obj, *, error_code: str, log_label: str
+) -> None:
+    """Best-effort `registry.close_failed` used by the SSE handshake
+    error paths, where a secondary failure to close the handle must
+    not mask the original exception. Logs an exception traceback so
+    the operator can see both failures.
+    """
+    try:
+        await deps.registry.close_failed(handle_obj, error_code=error_code)
+    except Exception:
+        logger.exception(
+            "[WebChatGateway] close_failed during %s raised sid=%s",
+            log_label,
+            handle_obj.stream_id,
+        )
+
+
+async def _emit_terminal_safety_net(
+    deps: ChatDeps, handle_obj, *, collected: list[str], terminal_emitted: bool
+) -> None:
+    """Belt-and-suspenders for the outermost finally: if any path above
+    forgot to call a `registry.close_*`, the lock would stay held
+    indefinitely. `close_failed` is idempotent — the registry no-ops on
+    an already-closed handle (see core/stream_registry.py).
+
+    Reaching this branch with `terminal_emitted=False` means a code
+    path returned without setting the flag — almost always a refactor
+    bug. Log it loudly (with a stack via `stack_info=True`) so the
+    operator can find it; otherwise the buffer transitions to
+    `closed_failed("internal_error")` silently and any peer device
+    that resumes onto it sees a generic error frame with no
+    server-side trace.
+    """
+    if terminal_emitted:
+        return
+    logger.warning(
+        "[WebChatGateway] stream handler missed terminal close "
+        "(stream_id=%s, collected=%d) — forcing close_failed",
+        handle_obj.stream_id,
+        len("".join(collected)),
+        stack_info=True,
+    )
+    try:
+        await deps.registry.close_failed(handle_obj, error_code="internal_error")
+    except Exception:
+        logger.exception(
+            "[WebChatGateway] terminal close_failed in finally raised"
+        )
+
+
+async def _drain_pull_task(task: asyncio.Task | None) -> None:
+    """Cancel and await a stream-iter pull task so the inner `__anext__`
+    finishes (cancelled or otherwise) before the generator is touched.
+    Calling `stream_iter.aclose()` while a pull is in flight races with
+    that pull and can raise "aclose() got called when the generator
+    was already running" — drain first.
+    """
+    if task is None or task.done():
+        return
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, StopAsyncIteration, Exception):
+        pass
 
 
 def make_chat_stream_handler(deps: ChatDeps):
@@ -50,62 +221,21 @@ def make_chat_stream_handler(deps: ChatDeps):
     # `incomplete=False` (full reply, just no live viewer for one POSTer).
 
     async def handle(request: web.Request) -> web.StreamResponse:
-        # Steps 1-3: origin / IP / auth (incl. revoked + expired). Reuse the
-        # gate_request helper so /chat and /chat/stream don't drift on the
-        # auth-side wire contract; the helper returns either a typed
-        # GatePass or an already-CORS'd error Response.
-        gated = await gate_request(request, deps)
-        if isinstance(gated, web.Response):
-            return gated
-        token = gated.token
-        ip = gated.ip
-        origin = gated.origin
-        allowed = gated.allowed
-        same_host = gated.same_host
-
-        # Step 4: parse JSON body + length cap before taking the per-token
-        # lock so a slow/large body cannot pin a streaming slot.
-        parsed = await _parse_chat_body(
-            request, deps.max_message_length,
-            max_attachments=deps.max_attachments_per_message,
-            origin=origin, allowed=allowed, same_host=same_host,
-        )
-        if isinstance(parsed, web.Response):
-            return parsed
-        data = parsed
-
-        # Validate attachment ownership before taking the registry lock
-        # so a stale or cross-token file_id can't pin a streaming slot
-        # during the storage round trip. Mirror the non-stream handler.
-        attachment_rows: list[FileRow] = []
-        if data.attachments:
-            for fid in data.attachments:
-                try:
-                    row = await deps.storage.get_file(fid)
-                except Exception:
-                    logger.exception(
-                        "[WebChatGateway] get_file failed file_id=%s", fid
-                    )
-                    return json_response(
-                        {"error": "internal_error"},
-                        status=500,
-                        origin=origin,
-                        allowed_origins=allowed,
-                        same_origin_host=same_host,
-                    )
-                if (
-                    row is None
-                    or row.token_name != token.name
-                    or row.session_id != data.session_id
-                ):
-                    return json_response(
-                        {"error": "invalid_attachment"},
-                        status=400,
-                        origin=origin,
-                        allowed_origins=allowed,
-                        same_origin_host=same_host,
-                    )
-                attachment_rows.append(row)
+        # Steps 1-4: gate (origin / IP / auth) + body parse + attachment
+        # ownership are all delegated to the shared preamble so /chat
+        # and /chat/stream can't drift on the wire contract for any of
+        # those failure cases. The streaming-specific bits (registry
+        # open, SSE handshake, driver registration, quota check) pick
+        # up right after.
+        prepared = await prepare_chat_request(request, deps)
+        if isinstance(prepared, web.Response):
+            return prepared
+        token = prepared.token
+        origin = prepared.origin
+        allowed = prepared.allowed
+        same_host = prepared.same_host
+        data = prepared.data
+        attachment_rows = prepared.attachment_rows
         user_attachments_payload: list[dict] = (
             [{"file_id": r.file_id, "mime": r.mime} for r in attachment_rows]
             if attachment_rows
@@ -116,27 +246,11 @@ def make_chat_stream_handler(deps: ChatDeps):
         # creates buffer entry and audits). chat-sync `stream_started` is
         # emitted only after the SSE handshake succeeds, so peer devices
         # do not attach to a stream the origin client never opened.
-        handle_obj = await deps.registry.open(
-            token_name=token.name,
-            session_id=data.session_id,
-            attachments=user_attachments_payload,
-            attachment_file_ids=[r.file_id for r in attachment_rows],
+        handle_obj = await _open_stream_or_429(
+            deps, prepared, user_attachments_payload
         )
-        if handle_obj is None:
-            # Lock contention is a precondition failure, not a stream
-            # error: the client never gets a 200 SSE response. Returning
-            # JSON keeps parity with /chat so the frontend's existing 429
-            # handler covers both endpoints.
-            await deps.audit.write(
-                "concurrent_block", name=token.name, ip=ip, detail=None
-            )
-            return json_response(
-                {"error": "concurrent_request"},
-                status=429,
-                origin=origin,
-                allowed_origins=allowed,
-                same_origin_host=same_host,
-            )
+        if isinstance(handle_obj, web.Response):
+            return handle_obj
 
         # Register the driver Task IMMEDIATELY after open() returns a
         # handle, BEFORE any other awaitable (quota lookup, SSE setup).
@@ -160,30 +274,12 @@ def make_chat_stream_handler(deps: ChatDeps):
         # Step 6: quota check — under the registry lock, before any SSE
         # bytes hit the wire so we can still return a JSON 429.
         today = date.today()
-        try:
-            today_count = await deps.storage.get_today_usage(token.name, day=today)
-        except Exception:
-            logger.exception("[WebChatGateway] get_today_usage failed")
-            today_count = 0
-        if today_count >= token.daily_quota:
-            await deps.registry.close_failed(handle_obj, error_code="quota_exceeded")
-            await deps.audit.write(
-                "quota_exceeded",
-                name=token.name,
-                ip=ip,
-                detail={"today_count": today_count, "quota": token.daily_quota},
-            )
-            return json_response(
-                {
-                    "error": "quota_exceeded",
-                    "remaining": 0,
-                    "daily_quota": token.daily_quota,
-                },
-                status=429,
-                origin=origin,
-                allowed_origins=allowed,
-                same_origin_host=same_host,
-            )
+        quota_check = await _check_daily_quota_or_429(
+            deps, handle_obj, prepared, today
+        )
+        if isinstance(quota_check, web.Response):
+            return quota_check
+        today_count = quota_check
 
         # Step 7: open SSE response. (Driver registration moved up to
         # immediately after open() — see the block above.)
@@ -272,16 +368,11 @@ def make_chat_stream_handler(deps: ChatDeps):
                 handle_obj.stream_id,
                 stack_info=True,
             )
-            try:
-                await deps.registry.close_failed(
-                    handle_obj, error_code="cancelled"
-                )
-            except Exception:
-                logger.exception(
-                    "[WebChatGateway] close_failed during SSE handshake"
-                    " cancellation cleanup raised sid=%s",
-                    handle_obj.stream_id,
-                )
+            await _close_failed_quietly(
+                deps, handle_obj,
+                error_code="cancelled",
+                log_label="SSE handshake cancellation cleanup",
+            )
             raise
         except (ConnectionResetError, ConnectionError):
             # Peer dropped the connection between our 200/headers and
@@ -301,32 +392,22 @@ def make_chat_stream_handler(deps: ChatDeps):
                 "[WebChatGateway] SSE handshake peer-dropped sid=%s",
                 handle_obj.stream_id,
             )
-            try:
-                await deps.registry.close_failed(
-                    handle_obj, error_code="cancelled"
-                )
-            except Exception:
-                logger.exception(
-                    "[WebChatGateway] close_failed during handshake-drop"
-                    " cleanup raised sid=%s",
-                    handle_obj.stream_id,
-                )
+            await _close_failed_quietly(
+                deps, handle_obj,
+                error_code="cancelled",
+                log_label="handshake-drop cleanup",
+            )
             return response
         except Exception:
             logger.exception(
                 "[WebChatGateway] SSE handshake failed sid=%s",
                 handle_obj.stream_id,
             )
-            try:
-                await deps.registry.close_failed(
-                    handle_obj, error_code="internal_error"
-                )
-            except Exception:
-                logger.exception(
-                    "[WebChatGateway] close_failed during SSE handshake"
-                    " cleanup raised sid=%s",
-                    handle_obj.stream_id,
-                )
+            await _close_failed_quietly(
+                deps, handle_obj,
+                error_code="internal_error",
+                log_label="SSE handshake cleanup",
+            )
             raise
 
         collected: list[str] = []
@@ -368,32 +449,12 @@ def make_chat_stream_handler(deps: ChatDeps):
                 return False
             return True
 
-        # Resolve attachments to provider-visible URLs (local paths or
-        # file:// URLs). open_local_path lazily fetches the bytes for R2
-        # before returning a path; for LocalFileStore it's a no-op. We
-        # accept a partial set on failure (e.g. one of three images can't
-        # be resolved) — the provider gets the others, the user sees the
-        # bubble with all three thumbnails (rendered from `attachments`,
-        # not image_urls), and the failure is logged for the operator.
-        image_urls: list[str] = []
-        for row in attachment_rows:
-            try:
-                local_path = await deps.file_store.open_local_path(
-                    storage_key=row.storage_key
-                )
-            except Exception:
-                logger.exception(
-                    "[WebChatGateway] open_local_path failed key=%s",
-                    row.storage_key,
-                )
-                local_path = None
-            if local_path:
-                image_urls.append(local_path)
-            else:
-                logger.warning(
-                    "[WebChatGateway] attachment unresolved file_id=%s",
-                    row.file_id,
-                )
+        # Resolve attachments to provider-visible URLs. See helper for
+        # the full failure-mode rationale (we accept a partial set so a
+        # single broken attachment doesn't tank a multi-image turn).
+        image_urls = await _resolve_attachment_image_urls(
+            deps.file_store, attachment_rows
+        )
 
         stream = deps.llm_bridge.generate_reply_stream(
             token_name=token.name,
@@ -415,19 +476,7 @@ def make_chat_stream_handler(deps: ChatDeps):
         pull_task: asyncio.Task | None = None
 
         async def _drain_pull(task: asyncio.Task | None) -> None:
-            # Cancel and await the pull task so the inner `__anext__`
-            # finishes (cancelled or otherwise) before we touch the
-            # generator. Calling `stream_iter.aclose()` while a pull
-            # is in flight races with that pull and can raise
-            # "aclose() got called when the generator was already
-            # running" — drain first.
-            if task is None or task.done():
-                return
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, StopAsyncIteration, Exception):
-                pass
+            await _drain_pull_task(task)
 
         try:
             try:
@@ -776,34 +825,12 @@ def make_chat_stream_handler(deps: ChatDeps):
                 await _write_frame(done_frame)
             return response
         finally:
-            # Belt-and-suspenders: if any path above forgot to call a
-            # registry.close_*, the lock would stay held indefinitely.
-            # close_failed is idempotent — the registry no-ops on an
-            # already-closed handle (see core/stream_registry.py).
-            #
-            # Reaching this branch means a code path returned without
-            # setting terminal_emitted — almost always a refactor bug.
-            # Log it loudly (with a stack via logger.exception) so the
-            # operator can find it; otherwise the buffer transitions to
-            # closed_failed("internal_error") silently and any peer
-            # device that resumes onto it sees a generic error frame
-            # with no server-side trace.
-            if not terminal_emitted:
-                logger.warning(
-                    "[WebChatGateway] stream handler missed terminal close "
-                    "(stream_id=%s, collected=%d) — forcing close_failed",
-                    handle_obj.stream_id,
-                    len("".join(collected)),
-                    stack_info=True,
-                )
-                try:
-                    await deps.registry.close_failed(
-                        handle_obj, error_code="internal_error"
-                    )
-                except Exception:
-                    logger.exception(
-                        "[WebChatGateway] terminal close_failed in finally raised"
-                    )
+            await _emit_terminal_safety_net(
+                deps,
+                handle_obj,
+                collected=collected,
+                terminal_emitted=terminal_emitted,
+            )
 
     return handle
 

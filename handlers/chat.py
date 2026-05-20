@@ -24,7 +24,6 @@ from ..core.file_lifecycle import (
     release_files_safely,
 )
 from ..core.llm_bridge import map_llm_error
-from ..storage.base import FileRow
 from .chat_common import (  # noqa: F401  (ChatDeps re-exported for backward compat)
     ChatDeps,
     _HEARTBEAT_INTERVAL,
@@ -33,6 +32,7 @@ from .chat_common import (  # noqa: F401  (ChatDeps re-exported for backward com
     _is_expired,
     _parse_chat_body,
     _parse_payload,
+    prepare_chat_request,
 )
 from .chat_files_auth import (  # noqa: F401
     make_logout_handler,
@@ -45,7 +45,6 @@ from .chat_stream import (  # noqa: F401
 )
 from .common import (
     extract_origin,
-    gate_request,
     json_response,
     preflight_response,
 )
@@ -53,65 +52,21 @@ from .common import (
 
 def make_chat_handler(deps: ChatDeps):
     async def handle(request: web.Request) -> web.Response:
-        # Origin allow-list → IP brute-force → bearer auth, all in one
-        # shared helper so the non-stream /chat path can't drift from
-        # the streaming sibling or any /conversations endpoint.
-        gated = await gate_request(request, deps)
-        if isinstance(gated, web.Response):
-            return gated
-        origin = gated.origin
-        allowed = gated.allowed
-        same_host = gated.same_host
-        ip = gated.ip
-        token = gated.token
-
-        # Parse + length check (before taking the per-token lock so a slow
-        # body cannot pin the slot). Shared with /chat/stream via
-        # _parse_chat_body so the error-shape contract stays in lockstep.
-        parsed = await _parse_chat_body(
-            request, deps.max_message_length,
-            max_attachments=deps.max_attachments_per_message,
-            origin=origin, allowed=allowed, same_host=same_host,
-        )
-        if isinstance(parsed, web.Response):
-            return parsed
-        data = parsed
-
-        # Validate attachment ownership before taking the per-token lock
-        # so a stale or cross-token file_id can't pin the slot during the
-        # storage round trip. Each attachment must belong to THIS token
-        # AND THIS session — cross-session attachment reuse is rejected
-        # to prevent a token from leaking a file_id into another's
-        # session via the wire.
-        attachment_rows: list[FileRow] = []
-        if data.attachments:
-            for fid in data.attachments:
-                try:
-                    row = await deps.storage.get_file(fid)
-                except Exception:
-                    logger.exception(
-                        "[WebChatGateway] get_file failed file_id=%s", fid
-                    )
-                    return json_response(
-                        {"error": "internal_error"},
-                        status=500,
-                        origin=origin,
-                        allowed_origins=allowed,
-                        same_origin_host=same_host,
-                    )
-                if (
-                    row is None
-                    or row.token_name != token.name
-                    or row.session_id != data.session_id
-                ):
-                    return json_response(
-                        {"error": "invalid_attachment"},
-                        status=400,
-                        origin=origin,
-                        allowed_origins=allowed,
-                        same_origin_host=same_host,
-                    )
-                attachment_rows.append(row)
+        # Origin → IP → bearer auth → body parse → attachment ownership
+        # are all delegated to the shared preamble so /chat and
+        # /chat/stream can't drift on the wire contract for any of
+        # those failure cases. Returns either a typed bundle or an
+        # already-CORS'd error Response.
+        prepared = await prepare_chat_request(request, deps)
+        if isinstance(prepared, web.Response):
+            return prepared
+        token = prepared.token
+        ip = prepared.ip
+        origin = prepared.origin
+        allowed = prepared.allowed
+        same_host = prepared.same_host
+        data = prepared.data
+        attachment_rows = prepared.attachment_rows
 
         # 5. Concurrency lock
         async with deps.concurrency.acquire(token.name) as acquired:
