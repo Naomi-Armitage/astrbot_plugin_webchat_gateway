@@ -478,8 +478,9 @@ FIELDS: tuple[SettingField, ...] = (
         label="生图模型",
         restart_required=False,
         hint=(
-            "dall-e-3 / gpt-image-1 / 或网关支持的其它模型。"
-            "响应统一按 b64_json 解析。"
+            "dall-e-3 / gpt-image-1 / gpt-image-2 / 或网关支持的其它模型。"
+            "检测到 gpt-image-* 系列时会自动跳过 response_format 参数 "
+            "(该系列不支持该字段，会报 400)。"
         ),
     ),
     SettingField(
@@ -497,8 +498,11 @@ FIELDS: tuple[SettingField, ...] = (
         label="请求总超时(秒)",
         restart_required=False,
         min=5,
-        max=600,
-        hint="生图通常 5-30 秒，默认 60 秒留有余量。",
+        max=1800,
+        hint=(
+            "默认 180 秒。生图通常 30-180 秒，gpt-image-1 / 高画质场景"
+            "可能 180-300 秒，自建中转网关可能更长。范围 5-1800。"
+        ),
     ),
 )
 

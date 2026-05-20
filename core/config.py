@@ -567,9 +567,9 @@ class ConfigView:
         )
         image_gen_timeout = _clamp_int(
             _get(raw_image_gen, "timeout_seconds"),
-            default=60,
+            default=180,
             lo=5,
-            hi=600,
+            hi=1800,
         )
         view = cls(
             host=host,

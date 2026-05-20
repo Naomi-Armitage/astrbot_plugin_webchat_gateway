@@ -147,7 +147,7 @@
       "model": {
         "type": "string",
         "description": "生图模型",
-        "hint": "dall-e-3 / gpt-image-1 / 或网关支持的其它模型。响应统一按 b64_json 解析。",
+        "hint": "dall-e-3 / gpt-image-1 / gpt-image-2 / 或网关支持的其它模型。检测到 gpt-image-* 系列时会自动跳过 response_format 参数 (该系列不支持该字段，会报 400)。",
         "default": "dall-e-3"
       },
       "size": {
@@ -159,8 +159,8 @@
       "timeout_seconds": {
         "type": "int",
         "description": "请求总超时（秒）",
-        "hint": "范围 5-600，默认 60。生图通常 5-30 秒，留出余量。",
-        "default": 60
+        "hint": "范围 5-1800，默认 180。生图通常 30-180 秒，gpt-image-1 / 高画质场景可能 180-300 秒。",
+        "default": 180
       }
     }
   },

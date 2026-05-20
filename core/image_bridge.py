@@ -147,17 +147,25 @@ class ImageBridge:
         if len(cleaned) > _DEFAULT_PROMPT_CAP:
             cleaned = cleaned[:_DEFAULT_PROMPT_CAP]
         url = f"{self._endpoint}/images/generations"
+        # `response_format` is NOT accepted by GPT-image-* models —
+        # OpenAI explicitly returns 400 "Unknown parameter" for those.
+        # Only DALL-E 2/3 accept the field, and they default to URL,
+        # so we force `b64_json` only when we know it's safe. Match
+        # by case-insensitive substring so `dall-e-3`, `Dall-E 3`,
+        # `gpt-image-1`, `Gemini-Image` etc. all classify correctly.
+        # The reference plugin (Railgun19457/astrbot_plugin_image_generation)
+        # uses the same predicate; matching it keeps the cross-plugin
+        # behaviour consistent on the same operator config.
+        model_lower = self._model.lower()
+        is_gpt_image = "gpt-image" in model_lower
         body: dict[str, Any] = {
             "model": self._model,
             "prompt": cleaned,
             "n": 1,
             "size": self._size,
-            # Force b64 so we don't depend on the legacy 60-min URL
-            # expiry path. OpenAI's GPT-image models only return b64
-            # anyway — asking for `url` on those raises 400 — so the
-            # parameter is harmless for either family.
-            "response_format": "b64_json",
         }
+        if not is_gpt_image:
+            body["response_format"] = "b64_json"
         headers = {
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
@@ -172,19 +180,29 @@ class ImageBridge:
                     except Exception:
                         payload = None
                     if status >= 400:
+                        # Surface upstream's error message into the
+                        # exception so the chat audit row captures
+                        # what actually went wrong (auth, bad params,
+                        # rate limit, etc.) instead of a generic
+                        # ``image_call_failed``. Operators reading the
+                        # audit log can grep for the upstream code.
                         msg = ""
                         if isinstance(payload, dict):
                             err = payload.get("error")
                             if isinstance(err, dict):
                                 msg = str(err.get("message") or "")[:200]
+                            elif isinstance(err, str):
+                                msg = err[:200]
                         logger.warning(
-                            "[WebChatGateway] image gen upstream %d: %s",
+                            "[WebChatGateway] image gen upstream %d "
+                            "model=%s: %s",
                             status,
-                            msg,
+                            self._model,
+                            msg or "(no error message)",
                         )
                         raise ImageBridgeError(
                             "image_call_failed",
-                            f"upstream {status}: {msg}",
+                            f"upstream {status}: {msg or self._model}",
                         )
                     if not isinstance(payload, dict):
                         raise ImageBridgeError(
@@ -197,26 +215,53 @@ class ImageBridge:
                     if not item:
                         raise ImageBridgeError("empty_image_reply")
                     b64 = item.get("b64_json")
-                    if not isinstance(b64, str) or not b64:
-                        # Legacy DALL-E with response_format=url falls
-                        # here. We force b64_json above, so a missing
-                        # field means the upstream actually returned
-                        # nothing usable — treat as empty.
-                        raise ImageBridgeError("empty_image_reply")
-                    try:
-                        raw = base64.b64decode(b64, validate=False)
-                    except (ValueError, TypeError) as exc:
-                        raise ImageBridgeError(
-                            "image_call_failed", "b64 decode failed"
-                        ) from exc
-                    if not raw:
-                        raise ImageBridgeError("empty_image_reply")
-                    # OpenAI image endpoints always return PNG. If a
-                    # future-compatible gateway returns a different
-                    # MIME, the upload validator will refuse it on save
-                    # (the chat client's allowed_mime gate already
-                    # whitelists png/jpeg/webp/gif).
-                    return ImageResult(content=raw, mime="image/png", prompt=cleaned)
+                    if isinstance(b64, str) and b64:
+                        try:
+                            raw = base64.b64decode(b64, validate=False)
+                        except (ValueError, TypeError) as exc:
+                            raise ImageBridgeError(
+                                "image_call_failed", "b64 decode failed"
+                            ) from exc
+                        if not raw:
+                            raise ImageBridgeError("empty_image_reply")
+                        return ImageResult(
+                            content=raw, mime="image/png", prompt=cleaned
+                        )
+                    # Some OpenAI-compatible gateways (and DALL-E
+                    # without `response_format=b64_json`) only return
+                    # a URL pointing at the rendered image. Fetch the
+                    # bytes ourselves so the rest of the pipeline
+                    # (FileStore save + webchat_files insert) doesn't
+                    # need to know about that variant.
+                    download_url = item.get("url")
+                    if isinstance(download_url, str) and download_url:
+                        try:
+                            async with session.get(download_url) as dl:
+                                if dl.status >= 400:
+                                    raise ImageBridgeError(
+                                        "image_call_failed",
+                                        f"image download {dl.status}",
+                                    )
+                                raw = await dl.read()
+                                if not raw:
+                                    raise ImageBridgeError("empty_image_reply")
+                                # Trust upstream Content-Type if it's
+                                # a sensible image/* string; fall back
+                                # to png otherwise (DALL-E URLs are
+                                # PNG in practice).
+                                ct = dl.headers.get("Content-Type", "").split(
+                                    ";", 1
+                                )[0].strip().lower()
+                                mime = ct if ct.startswith("image/") else "image/png"
+                                return ImageResult(
+                                    content=raw, mime=mime, prompt=cleaned
+                                )
+                        except aiohttp.ClientError as exc:
+                            raise ImageBridgeError(
+                                "image_call_failed",
+                                f"image download client error: {exc}",
+                            ) from exc
+                    raise ImageBridgeError("empty_image_reply")
         except asyncio.TimeoutError as exc:
             raise ImageBridgeError("image_timeout") from exc
         except aiohttp.ClientError as exc:

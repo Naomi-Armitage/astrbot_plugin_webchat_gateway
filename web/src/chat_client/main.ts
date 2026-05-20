@@ -4461,6 +4461,9 @@ async function runNonStreamingSend(sid: string, message: string, attachments: At
     // button) because the user typically needs to either turn the
     // feature on, fix the API key, shorten the prompt, or wait —
     // pressing 重试 with the same text won't help.
+    const imageDetail = typeof payload.detail === "string"
+      ? String(payload.detail).slice(0, 200)
+      : "";
     if (err === "image_disabled") {
       addMessageBubble("notice", "管理员尚未启用生图功能。");
       return;
@@ -4470,15 +4473,34 @@ async function runNonStreamingSend(sid: string, message: string, attachments: At
       return;
     }
     if (err === "image_timeout") {
-      addMessageBubble("error", "生图超时，请稍后再试。");
+      addMessageBubble(
+        "error",
+        imageDetail
+          ? `生图超时：${imageDetail}`
+          : "生图超时，请稍后再试，或在设置里增大「请求总超时」。",
+      );
       return;
     }
     if (err === "image_call_failed") {
-      addMessageBubble("error", "生图失败，请检查管理员的生图配置。");
+      // Bridge surfaces the upstream error (auth, model not found,
+      // unknown parameter, etc.) into `detail`. Show it so the
+      // operator can fix the actual config issue instead of a
+      // generic "请检查管理员的生图配置".
+      addMessageBubble(
+        "error",
+        imageDetail
+          ? `生图失败：${imageDetail}`
+          : "生图失败，请检查管理员的生图配置。",
+      );
       return;
     }
     if (err === "empty_image_reply") {
-      addMessageBubble("error", "生图服务返回为空，请稍后再试或更换 prompt。");
+      addMessageBubble(
+        "error",
+        imageDetail
+          ? `生图返回为空：${imageDetail}`
+          : "生图服务返回为空，请稍后再试或更换 prompt。",
+      );
       return;
     }
     // Retryable failures (5xx, llm_timeout/empty_reply with no fallback

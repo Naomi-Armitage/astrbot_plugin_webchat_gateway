@@ -288,16 +288,16 @@ class TestImageBridgeGenerate:
             await bridge.generate("a cat")
         assert exc.value.code == "empty_image_reply"
 
-    async def test_missing_b64_raises_empty_reply(self, patch_aiohttp):
-        """Legacy DALL-E with response_format=url would hit this — we
-        force b64_json so a missing field means truly nothing usable
-        came back."""
+    async def test_missing_b64_and_url_raises_empty_reply(self, patch_aiohttp):
+        """When upstream returns a data entry without `b64_json` AND
+        without a download `url`, treat as empty — the response is
+        structurally well-formed but carries nothing renderable."""
         from astrbot_plugin_webchat_gateway.core.image_bridge import (
             ImageBridgeError,
         )
 
         patch_aiohttp(_StubResponse(status=200, json_body={
-            "data": [{"url": "https://example.com/x.png"}],
+            "data": [{"revised_prompt": "a cat sitting"}],  # no image
         }))
         bridge = self._make_bridge()
         with pytest.raises(ImageBridgeError) as exc:
@@ -324,6 +324,90 @@ class TestImageBridgeGenerate:
         with pytest.raises(ImageBridgeError) as exc:
             await bridge.generate("   ")
         assert exc.value.code == "image_call_failed"
+
+    async def test_gpt_image_model_omits_response_format(self, patch_aiohttp):
+        """GPT-image-* models reject `response_format=b64_json` with
+        400 Unknown parameter — they only ever return b64 anyway. The
+        bridge must skip the field for that family. Verified by
+        inspecting the captured request body, not just by happy-path
+        success: an upstream that accepts the field but ignores it
+        would also make the test pass for the wrong reason."""
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 8
+        b64 = base64.b64encode(png).decode()
+        session = patch_aiohttp(_StubResponse(status=200, json_body={
+            "data": [{"b64_json": b64}],
+        }))
+        bridge = self._make_bridge(model="gpt-image-1")
+        await bridge.generate("a cat")
+        call_body = session.calls[0]["json"]
+        assert "response_format" not in call_body, (
+            "gpt-image-* models reject response_format; bridge must skip it"
+        )
+        # And the rest of the payload still looks right.
+        assert call_body["model"] == "gpt-image-1"
+        assert call_body["prompt"] == "a cat"
+
+    async def test_dall_e_model_still_sends_response_format(self, patch_aiohttp):
+        png = b"\x89PNG"
+        b64 = base64.b64encode(png).decode()
+        session = patch_aiohttp(_StubResponse(status=200, json_body={
+            "data": [{"b64_json": b64}],
+        }))
+        bridge = self._make_bridge(model="dall-e-3")
+        await bridge.generate("a cat")
+        assert session.calls[0]["json"]["response_format"] == "b64_json"
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "gpt-image-1",
+            "gpt-image-2",
+            "gpt-image-pro",
+            "GPT-Image-2",  # case-insensitive
+            "openai/gpt-image-2",  # gateway-prefixed
+        ],
+    )
+    async def test_gpt_image_family_all_skip_response_format(
+        self, patch_aiohttp, model
+    ):
+        """The detection is `"gpt-image" in model.lower()`, so the
+        whole family (current gpt-image-1 / gpt-image-2 / hypothetical
+        gpt-image-pro / case variants / gateway prefixes) classifies
+        correctly. Parametrise so a future model name in the same
+        family doesn't accidentally regress."""
+        png = b"\x89PNG"
+        b64 = base64.b64encode(png).decode()
+        session = patch_aiohttp(_StubResponse(status=200, json_body={
+            "data": [{"b64_json": b64}],
+        }))
+        bridge = self._make_bridge(model=model)
+        await bridge.generate("a cat")
+        assert "response_format" not in session.calls[0]["json"], (
+            f"model={model!r} is a gpt-image variant; should skip response_format"
+        )
+
+    async def test_upstream_error_message_propagates(self, patch_aiohttp):
+        """The 400 body's `error.message` is the actionable signal for
+        operators — bridge must surface it so the chat audit row + the
+        UI bubble can show "upstream 400: Unknown parameter" instead
+        of an opaque image_call_failed."""
+        from astrbot_plugin_webchat_gateway.core.image_bridge import (
+            ImageBridgeError,
+        )
+
+        patch_aiohttp(_StubResponse(status=400, json_body={
+            "error": {"message": "Unknown parameter: 'response_format'"},
+        }))
+        bridge = self._make_bridge(model="gpt-image-1")
+        # Use a custom call site that bypasses the response_format
+        # skip (the previous test confirms that's working) — we want
+        # to verify the error-propagation path itself. Easiest: send
+        # the request and check that the raised exception's string
+        # carries the upstream message.
+        with pytest.raises(ImageBridgeError) as exc:
+            await bridge.generate("a cat")
+        assert exc.value.code == "image_call_failed"
+        assert "Unknown parameter" in str(exc.value)
 
 
 # ---------------------------------------------------------------------
@@ -470,7 +554,10 @@ class TestImageGenConfig:
         assert cfg.image_gen.api_key == ""
         assert cfg.image_gen.model == "dall-e-3"
         assert cfg.image_gen.size == "1024x1024"
-        assert cfg.image_gen.timeout_seconds == 60
+        # Default 180s matches the reference plugin and OpenAI's own
+        # SDK; the previous 60s default tripped legitimate gpt-image
+        # / high-detail generations that legitimately take 100-180s.
+        assert cfg.image_gen.timeout_seconds == 180
 
     def test_custom_config(self):
         from astrbot_plugin_webchat_gateway.core.config import ConfigView
@@ -498,7 +585,7 @@ class TestImageGenConfig:
         cfg = ConfigView.from_raw({
             "image_gen": {"timeout_seconds": 99999},
         })
-        assert cfg.image_gen.timeout_seconds == 600
+        assert cfg.image_gen.timeout_seconds == 1800
         cfg = ConfigView.from_raw({
             "image_gen": {"timeout_seconds": 0},
         })

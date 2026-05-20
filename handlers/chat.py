@@ -14,6 +14,7 @@ callers continue to work after the split.
 from __future__ import annotations
 
 from datetime import date
+from typing import Any
 
 from aiohttp import web
 
@@ -162,17 +163,35 @@ def make_chat_handler(deps: ChatDeps):
                     status_code = 504 if exc.code == "image_timeout" else 502
                     if exc.code == "image_disabled":
                         status_code = 503
+                    # Surface the upstream error string into the audit
+                    # detail (truncated). Operators reading the audit
+                    # log will see "upstream 400: Unknown parameter:
+                    # 'response_format'" instead of just
+                    # "image_call_failed" — the former actually tells
+                    # them what to change. The string is the message
+                    # arg the bridge passed when raising; for the
+                    # "happy" disabled / timeout codes it's empty.
+                    detail_str = str(exc)
+                    audit_detail = {
+                        "code": exc.code,
+                        "prompt_len": len(prompt),
+                    }
+                    if detail_str and detail_str != exc.code:
+                        audit_detail["upstream"] = detail_str[:200]
                     await deps.audit.write(
                         "image_failed",
                         name=token.name,
                         ip=ip,
-                        detail={
-                            "code": exc.code,
-                            "prompt_len": len(prompt),
-                        },
+                        detail=audit_detail,
                     )
+                    error_body: dict[str, Any] = {"error": exc.code}
+                    if detail_str and detail_str != exc.code:
+                        # Echo to the client too so the chat bubble
+                        # can show a one-line "失败: <upstream msg>"
+                        # instead of an opaque error code.
+                        error_body["detail"] = detail_str[:200]
                     return json_response(
-                        {"error": exc.code},
+                        error_body,
                         status=status_code,
                         origin=origin,
                         allowed_origins=allowed,
