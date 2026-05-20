@@ -140,7 +140,6 @@ class TestPilMaxPixelsScoping:
         from PIL import Image
         from astrbot_plugin_webchat_gateway.core.image_util import (
             detect_image_mime,
-            PIL_MAX_PIXELS,
         )
 
         # Generate a tiny valid PNG so the function reaches the

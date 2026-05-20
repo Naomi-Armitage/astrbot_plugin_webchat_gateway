@@ -26,9 +26,7 @@ production serve handler and asserting:
 
 from __future__ import annotations
 
-import asyncio
 import time
-from dataclasses import dataclass
 
 import pytest
 from aiohttp import web

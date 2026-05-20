@@ -27,7 +27,6 @@ coverage continues to live in `test_regenerate_service.py`.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
