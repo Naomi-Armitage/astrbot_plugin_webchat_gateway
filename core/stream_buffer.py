@@ -389,7 +389,15 @@ class InMemoryBuffer:
                         "reached with all entries active; refusing to "
                         "create new stream"
                     )
-                self._entries.pop(oldest_closed)
+                # Wake any subscriber parked on this entry's events
+                # before we drop the entry itself — otherwise an
+                # iter_subscribe parked on the per-stream Event sleeps
+                # forever (its events stay unset, fetch_since still
+                # sees the now-popped entry as None on next wake).
+                # See _evict_locked for the rationale and the
+                # symmetric per-token branch above which already
+                # uses _evict_locked.
+                self._evict_locked(oldest_closed)
                 global_evict.append(oldest_closed)
             entry = _InMemoryEntry(
                 stream_id=stream_id,
