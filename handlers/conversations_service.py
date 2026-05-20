@@ -1221,6 +1221,124 @@ class ConversationService:
             ):
                 yield evt
 
+    async def _emit_regen_truncate_events(
+        self,
+        *,
+        raw_history: list[Any],
+        message_index: int,
+        session_id: str,
+        token_name: str,
+        reply: str,
+        now: int,
+    ) -> None:
+        """Emit the chat-sync events for a regenerate that truncated the
+        rendered tail and appended a fresh assistant message.
+
+        Emits one `message_deleted` for each dropped rendered index in
+        DESCENDING order so peers splicing head-to-tail don't see
+        indices shift between events. Then a single `message_added`
+        lands at the slot the target used to occupy. The events are
+        appended in a single `append_updates` write so peers receive
+        them as a contiguous pts batch.
+        """
+        rendered_to_raw = self._render_to_raw_indices(raw_history)
+        deletion_events: list[NewEvent] = []
+        for r in range(len(rendered_to_raw) - 1, message_index - 1, -1):
+            raw_i = rendered_to_raw[r]
+            if raw_i >= len(raw_history) or not isinstance(raw_history[raw_i], dict):
+                continue
+            dropped_role = str(
+                raw_history[raw_i].get("role") or ""
+            ).strip().lower()
+            if dropped_role not in ("user", "assistant"):
+                continue
+            deletion_events.append(
+                NewEvent(
+                    event_type=EVENT_MESSAGE_DELETED,
+                    session_id=session_id,
+                    payload=json.dumps(
+                        {"index": r, "role": dropped_role},
+                        ensure_ascii=False,
+                    ),
+                )
+            )
+        deletion_events.append(
+            NewEvent(
+                event_type=EVENT_MESSAGE_ADDED,
+                session_id=session_id,
+                payload=json.dumps(
+                    {"role": "assistant", "content": reply},
+                    ensure_ascii=False,
+                ),
+            )
+        )
+        await self._storage.append_updates(
+            token_name=token_name,
+            events=deletion_events,
+            now=now,
+        )
+        await self._event_bus.notify(token_name)
+
+    async def _regen_resolve_image_urls(
+        self,
+        file_ids: list[str],
+        *,
+        token_name: str,
+        session_id: str,
+    ) -> list[str]:
+        """Resolve a regenerate's recovered user-message attachments to
+        provider-visible local paths.
+
+        Reuses the same defence-in-depth ownership check every other
+        resolve site does (chat.py, `_cm_persist_pair`,
+        `_release_attached_files`): the file_id came from CM history
+        under this token's session and SHOULD already be owned, but
+        any CM-corruption path that lets a cross-scope id slip through
+        would otherwise have regenerate leak another token's bytes
+        into the LLM call.
+
+        Missing rows, ownership mismatches, and `open_local_path`
+        failures are all skipped silently (logged) — a partial image
+        set is fed to the provider rather than failing the whole
+        regenerate, matching the live /chat behaviour.
+        """
+        image_urls: list[str] = []
+        for fid in file_ids:
+            try:
+                row = await self._storage.get_file(fid)
+            except Exception:
+                logger.exception(
+                    "[WebChatGateway] get_file during regenerate failed "
+                    "file_id=%s",
+                    fid,
+                )
+                continue
+            if row is None:
+                continue
+            if row.token_name != token_name or row.session_id != session_id:
+                logger.warning(
+                    "[WebChatGateway] regenerate skipped cross-scope "
+                    "attachment token=%s session=%s file=%s",
+                    token_name,
+                    session_id,
+                    fid,
+                )
+                continue
+            try:
+                local_path = await self._file_store.open_local_path(
+                    storage_key=row.storage_key
+                )
+            except Exception:
+                logger.exception(
+                    "[WebChatGateway] open_local_path during regenerate "
+                    "failed key=%s",
+                    row.storage_key,
+                )
+                continue
+            if local_path:
+                image_urls.append(local_path)
+        return image_urls
+
     async def _regenerate_stream_inner(
         self,
         *,
@@ -1266,107 +1384,32 @@ class ConversationService:
         if not last_user_text and not last_user_file_ids:
             raise ServiceError("message_not_found", status=404)
 
-        # Quota check BEFORE any side effect. A 429 here must not leave
-        # CM truncated or attachments released; ordering matches /chat.
-        today = date.today()
-        try:
-            today_count = await self._storage.get_today_usage(
-                token_name, day=today
-            )
-        except Exception:
-            logger.exception(
-                "[WebChatGateway] get_today_usage during regenerate failed"
-            )
-            today_count = 0
-        if today_count >= token_daily_quota:
-            await self._audit.write(
-                "quota_exceeded",
-                name=token_name,
-                ip=ip,
-                detail={
-                    "today_count": today_count,
-                    "quota": token_daily_quota,
-                    "operation": "regenerate",
-                },
-            )
-            raise ServiceError("quota_exceeded", status=429)
+        today, today_count = await self._regen_check_daily_quota(
+            token_name=token_name,
+            ip=ip,
+            token_daily_quota=token_daily_quota,
+        )
 
         # Resolve attachments to provider-visible local paths so the
         # regenerate sees the same multimodal context the original /chat
         # call did. Done AFTER the quota gate so a quota-blocked
         # regenerate doesn't probe the file store.
-        image_urls: list[str] = []
-        for fid in last_user_file_ids:
-            try:
-                row = await self._storage.get_file(fid)
-            except Exception:
-                logger.exception(
-                    "[WebChatGateway] get_file during regenerate failed "
-                    "file_id=%s",
-                    fid,
-                )
-                continue
-            if row is None:
-                continue
-            # Defense-in-depth ownership recheck. The file_id came from
-            # CM history under this token's session and should already
-            # be owned — every other resolve site (chat.py:377,
-            # _cm_persist_pair, _release_attached_files) verifies the
-            # same. Skipping here would, on any future CM-corruption
-            # path, let regenerate leak another token's bytes into
-            # this LLM call.
-            if row.token_name != token_name or row.session_id != session_id:
-                logger.warning(
-                    "[WebChatGateway] regenerate skipped cross-scope "
-                    "attachment token=%s session=%s file=%s",
-                    token_name,
-                    session_id,
-                    fid,
-                )
-                continue
-            try:
-                local_path = await self._file_store.open_local_path(
-                    storage_key=row.storage_key
-                )
-            except Exception:
-                logger.exception(
-                    "[WebChatGateway] open_local_path during regenerate "
-                    "failed key=%s",
-                    row.storage_key,
-                )
-                continue
-            if local_path:
-                image_urls.append(local_path)
+        image_urls = await self._regen_resolve_image_urls(
+            last_user_file_ids,
+            token_name=token_name,
+            session_id=session_id,
+        )
 
         # Truncate CM history to [0, target_raw_idx) and persist BEFORE
         # the LLM call. LlmBridge.generate_reply_stream reads from CM
         # via `_history_text`; with the truncated history in place the
         # provider sees the right context.
-        truncated_history = raw_history[:target_raw_idx]
-        dropped_tail = raw_history[target_raw_idx:]
-        umo = _umo(token_name, session_id)
-        try:
-            await self._cm.update_conversation(
-                unified_msg_origin=umo,
-                conversation_id=cid,
-                history=truncated_history,
-            )
-        except Exception:
-            logger.exception(
-                "[WebChatGateway] CM.update_conversation(regenerate truncate)"
-                " failed"
-            )
-            raise ServiceError("regenerate_failed", status=500) from None
-
-        # Release attachments referenced ONLY by the dropped tail. The new
-        # assistant reply we're about to generate is text-only, so the
-        # final reference set equals truncated_history's reference set.
-        await self._release_orphaned_attachments(
+        truncated_history, umo = await self._regen_truncate_cm_history(
+            raw_history=raw_history,
+            target_raw_idx=target_raw_idx,
+            cid=cid,
             token_name=token_name,
             session_id=session_id,
-            removed_entries=dropped_tail,
-            surviving_history=truncated_history,
-            log_label="regenerate_assistant_message",
         )
 
         # Streaming LLM call. Each yielded chunk becomes an SSE frame
@@ -1416,6 +1459,140 @@ class ConversationService:
             )
             raise ServiceError("empty_reply", status=502)
 
+        remaining = await self._regen_finalize_assistant(
+            token_name=token_name,
+            session_id=session_id,
+            umo=umo,
+            cid=cid,
+            reply=reply,
+            truncated_history=truncated_history,
+            raw_history=raw_history,
+            message_index=message_index,
+            today=today,
+            today_count=today_count,
+            token_daily_quota=token_daily_quota,
+            ip=ip,
+        )
+        yield {
+            "type": "done",
+            "reply": reply,
+            "remaining": remaining,
+            "daily_quota": token_daily_quota,
+        }
+
+    async def _regen_truncate_cm_history(
+        self,
+        *,
+        raw_history: list[Any],
+        target_raw_idx: int,
+        cid: str,
+        token_name: str,
+        session_id: str,
+    ) -> tuple[list[Any], str]:
+        """Truncate CM history to `[0, target_raw_idx)` and release the
+        dropped-tail's orphaned attachments.
+
+        Done BEFORE the LLM call so `LlmBridge.generate_reply_stream`
+        reads the truncated prompt context via `_history_text` and the
+        provider sees the right turn boundary. The new assistant reply
+        about to be generated is text-only, so the final reference set
+        equals `truncated_history`'s reference set — anything only
+        referenced from the dropped tail can be released safely.
+
+        Returns `(truncated_history, umo)`. Raises
+        `ServiceError("regenerate_failed", status=500)` if CM rejects
+        the truncate write — the caller may not have committed any
+        observable side effect yet.
+        """
+        truncated_history = raw_history[:target_raw_idx]
+        dropped_tail = raw_history[target_raw_idx:]
+        umo = _umo(token_name, session_id)
+        try:
+            await self._cm.update_conversation(
+                unified_msg_origin=umo,
+                conversation_id=cid,
+                history=truncated_history,
+            )
+        except Exception:
+            logger.exception(
+                "[WebChatGateway] CM.update_conversation(regenerate truncate)"
+                " failed"
+            )
+            raise ServiceError("regenerate_failed", status=500) from None
+        await self._release_orphaned_attachments(
+            token_name=token_name,
+            session_id=session_id,
+            removed_entries=dropped_tail,
+            surviving_history=truncated_history,
+            log_label="regenerate_assistant_message",
+        )
+        return truncated_history, umo
+
+    async def _regen_check_daily_quota(
+        self,
+        *,
+        token_name: str,
+        ip: str | None,
+        token_daily_quota: int,
+    ) -> tuple[date, int]:
+        """Daily quota gate for `_regenerate_stream_inner`.
+
+        Runs BEFORE any side effect — a 429 here must not leave CM
+        truncated, attachments released, or events emitted. Ordering
+        matches /chat. Returns `(today, today_count)` on pass; raises
+        `ServiceError("quota_exceeded", status=429)` on block (after
+        writing the matching audit event).
+        """
+        today = date.today()
+        try:
+            today_count = await self._storage.get_today_usage(
+                token_name, day=today
+            )
+        except Exception:
+            logger.exception(
+                "[WebChatGateway] get_today_usage during regenerate failed"
+            )
+            today_count = 0
+        if today_count >= token_daily_quota:
+            await self._audit.write(
+                "quota_exceeded",
+                name=token_name,
+                ip=ip,
+                detail={
+                    "today_count": today_count,
+                    "quota": token_daily_quota,
+                    "operation": "regenerate",
+                },
+            )
+            raise ServiceError("quota_exceeded", status=429)
+        return today, today_count
+
+    async def _regen_finalize_assistant(
+        self,
+        *,
+        token_name: str,
+        session_id: str,
+        umo: str,
+        cid: str,
+        reply: str,
+        truncated_history: list[Any],
+        raw_history: list[Any],
+        message_index: int,
+        today: date,
+        today_count: int,
+        token_daily_quota: int,
+        ip: str | None,
+    ) -> int:
+        """Persist the regenerated assistant reply and emit sync events.
+
+        Called after the LLM stream has yielded a non-empty reply. The
+        ordering matches /chat (LLM → CM → usage → audit) so a crash
+        between LLM and usage-increment leaves the user with a
+        regenerated reply persisted but not counted — strictly
+        preferable to the inverse (charged for a reply never
+        persisted). Returns the post-increment `remaining` quota for
+        the final `done` SSE frame.
+        """
         # LLM succeeded — append the new assistant reply to the
         # truncated history. We use `AssistantMessageSegment` /
         # `TextPart` (the same shape `_cm_persist_pair` writes via
@@ -1442,11 +1619,7 @@ class ConversationService:
             )
             raise ServiceError("regenerate_failed", status=500) from None
 
-        # Increment quota AFTER the CM write succeeds — matches /chat
-        # ordering (LLM → CM → usage → audit). A crash between LLM
-        # and usage-increment leaves the user with a regenerated
-        # reply persisted but not counted; that's strictly preferable
-        # to the inverse (charged for a reply that was never persisted).
+        # Increment quota AFTER the CM write succeeds.
         try:
             new_count = await self._storage.increment_daily_usage(
                 token_name, day=today
@@ -1474,50 +1647,17 @@ class ConversationService:
             now=now,
         )
 
-        # Build per-tail deletion events. Mid-history regenerate also
-        # drops every rendered entry after the target (the LLM context
-        # only includes [0, target) and we just persisted that). Emit
-        # one message_deleted for each dropped rendered index in
-        # DESCENDING order so peers splicing head-to-tail don't see
-        # indices shift between events. Then message_added lands at
-        # the slot the target used to occupy.
-        rendered_to_raw = self._render_to_raw_indices(raw_history)
-        deletion_events: list[NewEvent] = []
-        for r in range(len(rendered_to_raw) - 1, message_index - 1, -1):
-            raw_i = rendered_to_raw[r]
-            if raw_i >= len(raw_history) or not isinstance(raw_history[raw_i], dict):
-                continue
-            dropped_role = str(
-                raw_history[raw_i].get("role") or ""
-            ).strip().lower()
-            if dropped_role not in ("user", "assistant"):
-                continue
-            deletion_events.append(
-                NewEvent(
-                    event_type=EVENT_MESSAGE_DELETED,
-                    session_id=session_id,
-                    payload=json.dumps(
-                        {"index": r, "role": dropped_role},
-                        ensure_ascii=False,
-                    ),
-                )
-            )
-        deletion_events.append(
-            NewEvent(
-                event_type=EVENT_MESSAGE_ADDED,
-                session_id=session_id,
-                payload=json.dumps(
-                    {"role": "assistant", "content": reply},
-                    ensure_ascii=False,
-                ),
-            )
-        )
-        await self._storage.append_updates(
+        # Build per-tail deletion + added events. Mid-history regenerate
+        # also drops every rendered entry after the target (the LLM
+        # context only includes [0, target) and we just persisted that).
+        await self._emit_regen_truncate_events(
+            raw_history=raw_history,
+            message_index=message_index,
+            session_id=session_id,
             token_name=token_name,
-            events=deletion_events,
+            reply=reply,
             now=now,
         )
-        await self._event_bus.notify(token_name)
         await self._audit.write(
             "conv_message_regenerated",
             name=token_name,
@@ -1529,12 +1669,7 @@ class ConversationService:
                 "remaining": remaining,
             },
         )
-        yield {
-            "type": "done",
-            "reply": reply,
-            "remaining": remaining,
-            "daily_quota": token_daily_quota,
-        }
+        return remaining
 
     async def record_chat_pair(
         self,
@@ -1580,143 +1715,196 @@ class ConversationService:
             # independent so we proceed regardless.
             pass
         try:
-            now = self._now()
-            existing = await self._storage.get_session_meta(
-                token_name=token_name, session_id=session_id
+            await self._sync_chat_pair_events(
+                token_name=token_name,
+                session_id=session_id,
+                user_text=user_text,
+                assistant_text=assistant_text,
+                incomplete=incomplete,
+                user_already_emitted=user_already_emitted,
+                user_attachments=user_attachments,
             )
-            events: list[NewEvent] = []
-            # +1 if the user message was already counted at stream_started,
-            # +2 otherwise (non-stream /chat that still emits the pair here).
-            count_delta = 1 if user_already_emitted else 2
-            new_count = (existing.message_count if existing else 0) + count_delta
-            preview = assistant_text[:_PREVIEW_CHARS]
-            if existing is None:
-                # session_created should NOT fire if user_already_emitted
-                # — emit_stream_started already did. Without this guard
-                # peers would see two session_created events for one new
-                # session and the second would be a no-op only because
-                # applyEvent guards `if (!store.sessions[sid])`.
-                if not user_already_emitted:
-                    events.append(
-                        NewEvent(
-                            event_type=EVENT_SESSION_CREATED,
-                            session_id=session_id,
-                            payload=json.dumps({"title": ""}, ensure_ascii=False),
-                        )
-                    )
-                    await self._storage.upsert_session_meta(
-                        token_name=token_name,
+        except Exception as exc:
+            await self._log_record_chat_pair_failure(
+                exc, token_name=token_name,
+                session_id=session_id, incomplete=incomplete,
+            )
+
+    async def _sync_chat_pair_events(
+        self,
+        *,
+        token_name: str,
+        session_id: str,
+        user_text: str,
+        assistant_text: str,
+        incomplete: bool,
+        user_already_emitted: bool,
+        user_attachments: list[dict] | None,
+    ) -> None:
+        """Chat-sync half of `record_chat_pair`: writes the event log
+        and refreshes the session_meta cache for a finished turn.
+
+        Independent of CM persistence — called after `_cm_persist_pair`
+        (whether it succeeded or not) so the web UI's event log and
+        meta cache still catch up even if CM hit a transient error.
+        Raising propagates to `record_chat_pair`'s outer handler, which
+        funnels into `_log_record_chat_pair_failure` so the chat reply
+        is never blocked by a sync hiccup.
+        """
+        now = self._now()
+        existing = await self._storage.get_session_meta(
+            token_name=token_name, session_id=session_id
+        )
+        events: list[NewEvent] = []
+        # +1 if the user message was already counted at stream_started,
+        # +2 otherwise (non-stream /chat that still emits the pair here).
+        count_delta = 1 if user_already_emitted else 2
+        new_count = (existing.message_count if existing else 0) + count_delta
+        preview = assistant_text[:_PREVIEW_CHARS]
+        if existing is None:
+            # session_created should NOT fire if user_already_emitted
+            # — emit_stream_started already did. Without this guard
+            # peers would see two session_created events for one new
+            # session and the second would be a no-op only because
+            # applyEvent guards `if (!store.sessions[sid])`.
+            if not user_already_emitted:
+                events.append(
+                    NewEvent(
+                        event_type=EVENT_SESSION_CREATED,
                         session_id=session_id,
-                        title="",
-                        title_manual=False,
-                        message_count=new_count,
-                        preview=preview,
-                        now=now,
+                        payload=json.dumps({"title": ""}, ensure_ascii=False),
                     )
-                else:
-                    # Defensive: a stream that emitted stream_started
-                    # SHOULD have left a session meta row behind. If
-                    # somehow there's no row, recover by upserting one
-                    # without re-firing session_created (peers already
-                    # got it).
-                    await self._storage.upsert_session_meta(
-                        token_name=token_name,
-                        session_id=session_id,
-                        title="",
-                        title_manual=False,
-                        message_count=new_count,
-                        preview=preview,
-                        now=now,
-                    )
-            else:
-                # Bump updated_at so list_conversations sort order matches
-                # "most recent activity"; refresh cached count + preview so
-                # the sidebar list endpoint stays single-query (no CM read).
-                # No event for the bump itself — the message_added pair
-                # already conveys the change.
-                #
-                # Stale-tab race: another device may have soft-deleted this
-                # session while this tab kept its old view. The deleted
-                # row is excluded from list_conversations, but the new
-                # message_added events would still land — peers would see
-                # the chat resurface only as bubbles, with the session
-                # itself filtered out (visible-elsewhere mismatch). Clear
-                # `deleted_at` to undelete and emit a meta_updated event
-                # before the message pair so all peers re-create / reveal
-                # the row consistently.
-                deleted_arg: int | None | object = UNSET
-                if existing.deleted_at is not None:
-                    deleted_arg = None
-                    events.append(
-                        NewEvent(
-                            event_type=EVENT_SESSION_META_UPDATED,
-                            session_id=session_id,
-                            payload=json.dumps(
-                                {"deleted": False}, ensure_ascii=False
-                            ),
-                        )
-                    )
+                )
                 await self._storage.upsert_session_meta(
                     token_name=token_name,
                     session_id=session_id,
-                    deleted_at=deleted_arg,
+                    title="",
+                    title_manual=False,
                     message_count=new_count,
                     preview=preview,
                     now=now,
                 )
-            if not user_already_emitted:
-                user_payload: dict[str, Any] = {
-                    "role": "user",
-                    "content": user_text,
-                }
-                if user_attachments:
-                    user_payload["attachments"] = list(user_attachments)
+            else:
+                # Defensive: a stream that emitted stream_started
+                # SHOULD have left a session meta row behind. If
+                # somehow there's no row, recover by upserting one
+                # without re-firing session_created (peers already
+                # got it).
+                await self._storage.upsert_session_meta(
+                    token_name=token_name,
+                    session_id=session_id,
+                    title="",
+                    title_manual=False,
+                    message_count=new_count,
+                    preview=preview,
+                    now=now,
+                )
+        else:
+            # Bump updated_at so list_conversations sort order matches
+            # "most recent activity"; refresh cached count + preview so
+            # the sidebar list endpoint stays single-query (no CM read).
+            # No event for the bump itself — the message_added pair
+            # already conveys the change.
+            #
+            # Stale-tab race: another device may have soft-deleted this
+            # session while this tab kept its old view. The deleted
+            # row is excluded from list_conversations, but the new
+            # message_added events would still land — peers would see
+            # the chat resurface only as bubbles, with the session
+            # itself filtered out (visible-elsewhere mismatch). Clear
+            # `deleted_at` to undelete and emit a meta_updated event
+            # before the message pair so all peers re-create / reveal
+            # the row consistently.
+            deleted_arg: int | None | object = UNSET
+            if existing.deleted_at is not None:
+                deleted_arg = None
                 events.append(
                     NewEvent(
-                        event_type=EVENT_MESSAGE_ADDED,
+                        event_type=EVENT_SESSION_META_UPDATED,
                         session_id=session_id,
-                        payload=json.dumps(user_payload, ensure_ascii=False),
+                        payload=json.dumps(
+                            {"deleted": False}, ensure_ascii=False
+                        ),
                     )
                 )
-            assistant_payload: dict[str, Any] = {
-                "role": "assistant",
-                "content": assistant_text,
+            await self._storage.upsert_session_meta(
+                token_name=token_name,
+                session_id=session_id,
+                deleted_at=deleted_arg,
+                message_count=new_count,
+                preview=preview,
+                now=now,
+            )
+        if not user_already_emitted:
+            user_payload: dict[str, Any] = {
+                "role": "user",
+                "content": user_text,
             }
-            if incomplete:
-                assistant_payload["incomplete"] = True
+            if user_attachments:
+                user_payload["attachments"] = list(user_attachments)
             events.append(
                 NewEvent(
                     event_type=EVENT_MESSAGE_ADDED,
                     session_id=session_id,
-                    payload=json.dumps(
-                        assistant_payload, ensure_ascii=False
-                    ),
+                    payload=json.dumps(user_payload, ensure_ascii=False),
                 )
             )
-            await self._storage.append_updates(
-                token_name=token_name, events=events, now=now
+        assistant_payload: dict[str, Any] = {
+            "role": "assistant",
+            "content": assistant_text,
+        }
+        if incomplete:
+            assistant_payload["incomplete"] = True
+        events.append(
+            NewEvent(
+                event_type=EVENT_MESSAGE_ADDED,
+                session_id=session_id,
+                payload=json.dumps(
+                    assistant_payload, ensure_ascii=False
+                ),
             )
-            await self._event_bus.notify(token_name)
-        except Exception as exc:
-            logger.exception(
-                "[WebChatGateway] record_chat_pair failed token=%s session=%s",
-                token_name,
-                session_id,
+        )
+        await self._storage.append_updates(
+            token_name=token_name, events=events, now=now
+        )
+        await self._event_bus.notify(token_name)
+
+    async def _log_record_chat_pair_failure(
+        self,
+        exc: Exception,
+        *,
+        token_name: str,
+        session_id: str,
+        incomplete: bool,
+    ) -> None:
+        """Funnel for the chat-sync failure path of `record_chat_pair`.
+
+        Logs the exception (always succeeds — logger handles its own
+        errors) and best-effort writes a `sync_record_failed` audit
+        event. The audit write itself is wrapped because if storage is
+        wedged badly enough to fail the sync writes, the audit call may
+        also fail — and the contract for `record_chat_pair` is "never
+        raise" so the chat reply is never blocked.
+        """
+        logger.exception(
+            "[WebChatGateway] record_chat_pair failed token=%s session=%s",
+            token_name,
+            session_id,
+        )
+        try:
+            await self._audit.write(
+                "sync_record_failed",
+                name=token_name,
+                detail={
+                    "session_id": session_id,
+                    "incomplete": incomplete,
+                    "error": str(exc)[:200],
+                },
             )
-            try:
-                await self._audit.write(
-                    "sync_record_failed",
-                    name=token_name,
-                    detail={
-                        "session_id": session_id,
-                        "incomplete": incomplete,
-                        "error": str(exc)[:200],
-                    },
-                )
-            except Exception:
-                # Audit logging itself failed — already logged via logger
-                # above. Swallow so chat reply is never blocked.
-                pass
+        except Exception:
+            # Audit logging itself failed — already logged via logger
+            # above. Swallow so chat reply is never blocked.
+            pass
 
     async def emit_stream_started(
         self,
