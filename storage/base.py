@@ -219,6 +219,23 @@ class AbstractStorage(ABC):
     async def reset_ip_failures(self, ip: str) -> None: ...
 
     @abstractmethod
+    async def decrement_ip_failure(self, ip: str) -> int:
+        """Atomically pay back ONE failure to `ip`.
+
+        Used on successful auth. Returns the post-decrement count (>=0).
+        When the count would reach zero, the row is removed AND
+        `blocked_until` is cleared — there's no point keeping a
+        zero-counter row around. If no row exists, returns 0.
+
+        This replaces the prior "reset to 0 on success" behaviour: an
+        attacker with one valid token on the same IP could otherwise
+        zero out the counter at will, defeating brute-force accounting
+        for any OTHER token on that IP. Decrement-by-one preserves
+        typo-recovery for legit users while capping attacker leverage
+        at exactly one probe credit per legitimate auth.
+        """
+
+    @abstractmethod
     async def prune_ip_failures(self, *, before_ts: int) -> int:
         """Delete stale ip_failures rows whose `last_fail_ts < before_ts`.
 

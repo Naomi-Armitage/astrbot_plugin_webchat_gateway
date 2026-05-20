@@ -541,6 +541,32 @@ class MysqlStorage(AbstractStorage):
             async with conn.cursor() as cur:
                 await cur.execute("DELETE FROM ip_failures WHERE ip = %s", (ip,))
 
+    async def decrement_ip_failure(self, ip: str) -> int:
+        async with self._write_tx() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                # SELECT … FOR UPDATE so a concurrent record_ip_failure
+                # can't slip an increment between our read and the
+                # write. The whole sequence is in one write_tx so
+                # commit/rollback is atomic for the row.
+                await cur.execute(
+                    "SELECT fail_count FROM ip_failures WHERE ip = %s FOR UPDATE",
+                    (ip,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    return 0
+                new_count = max(0, int(row["fail_count"]) - 1)
+                if new_count == 0:
+                    await cur.execute(
+                        "DELETE FROM ip_failures WHERE ip = %s", (ip,)
+                    )
+                else:
+                    await cur.execute(
+                        "UPDATE ip_failures SET fail_count = %s WHERE ip = %s",
+                        (new_count, ip),
+                    )
+                return new_count
+
     async def prune_ip_failures(self, *, before_ts: int) -> int:
         async with self._write_tx() as conn:
             async with conn.cursor() as cur:

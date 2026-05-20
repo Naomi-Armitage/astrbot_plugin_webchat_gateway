@@ -480,6 +480,32 @@ class SqliteStorage(AbstractStorage):
             await self._db.execute("DELETE FROM ip_failures WHERE ip = ?", (ip,))
             await self._db.commit()
 
+    async def decrement_ip_failure(self, ip: str) -> int:
+        async with self._write_lock:
+            async with self._db.execute(
+                "SELECT fail_count FROM ip_failures WHERE ip = ?",
+                (ip,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
+                return 0
+            new_count = max(0, int(row["fail_count"]) - 1)
+            if new_count == 0:
+                # Counter hit zero — drop the row entirely. The same DELETE
+                # also clears any lingering `blocked_until` for the IP,
+                # which matches the "fully paid back" intent. (The row
+                # might still get re-created on the next failure.)
+                await self._db.execute(
+                    "DELETE FROM ip_failures WHERE ip = ?", (ip,)
+                )
+            else:
+                await self._db.execute(
+                    "UPDATE ip_failures SET fail_count = ? WHERE ip = ?",
+                    (new_count, ip),
+                )
+            await self._db.commit()
+        return new_count
+
     async def prune_ip_failures(self, *, before_ts: int) -> int:
         async with self._write_lock:
             cur = await self._db.execute(
