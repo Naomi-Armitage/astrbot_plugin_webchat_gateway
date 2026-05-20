@@ -106,8 +106,9 @@
   "chat_provider_id": {
     "type": "string",
     "description": "WebChat 使用的对话模型 (Provider ID)",
-    "hint": "留空则使用 AstrBot 全局当前对话模型；填入已在 AstrBot 中配置的 provider id 即可在本插件单独切换模型。修改后需重启服务。",
-    "default": ""
+    "hint": "留空则使用 AstrBot 全局当前对话模型；可直接从下拉框选择已在 AstrBot 中配置的 provider，即可在本插件单独切换模型。修改后需重启服务。",
+    "default": "",
+    "_special": "select_provider"
   },
   "default_daily_quota": {
     "type": "int",
