@@ -548,33 +548,53 @@
         height: min(calc(100vh - 320px), 600px);
         min-height: 240px;
         overflow-y: auto;
-        font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-        font-size: 12px;
-        line-height: 1.55;
+        /* Mixed-script monospace: JetBrains Mono / SF Mono cover
+           Latin (used for timestamps + level + dotted logger name),
+           Sarasa / Source Han Mono / system CJK fonts handle Chinese
+           glyphs in the message body. Without a CJK fallback the
+           message column drops to a thin system serif that mismatches
+           the rest of the row and reads as washed-out.
+           14px (was 12) so the CJK glyphs render with enough density
+           to actually be legible on standard-density displays. */
+        font-family:
+          "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas,
+          "Sarasa Mono SC", "Sarasa Mono", "Source Han Mono SC",
+          "Microsoft YaHei UI", "PingFang SC", "Microsoft YaHei",
+          monospace;
+        font-size: 13px;
+        line-height: 1.6;
         color: var(--text);
         white-space: pre-wrap;
         word-break: break-word;
       }
       .logs-view .log-entry {
-        padding: 2px 0;
+        padding: 3px 0;
         border-bottom: 1px solid transparent;
+        display: grid;
+        grid-template-columns: auto auto auto 1fr;
+        gap: 0 8px;
+        align-items: baseline;
       }
       .logs-view .log-entry:hover {
+        background: var(--surface-2);
+        border-radius: 4px;
         border-bottom-color: var(--border-soft);
       }
       .logs-view .log-ts {
         color: var(--muted);
-        margin-right: 8px;
+        font-variant-numeric: tabular-nums;
       }
       .logs-view .log-level {
-        display: inline-block;
-        min-width: 64px;
         font-weight: 600;
-        margin-right: 8px;
+        text-align: center;
+        min-width: 64px;
       }
       .logs-view .log-logger {
         color: var(--muted);
-        margin-right: 8px;
+      }
+      .logs-view .log-msg {
+        color: var(--text);
+        word-break: break-word;
       }
       .logs-view .log-entry[data-level="DEBUG"] .log-level    { color: var(--muted); }
       .logs-view .log-entry[data-level="INFO"] .log-level     { color: var(--accent-strong); }
@@ -582,12 +602,14 @@
       .logs-view .log-entry[data-level="ERROR"] .log-level    { color: var(--bad); }
       .logs-view .log-entry[data-level="CRITICAL"] .log-level { color: #fff; background: var(--bad); padding: 0 4px; border-radius: 3px; }
       .logs-view .log-exc {
-        margin-top: 2px;
-        padding: 6px 9px;
+        grid-column: 1 / -1;
+        margin-top: 4px;
+        padding: 8px 10px;
         background: rgba(248, 81, 73, .08);
         border-left: 2px solid var(--bad);
         color: var(--bad);
-        font-size: 11px;
+        font-size: 12px;
+        line-height: 1.55;
         white-space: pre;
         overflow-x: auto;
       }
@@ -596,6 +618,25 @@
         font-style: italic;
         padding: 20px 0;
         text-align: center;
+      }
+      /* Auto-scroll toggle inside the logs filter row. Matches the
+         filter-row `label > control` shape (label on top, control
+         below) so it lines up with the level dropdown + grep input
+         beside it, instead of using the cramped status-bar
+         .inline-check pattern. */
+      .logs-toggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 7px 9px;
+        background: var(--bg-elev);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .logs-toggle input {
+        margin: 0;
       }
 
       /* ----- Pagination ----- */
@@ -1204,8 +1245,11 @@
             <input id="logsGrep" type="text" placeholder="子串模糊匹配 (大小写不敏感)"
               autocomplete="off" spellcheck="false" />
           </label>
-          <label class="inline-check" style="align-self: end;">
-            <input id="logsAutoscroll" type="checkbox" checked /> 自动滚到底
+          <label>自动滚到底
+            <span class="logs-toggle">
+              <input id="logsAutoscroll" type="checkbox" checked />
+              <span class="logs-toggle-text">已开启</span>
+            </span>
           </label>
           <div class="filter-actions">
             <button id="logsApplyBtn" type="button">应用</button>
@@ -2111,6 +2155,17 @@
         const nearBottom = v.scrollTop + v.clientHeight >= v.scrollHeight - 24;
         logsState.scrollPinned = nearBottom;
       });
+      // Mirror checkbox state into the inline 已开启 / 已关闭 label
+      // so the toggle reads like a real toggle, not a bare checkbox.
+      const autoscrollEl = $("logsAutoscroll");
+      const autoscrollText = document.querySelector(".logs-toggle-text");
+      const refreshAutoscrollText = () => {
+        if (autoscrollText) {
+          autoscrollText.textContent = autoscrollEl.checked ? "已开启" : "已关闭";
+        }
+      };
+      autoscrollEl.addEventListener("change", refreshAutoscrollText);
+      refreshAutoscrollText();
 
       // ----- Settings -----
       // Spec: GET /api/webchat/admin/settings -> {fields: [{key, section, type,

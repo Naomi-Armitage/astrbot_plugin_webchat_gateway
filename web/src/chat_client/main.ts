@@ -768,7 +768,15 @@ function addMessageBubble(
   hideTyping();
   const div = document.createElement("div");
   div.className = "msg " + role;
-  const hasImages = role === "user" && Array.isArray(attachments) && attachments.length > 0;
+  // Attachments render for BOTH user and bot bubbles. User-side
+  // covers image uploads; bot-side covers /image-command generations
+  // returned via the JSON `attachments` field. The previous
+  // `role === "user"` guard dropped the assistant's generated image
+  // on the floor, so the bubble showed "[已生成 1 张图片]" with no
+  // image — which is exactly what the operator reported.
+  const hasImages = (role === "user" || role === "bot")
+    && Array.isArray(attachments)
+    && attachments.length > 0;
   if (hasImages) {
     const list = attachments as AttachmentRef[];
     const count = Math.min(list.length, MAX_ATTACHMENTS_PER_MESSAGE);
@@ -791,8 +799,21 @@ function addMessageBubble(
   if (role === "bot") {
     div.classList.add("md");
     if (text) {
-      div.innerHTML = renderMarkdown(text);
-      decorateCodeblocks(div);
+      if (hasImages) {
+        // Image grid was just appended above; setting innerHTML on
+        // the bubble itself would wipe it out. Render markdown into
+        // a child wrapper instead so both render side-by-side
+        // (image first, then text — same ordering as the user-side
+        // hasImages branch below).
+        const md = document.createElement("div");
+        md.className = "msg-text md";
+        md.innerHTML = renderMarkdown(text);
+        decorateCodeblocks(md);
+        div.appendChild(md);
+      } else {
+        div.innerHTML = renderMarkdown(text);
+        decorateCodeblocks(div);
+      }
     }
   } else if (text) {
     if (hasImages) {
@@ -2024,11 +2045,16 @@ function applyEvent(ev: ServerEvent): void {
           if (last && last.role === "bot" && last.text === content) last.incomplete = true;
         }
         // Backfill attachments onto the locally-recorded entry so a later
-        // replay (e.g. session-switch) shows the image grid.
-        if (attachments && role === "user" && s) {
+        // replay (e.g. session-switch) shows the image grid. Now covers
+        // both roles — assistant attachments come from the /image
+        // command's generated image; without this branch a refresh
+        // would drop the image off the assistant bubble even though
+        // the event log still has it.
+        if (attachments && s) {
+          const historyRole = role === "assistant" ? "bot" : "user";
           for (let i = s.history.length - 1; i >= 0; i--) {
             const h = s.history[i]!;
-            if (h.role === "user" && h.text === content && !h.attachments) {
+            if (h.role === historyRole && h.text === content && !h.attachments) {
               h.attachments = attachments;
               break;
             }
@@ -2061,7 +2087,7 @@ function applyEvent(ev: ServerEvent): void {
           if (h.text !== content) continue;
           if (attachmentsKeyFromRefs(h.attachments) !== aKey) continue;
           if (Math.abs(evTsMs - h.ts) > 60_000) continue;
-          if (attachments && localRole === "user" && !h.attachments) {
+          if (attachments && !h.attachments) {
             h.attachments = attachments;
           }
           fallbackSess.lastActiveAt = Math.max(fallbackSess.lastActiveAt, evTsMs);
@@ -2077,7 +2103,7 @@ function applyEvent(ev: ServerEvent): void {
       }
       const item: HistoryItem = { role: localRole, text: content, ts: ev.ts * 1000 };
       if (incomplete && role === "assistant") item.incomplete = true;
-      if (attachments && localRole === "user") item.attachments = attachments;
+      if (attachments) item.attachments = attachments;
       sess.history.push(item);
       sess.lastActiveAt = ev.ts * 1000;
       if (role === "user" && (sess.title === "新会话" || !sess.title)) {
