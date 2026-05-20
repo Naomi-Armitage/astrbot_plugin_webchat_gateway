@@ -20,6 +20,7 @@ from .core.config import ConfigView
 from .core.cookie_logout import CookieLogoutTracker
 from .core.event_bus import EventBus
 from .core.file_store import FileStore, make_file_store_from_config
+from .core.image_bridge import ImageBridge
 from .core.ip_guard import IpGuard
 from .core.llm_bridge import LlmBridge
 from .core.prune_orchestrator import PruneOrchestrator, PruneRetentionConfig
@@ -266,6 +267,14 @@ class WebChatGatewayPlugin(Star):
                 conv_service=conv_service,
                 registry=registry,
                 file_store=file_store,
+                image_bridge=ImageBridge(
+                    enabled=cfg.image_gen.enabled,
+                    endpoint=cfg.image_gen.endpoint,
+                    api_key=cfg.image_gen.api_key,
+                    model=cfg.image_gen.model,
+                    size=cfg.image_gen.size,
+                    timeout_seconds=cfg.image_gen.timeout_seconds,
+                ),
                 allowed_origins=cfg.allowed_origins,
                 max_message_length=cfg.max_message_length,
                 max_attachments_per_message=cfg.uploads.max_attachments_per_message,

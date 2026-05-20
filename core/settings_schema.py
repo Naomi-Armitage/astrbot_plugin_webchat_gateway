@@ -424,6 +424,61 @@ FIELDS: tuple[SettingField, ...] = (
         secret=True,
         hint="创建 token 时一次性显示，请妥善保存。请勿提交到代码仓库。",
     ),
+    # --- 生图 ---------------------------------------------------------------
+    SettingField(
+        key="image_gen.enabled",
+        section="生图",
+        type="bool",
+        label="启用生图",
+        hint=(
+            "关闭后聊天里的 /image 命令直接返回 image_disabled，"
+            "composer 生图按钮变灰。"
+        ),
+    ),
+    SettingField(
+        key="image_gen.endpoint",
+        section="生图",
+        type="string",
+        label="兼容 OpenAI 的 base URL",
+        hint=(
+            "形如 https://api.openai.com/v1，或自建兼容网关。"
+            "POST {endpoint}/images/generations。"
+        ),
+    ),
+    SettingField(
+        key="image_gen.api_key",
+        section="生图",
+        type="string",
+        label="API 密钥",
+        secret=True,
+        hint="Bearer token；留空视为未启用，请勿提交到代码仓库。",
+    ),
+    SettingField(
+        key="image_gen.model",
+        section="生图",
+        type="string",
+        label="生图模型",
+        hint=(
+            "dall-e-3 / gpt-image-1 / 或网关支持的其它模型。"
+            "响应统一按 b64_json 解析。"
+        ),
+    ),
+    SettingField(
+        key="image_gen.size",
+        section="生图",
+        type="string",
+        label="图片尺寸",
+        hint="DALL-E 3 支持 1024x1024 / 1024x1792 / 1792x1024；其它模型按各家文档。",
+    ),
+    SettingField(
+        key="image_gen.timeout_seconds",
+        section="生图",
+        type="int",
+        label="请求总超时(秒)",
+        min=5,
+        max=600,
+        hint="生图通常 5-30 秒，默认 60 秒留有余量。",
+    ),
 )
 
 

@@ -19,6 +19,7 @@ from astrbot.api import logger
 from ..core.audit import AuditLogger
 from ..core.cookie_logout import CookieLogoutTracker
 from ..core.file_store import FileStore
+from ..core.image_bridge import ImageBridge
 from ..core.ip_guard import IpGuard
 from ..core.llm_bridge import LlmBridge
 from ..core.ratelimit import PerTokenConcurrency
@@ -47,6 +48,12 @@ class ChatDeps:
     conv_service: ConversationService
     registry: StreamRegistry
     file_store: FileStore
+    # Optional image generation bridge. Constructed by main.py with the
+    # operator's `image_gen.*` config; the bridge's own `.enabled`
+    # property gates whether /image commands actually fire. None when
+    # the plugin was wired without one (older deployments, test
+    # harnesses).
+    image_bridge: ImageBridge | None
     allowed_origins: set[str]
     max_message_length: int
     max_attachments_per_message: int

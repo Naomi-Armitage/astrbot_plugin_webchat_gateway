@@ -23,6 +23,12 @@ from ..core.file_lifecycle import (
     commit_attachments_or_release,
     release_files_safely,
 )
+from ..core.image_bridge import (
+    ImageBridgeError,
+    is_image_command,
+    persist_generated_image,
+    strip_image_prefix,
+)
 from ..core.llm_bridge import map_llm_error
 from .chat_common import (  # noqa: F401  (ChatDeps re-exported for backward compat)
     ChatDeps,
@@ -100,6 +106,165 @@ def make_chat_handler(deps: ChatDeps):
                         "daily_quota": token.daily_quota,
                     },
                     status=429,
+                    origin=origin,
+                    allowed_origins=allowed,
+                    same_origin_host=same_host,
+                )
+
+            # Image-generation slash branch: `/image …` / `/draw …` /
+            # `/img …` short-circuits the LLM call. Attachments that the
+            # operator sent alongside an image command are ignored (the
+            # OpenAI Images API doesn't accept input images on the
+            # generation endpoint); we still release them so quota
+            # doesn't leak.
+            if is_image_command(data.message):
+                if attachment_rows:
+                    try:
+                        await release_files_safely(
+                            storage=deps.storage,
+                            file_store=deps.file_store,
+                            rows=attachment_rows,
+                            log_label="image_cmd_drop_attachments",
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[WebChatGateway] image cmd: release on drop raised"
+                        )
+                if deps.image_bridge is None or not deps.image_bridge.enabled:
+                    await deps.audit.write(
+                        "image_failed",
+                        name=token.name,
+                        ip=ip,
+                        detail={
+                            "code": "image_disabled",
+                            "prompt_len": len(data.message),
+                        },
+                    )
+                    return json_response(
+                        {"error": "image_disabled"},
+                        status=503,
+                        origin=origin,
+                        allowed_origins=allowed,
+                        same_origin_host=same_host,
+                    )
+                prompt = strip_image_prefix(data.message)
+                if not prompt:
+                    return json_response(
+                        {"error": "image_prompt_empty"},
+                        status=400,
+                        origin=origin,
+                        allowed_origins=allowed,
+                        same_origin_host=same_host,
+                    )
+                try:
+                    result = await deps.image_bridge.generate(prompt)
+                except ImageBridgeError as exc:
+                    status_code = 504 if exc.code == "image_timeout" else 502
+                    if exc.code == "image_disabled":
+                        status_code = 503
+                    await deps.audit.write(
+                        "image_failed",
+                        name=token.name,
+                        ip=ip,
+                        detail={
+                            "code": exc.code,
+                            "prompt_len": len(prompt),
+                        },
+                    )
+                    return json_response(
+                        {"error": exc.code},
+                        status=status_code,
+                        origin=origin,
+                        allowed_origins=allowed,
+                        same_origin_host=same_host,
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        "[WebChatGateway] image gen unexpected failure"
+                    )
+                    await deps.audit.write(
+                        "image_failed",
+                        name=token.name,
+                        ip=ip,
+                        detail={
+                            "code": "image_call_failed",
+                            "error": str(exc)[:200],
+                            "prompt_len": len(prompt),
+                        },
+                    )
+                    return json_response(
+                        {"error": "image_call_failed"},
+                        status=502,
+                        origin=origin,
+                        allowed_origins=allowed,
+                        same_origin_host=same_host,
+                    )
+                import time as _time
+                now_ts = int(_time.time())
+                try:
+                    attachment = await persist_generated_image(
+                        storage=deps.storage,
+                        file_store=deps.file_store,
+                        token_name=token.name,
+                        result=result,
+                        now=now_ts,
+                    )
+                except Exception:
+                    logger.exception(
+                        "[WebChatGateway] image persist failed"
+                    )
+                    await deps.audit.write(
+                        "image_failed",
+                        name=token.name,
+                        ip=ip,
+                        detail={
+                            "code": "image_call_failed",
+                            "stage": "persist",
+                            "prompt_len": len(prompt),
+                        },
+                    )
+                    return json_response(
+                        {"error": "image_call_failed"},
+                        status=500,
+                        origin=origin,
+                        allowed_origins=allowed,
+                        same_origin_host=same_host,
+                    )
+                new_count = await deps.storage.increment_daily_usage(
+                    token.name, day=today
+                )
+                remaining = max(0, token.daily_quota - new_count)
+                # CM history can't usefully store binary image bytes,
+                # so the assistant_text is a brief Chinese tag and the
+                # actual image surfaces through the assistant_attachments
+                # field that record_chat_pair forwards into the
+                # message_added event.
+                assistant_text = "[已生成 1 张图片]"
+                await deps.conv_service.record_chat_pair(
+                    token_name=token.name,
+                    session_id=data.session_id,
+                    user_text=data.message,
+                    assistant_text=assistant_text,
+                    assistant_attachments=[attachment],
+                )
+                await deps.audit.write(
+                    "image_generated",
+                    name=token.name,
+                    ip=ip,
+                    detail={
+                        "prompt_len": len(prompt),
+                        "model": deps.image_bridge.model,
+                        "size": deps.image_bridge.size,
+                        "file_id": attachment["file_id"],
+                    },
+                )
+                return json_response(
+                    {
+                        "reply": assistant_text,
+                        "attachments": [attachment],
+                        "remaining": remaining,
+                        "daily_quota": token.daily_quota,
+                    },
                     origin=origin,
                     allowed_origins=allowed,
                     same_origin_host=same_host,

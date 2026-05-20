@@ -115,6 +115,49 @@
     "hint": "超过该天数的审计日志会被后台清理任务删除。范围 1 - 3650，默认 7 天。0 / 负值会被夹紧到 1；过大值会被夹紧到 3650。",
     "default": 7
   },
+  "image_gen": {
+    "type": "object",
+    "description": "生图（OpenAI Images API 兼容）",
+    "hint": "在聊天中以 /image、/img 或 /draw 开头触发图片生成。也可在聊天页 composer 旁边的生图按钮点击进入生图模式。endpoint + api_key 都填齐才视为启用。",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用生图",
+        "hint": "关闭后 /image 命令直接返回 image_disabled，composer 生图按钮变灰。",
+        "default": false
+      },
+      "endpoint": {
+        "type": "string",
+        "description": "OpenAI 兼容 base URL",
+        "hint": "形如 https://api.openai.com/v1，或自建兼容网关。POST {endpoint}/images/generations。",
+        "default": "https://api.openai.com/v1"
+      },
+      "api_key": {
+        "type": "string",
+        "description": "OpenAI 兼容 API Key",
+        "hint": "Bearer token；留空视为未启用。请勿提交到代码仓库。",
+        "default": ""
+      },
+      "model": {
+        "type": "string",
+        "description": "生图模型",
+        "hint": "dall-e-3 / gpt-image-1 / 或网关支持的其它模型。响应统一按 b64_json 解析。",
+        "default": "dall-e-3"
+      },
+      "size": {
+        "type": "string",
+        "description": "图片尺寸",
+        "hint": "DALL-E 3 支持 1024x1024 / 1024x1792 / 1792x1024；其它模型按各家文档。",
+        "default": "1024x1024"
+      },
+      "timeout_seconds": {
+        "type": "int",
+        "description": "请求总超时（秒）",
+        "hint": "范围 5-600，默认 60。生图通常 5-30 秒，留出余量。",
+        "default": 60
+      }
+    }
+  },
   "ip_brute_force_max_fails": {
     "type": "int",
     "description": "同 IP 鉴权失败多少次后封禁",

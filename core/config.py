@@ -173,6 +173,24 @@ class UploadsConfig:
 
 
 @dataclass(frozen=True)
+class ImageGenConfig:
+    """OpenAI-compatible image generation (POST /v1/images/generations).
+
+    `enabled=True` is the operator's intent; the ImageBridge has its
+    own "effectively enabled" check that also requires both
+    `endpoint` and `api_key` to be non-empty, so a half-filled config
+    can never wedge a /image request into a 500.
+    """
+
+    enabled: bool
+    endpoint: str
+    api_key: str
+    model: str
+    size: str
+    timeout_seconds: int
+
+
+@dataclass(frozen=True)
 class ConfigView:
     host: str
     port: int
@@ -202,6 +220,7 @@ class ConfigView:
     storage: StorageConfig
     streaming: StreamingConfig
     uploads: UploadsConfig
+    image_gen: ImageGenConfig
 
     @property
     def chat_path(self) -> str:
@@ -527,6 +546,29 @@ class ConfigView:
             _get(raw_r2, "cache_size_mb"), default=200, lo=10, hi=100_000
         )
 
+        raw_image_gen = _get(cfg, "image_gen", {}) or {}
+        image_gen_enabled = _parse_bool(
+            _get(raw_image_gen, "enabled"), default=False
+        )
+        image_gen_endpoint = str(
+            _get(raw_image_gen, "endpoint") or "https://api.openai.com/v1"
+        ).strip()
+        image_gen_endpoint = image_gen_endpoint.rstrip("/")
+        image_gen_api_key = str(_get(raw_image_gen, "api_key") or "").strip()
+        image_gen_model = (
+            str(_get(raw_image_gen, "model") or "dall-e-3").strip()
+            or "dall-e-3"
+        )
+        image_gen_size = (
+            str(_get(raw_image_gen, "size") or "1024x1024").strip()
+            or "1024x1024"
+        )
+        image_gen_timeout = _clamp_int(
+            _get(raw_image_gen, "timeout_seconds"),
+            default=60,
+            lo=5,
+            hi=600,
+        )
         view = cls(
             host=host,
             port=port,
@@ -581,6 +623,14 @@ class ConfigView:
                 r2_serving_mode=r2_serving_mode,
                 r2_direct_link_ttl_seconds=r2_direct_link_ttl_seconds,
                 r2_cache_size_mb=r2_cache_size_mb,
+            ),
+            image_gen=ImageGenConfig(
+                enabled=image_gen_enabled,
+                endpoint=image_gen_endpoint,
+                api_key=image_gen_api_key,
+                model=image_gen_model,
+                size=image_gen_size,
+                timeout_seconds=image_gen_timeout,
             ),
         )
         view._emit_warnings()

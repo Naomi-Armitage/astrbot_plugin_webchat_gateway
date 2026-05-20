@@ -266,6 +266,7 @@ const sidebarToggleBtn = $<HTMLButtonElement>("sidebarToggle");
 const sidebarBackdrop = $("sidebarBackdrop");
 const sessionListEl = $<HTMLUListElement>("sessionList");
 const attachBtn = $<HTMLButtonElement>("attachBtn");
+const imageBtn = $<HTMLButtonElement>("imageBtn");
 const fileInputEl = $<HTMLInputElement>("fileInput");
 const composerAttachmentsEl = $("composer-attachments");
 const dropOverlayEl = $("dropOverlay");
@@ -2980,6 +2981,16 @@ function streamingSupported(): boolean {
   return typeof TextDecoder !== "undefined" && typeof ReadableStream !== "undefined";
 }
 
+// /image, /img, /draw + whitespace → triggers image generation server-side.
+// Mirror of `core.image_bridge.is_image_command` so the frontend can route
+// these to the non-stream /chat endpoint (the image flow returns a single
+// JSON 200 with attachments, not an SSE stream — sending it through
+// /chat/stream would still work but is pointless overhead).
+const IMAGE_CMD_RE = /^\s*\/(?:image|img|draw)\b/i;
+function isImageCommand(text: string): boolean {
+  return IMAGE_CMD_RE.test(text || "");
+}
+
 // Hand-rolled SSE parser per WHATWG/HTML5 spec rules we actually need:
 //   - Frames are separated by "\n\n" (we accept both LF and CRLF; the
 //     decoded text is normalized at frame boundaries).
@@ -3728,7 +3739,7 @@ async function performSend(message: string, readyAttachments: AttachmentRef[]): 
     requestAutoTitle(sid, message).catch(() => {});
   }
 
-  const tryStream = streamingSupported() && !isStreamCircuitOpen();
+  const tryStream = streamingSupported() && !isStreamCircuitOpen() && !isImageCommand(message);
 
   try {
     if (tryStream) {
@@ -4325,6 +4336,22 @@ async function runNonStreamingSend(sid: string, message: string, attachments: At
     if (resp.ok) {
       setBadge(payload.remaining as number, payload.daily_quota as number);
       const reply = (payload.reply as string) || "(空回复)";
+      // Image-gen path: /image / /img / /draw returns the same JSON
+      // envelope plus an `attachments` array carrying the generated
+      // file_id(s). Forward those onto the assistant bubble + history
+      // so the image renders inline (same renderer as user-side image
+      // attachments). text/streaming responses never set this field,
+      // so the legacy path stays unaffected.
+      const rawAttachments = (payload as { attachments?: unknown }).attachments;
+      const replyAttachments: AttachmentRef[] = Array.isArray(rawAttachments)
+        ? rawAttachments
+            .filter((a): a is { file_id: string; mime: string } =>
+              !!a && typeof a === "object"
+              && typeof (a as { file_id?: unknown }).file_id === "string"
+              && typeof (a as { mime?: unknown }).mime === "string"
+            )
+            .map((a) => ({ file_id: a.file_id, mime: a.mime }))
+        : [];
       // Race: long-poll's `/events` response can land BEFORE /chat 200,
       // because record_chat_pair fires + notifies the EventBus right
       // before the chat handler returns. The two responses then race on
@@ -4347,14 +4374,16 @@ async function runNonStreamingSend(sid: string, message: string, attachments: At
         // the typing indicator if the long-poll is momentarily wedged. Same
         // dedup mechanism as the user echo: register a pending entry so the
         // upcoming `message_added` event for the assistant text is suppressed.
-        addMessageBubble("bot", reply);
+        addMessageBubble("bot", reply, replyAttachments.length ? replyAttachments : undefined);
         if (sessNow) {
-          sessNow.history.push({ role: "bot", text: reply, ts: Date.now() });
+          const item: HistoryItem = { role: "bot", text: reply, ts: Date.now() };
+          if (replyAttachments.length) item.attachments = replyAttachments;
+          sessNow.history.push(item);
           sessNow.lastActiveAt = Date.now();
           saveStore();
           renderSessionList();
         }
-        recordOptimistic(sid, "assistant", reply);
+        recordOptimistic(sid, "assistant", reply, replyAttachments.length ? replyAttachments : undefined);
       } else {
         hideTyping();
       }
@@ -4395,6 +4424,30 @@ async function runNonStreamingSend(sid: string, message: string, attachments: At
     }
     if (s === 403 && err === "forbidden_origin") {
       addMessageBubble("error", "页面来源未在 allowed_origins 中。");
+      return;
+    }
+    // Image-gen specific errors. Treat as terminal notices (no retry
+    // button) because the user typically needs to either turn the
+    // feature on, fix the API key, shorten the prompt, or wait —
+    // pressing 重试 with the same text won't help.
+    if (err === "image_disabled") {
+      addMessageBubble("notice", "管理员尚未启用生图功能。");
+      return;
+    }
+    if (err === "image_prompt_empty") {
+      addMessageBubble("notice", "请在 /image 后填写图片描述。");
+      return;
+    }
+    if (err === "image_timeout") {
+      addMessageBubble("error", "生图超时，请稍后再试。");
+      return;
+    }
+    if (err === "image_call_failed") {
+      addMessageBubble("error", "生图失败，请检查管理员的生图配置。");
+      return;
+    }
+    if (err === "empty_image_reply") {
+      addMessageBubble("error", "生图服务返回为空，请稍后再试或更换 prompt。");
       return;
     }
     // Retryable failures (5xx, llm_timeout/empty_reply with no fallback
@@ -4497,6 +4550,37 @@ attachBtn.addEventListener("click", () => {
   fileInputEl.value = "";
   fileInputEl.click();
 });
+// 生成图片 button. Prepends "/image " to the textarea if the prefix
+// isn't already there; clicking again with the prefix present
+// removes it (toggle behaviour). Mirrors how operators can also just
+// type the trigger themselves — the button is an affordance, not a
+// modal mode.
+function refreshImageBtnState(): void {
+  if (isImageCommand(inputEl.value)) {
+    imageBtn.classList.add("active");
+    imageBtn.setAttribute("aria-pressed", "true");
+  } else {
+    imageBtn.classList.remove("active");
+    imageBtn.setAttribute("aria-pressed", "false");
+  }
+}
+imageBtn.addEventListener("click", () => {
+  if (imageBtn.disabled) return;
+  if (isImageCommand(inputEl.value)) {
+    // Toggle off — strip the prefix + leading whitespace.
+    inputEl.value = inputEl.value.replace(IMAGE_CMD_RE, "").replace(/^\s+/, "");
+  } else {
+    inputEl.value = `/image ${inputEl.value.trimStart()}`;
+  }
+  autosizeInput();
+  refreshImageBtnState();
+  inputEl.focus();
+  // Move caret to end so the prompt typing continues naturally.
+  const len = inputEl.value.length;
+  try { inputEl.setSelectionRange(len, len); } catch {}
+});
+inputEl.addEventListener("input", refreshImageBtnState);
+refreshImageBtnState();
 fileInputEl.addEventListener("change", () => {
   if (fileInputEl.files && fileInputEl.files.length) {
     addAttachmentFiles(fileInputEl.files);

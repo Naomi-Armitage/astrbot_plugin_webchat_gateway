@@ -975,6 +975,14 @@ footer button:disabled { opacity: .5; cursor: not-allowed; }
 }
 .attach-btn svg { width: 16px; height: 16px; }
 .attach-btn:disabled { opacity: .5; cursor: not-allowed; }
+/* Image-generation button (next to attach paperclip). When the
+   composer text starts with /image|/img|/draw the JS flips an .active
+   class so the operator can see they're in image mode. */
+.attach-btn.active {
+  color: var(--accent);
+  border-color: color-mix(in oklab, var(--accent) 55%, var(--rule));
+  background: var(--accent-soft);
+}
 
 /* Drag-and-drop overlay */
 .drop-overlay {

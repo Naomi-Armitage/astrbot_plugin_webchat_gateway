@@ -40,6 +40,13 @@ Chat path (per request):
     llm_timeout     — provider call exceeded llm_timeout_seconds; detail: {msg_len}
     chat_error      — provider call failed; detail: {error: <truncated>}
     chat_ok         — request completed; detail: {msg_len, reply_len, remaining}
+    image_generated — /image command produced an attachment; detail:
+                      {prompt_len, model, size, file_id}.
+    image_failed    — /image command raised; detail:
+                      {code, prompt_len}. ``code`` matches the
+                      ImageBridgeError taxonomy (image_disabled /
+                      image_timeout / image_call_failed /
+                      empty_image_reply).
     file_release_failed — `commit_attachments_or_release` hit the double-
                       failure path: mark_files_committed raised AND the
                       compensating release also raised. Detail:

@@ -554,7 +554,14 @@ class ConversationService:
                 if ev_role == target_role and ev_content == target_content:
                     if ev_incomplete and target_role == "assistant":
                         incomplete_indices.add(cm_idx)
-                    if ev_attachments and target_role == "user":
+                    if ev_attachments:
+                        # Both roles can carry attachments now: user
+                        # has them for image uploads, assistant has
+                        # them when a /image command produced an
+                        # image. The role guard that used to live
+                        # here ("user" only) silently dropped
+                        # generated images from the post-refresh
+                        # render.
                         attachments_map[cm_idx] = ev_attachments
                     break
             else:
@@ -1681,6 +1688,7 @@ class ConversationService:
         incomplete: bool = False,
         user_already_emitted: bool = False,
         user_attachments: list[dict] | None = None,
+        assistant_attachments: list[dict] | None = None,
     ) -> None:
         # Must never raise: the chat reply has already been delivered to the
         # client. A failure here is a sync hiccup, not a chat error. We
@@ -1723,6 +1731,7 @@ class ConversationService:
                 incomplete=incomplete,
                 user_already_emitted=user_already_emitted,
                 user_attachments=user_attachments,
+                assistant_attachments=assistant_attachments,
             )
         except Exception as exc:
             await self._log_record_chat_pair_failure(
@@ -1740,6 +1749,7 @@ class ConversationService:
         incomplete: bool,
         user_already_emitted: bool,
         user_attachments: list[dict] | None,
+        assistant_attachments: list[dict] | None = None,
     ) -> None:
         """Chat-sync half of `record_chat_pair`: writes the event log
         and refreshes the session_meta cache for a finished turn.
@@ -1853,6 +1863,8 @@ class ConversationService:
             "role": "assistant",
             "content": assistant_text,
         }
+        if assistant_attachments:
+            assistant_payload["attachments"] = list(assistant_attachments)
         if incomplete:
             assistant_payload["incomplete"] = True
         events.append(
