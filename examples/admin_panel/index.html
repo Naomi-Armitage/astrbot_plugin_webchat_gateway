@@ -763,6 +763,25 @@
         width: auto;
         margin: 0;
       }
+      /* State indicator next to the bool checkbox. 开 / 关 instead
+         of 启用 / 禁用 to avoid colliding with field labels that
+         themselves start with "启用". Color carries the state too
+         so a colorblind-but-not-completely operator still gets the
+         right read from the character alone. */
+      .settings-field .bool-state {
+        font-size: 13px;
+        font-weight: 600;
+        padding: 2px 8px;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        background: var(--surface);
+        color: var(--muted);
+      }
+      .settings-field .bool-state[data-on="1"] {
+        background: var(--accent-soft);
+        color: var(--accent-strong);
+        border-color: rgba(163, 113, 247, .35);
+      }
       .settings-field .hint {
         font-family: var(--font-handwriting);
         font-size: 12px;
@@ -1917,10 +1936,24 @@
           const ctrlId = `set-${field.key.replace(/\./g, "_")}`;
           control.id = ctrlId;
           label.setAttribute("for", ctrlId);
+          // State indicator next to the checkbox. Previously read
+          // "启用 / 禁用" — but many of these field labels themselves
+          // start with "启用" (e.g. "启用生图", "启用图片上传"), and
+          // having the same word repeat as both the field name AND
+          // the state indicator made the row read like a self-
+          // contradiction ("启用生图: 禁用"). Use a one-character
+          // pair that can't collide with any field label, and color
+          // it (--accent for on, --muted for off) so the state is
+          // unambiguously visual.
           const onLabel = document.createElement("span");
-          onLabel.textContent = field.value ? "启用" : "禁用";
+          onLabel.className = "bool-state";
+          const paintState = (on) => {
+            onLabel.textContent = on ? "开" : "关";
+            onLabel.dataset.on = on ? "1" : "0";
+          };
+          paintState(Boolean(field.value));
           control.addEventListener("change", () => {
-            onLabel.textContent = control.checked ? "启用" : "禁用";
+            paintState(control.checked);
           });
           wrap.appendChild(control);
           wrap.appendChild(onLabel);
