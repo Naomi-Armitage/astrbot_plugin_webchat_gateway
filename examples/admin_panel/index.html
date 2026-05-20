@@ -30,18 +30,18 @@
         --good: #3fb950;
         --warn: #d29922;
         --bad: #f85149;
-        /* Handwriting cascade matches the landing / login / chat
-           pages' --font-display, with kaiti additions so Chinese
-           characters render in handwriting too. Without the kaiti
-           fallbacks, Chinese glyphs drop through to system-ui and
-           the page reads as mixed handwriting (Latin) + sans (CJK).
-           "楷体" works on Windows; "Kaiti SC" / "STKaiti" on macOS;
-           "KaiTi" generic — all are CJK-handwriting. */
+        /* Handwriting for Latin; system Chinese sans for CJK. Comic
+           Sans / Comic Neue / Chalkboard SE / Marker Felt have no CJK
+           glyphs, so the browser does per-character font substitution
+           and pulls Chinese from the next CJK-capable entry —
+           PingFang SC (mac), Microsoft YaHei (Windows), the rest
+           covers Linux + Android. NO 楷体 / Kaiti — looks bad at UI
+           sizes; user explicitly rejected. */
         --font-handwriting:
           "Comic Sans MS", "Comic Neue", "Chalkboard SE", "Marker Felt",
-          "Kaiti SC", "STKaiti", "KaiTi", "楷体", "楷体_GB2312",
-          system-ui, -apple-system, "Segoe UI", "PingFang SC",
-          "Microsoft YaHei", Roboto, sans-serif;
+          "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei",
+          "Noto Sans CJK SC", "Source Han Sans SC",
+          system-ui, -apple-system, Roboto, sans-serif;
       }
       * { box-sizing: border-box; }
       body {
