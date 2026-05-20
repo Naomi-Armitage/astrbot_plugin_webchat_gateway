@@ -26,6 +26,7 @@ from .core.prune_orchestrator import PruneOrchestrator, PruneRetentionConfig
 from .core.ratelimit import PerTokenConcurrency, PerTokenUploadGate
 from .core.stream_buffer import InMemoryBuffer, RedisBuffer, StreamBuffer
 from .core.stream_registry import StreamRegistry
+from .handlers.admin_settings import AdminSettingsDeps
 from .handlers.admin_stats import AdminDeps
 from .handlers.admin_tokens import ServiceError, TokenService
 from .handlers.chat import ChatDeps
@@ -286,6 +287,17 @@ class WebChatGatewayPlugin(Star):
                 trust_referer_as_origin=cfg.trust_referer_as_origin,
                 allow_missing_origin=cfg.allow_missing_origin,
             )
+            admin_settings_deps = AdminSettingsDeps(
+                config=self.config,
+                audit=audit,
+                allowed_origins=cfg.allowed_origins,
+                master_admin_key=cfg.master_admin_key,
+                ip_guard=ip_guard,
+                trust_forwarded_for=cfg.trust_forwarded_for,
+                trust_referer_as_origin=cfg.trust_referer_as_origin,
+                allow_missing_origin=cfg.allow_missing_origin,
+                on_reload=self._reload_cfg,
+            )
             title_deps = TitleDeps(
                 storage=storage,
                 audit=audit,
@@ -339,6 +351,7 @@ class WebChatGatewayPlugin(Star):
                 config=cfg,
                 chat=chat_deps,
                 admin=admin_deps,
+                admin_settings=admin_settings_deps,
                 title=title_deps,
                 conv=conv_deps,
                 conv_service=conv_service,
@@ -375,6 +388,22 @@ class WebChatGatewayPlugin(Star):
             "enabled" if cfg.master_admin_key else "DISABLED",
             cfg.llm_timeout_seconds,
         )
+
+    async def _reload_cfg(self) -> None:
+        """Rebuild ``self._cfg`` from the live ``self.config`` mapping.
+
+        Called by the admin settings PATCH handler after a successful
+        ``save_config``. Only hot-reloadable fields (currently just
+        ``audit_retention_days``) actually take effect immediately —
+        the prune loop reads ``self._cfg.audit_retention_days`` on every
+        iteration, so the next tick picks up the new value. The rest
+        of the runtime (HTTP server, registered handlers, allowed
+        origins) is bound at boot and remains on the old values until
+        the plugin is restarted; the response payload's
+        ``restart_required`` list is what the UI uses to tell the
+        operator which fields need a restart to be observed.
+        """
+        self._cfg = ConfigView.from_raw(self.config)
 
     async def _chat_sync_prune_loop(self) -> None:
         """Drive `PruneOrchestrator.run_iteration` on the configured

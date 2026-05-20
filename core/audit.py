@@ -13,6 +13,12 @@ Admin reads (audit-trail-only, mirrors lifecycle vocabulary):
                       detail: {include_revoked, count}
     admin_stats     — admin read per-token stats; detail: {days}
     admin_audit     — admin pulled the audit log; detail: {limit, count}
+    admin_settings_update — admin saved one or more whitelist config
+                      fields via /admin/settings; detail: {keys: [str]}.
+                      VALUES are deliberately omitted — origin lists,
+                      welcome messages, and similar fields may contain
+                      operator-typed text or non-public infrastructure
+                      hostnames that shouldn't enter the audit log.
     admin_auth_fail — admin auth attempt failed at the gate;
                       detail: {reason: no_token|invalid_key|admin_disabled|ip_blocked,
                                retry_after?: int}

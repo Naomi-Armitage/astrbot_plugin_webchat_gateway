@@ -18,6 +18,7 @@ from astrbot.api import logger
 
 from ..core.config import ConfigView
 from .admin_auth_routes import AuthRouteDeps, make_auth_handlers
+from .admin_settings import AdminSettingsDeps, make_admin_settings_handlers
 from .admin_stats import AdminDeps, make_admin_handlers
 from .chat import (
     ChatDeps,
@@ -49,6 +50,7 @@ class ServerDeps:
     config: ConfigView
     chat: ChatDeps
     admin: AdminDeps
+    admin_settings: AdminSettingsDeps
     title: TitleDeps
     conv: ConversationDeps
     conv_service: ConversationService
@@ -227,6 +229,11 @@ def build_app(deps: ServerDeps) -> web.Application:
 
     app.router.add_get(cfg.admin_audit_path, admin["get_audit"])
     app.router.add_options(cfg.admin_audit_path, admin["preflight"])
+
+    settings_handlers = make_admin_settings_handlers(deps.admin_settings)
+    app.router.add_get(cfg.admin_settings_path, settings_handlers["get_settings"])
+    app.router.add_patch(cfg.admin_settings_path, settings_handlers["patch_settings"])
+    app.router.add_options(cfg.admin_settings_path, settings_handlers["preflight"])
 
     auth = make_auth_handlers(
         AuthRouteDeps(

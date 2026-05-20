@@ -251,6 +251,10 @@ class ConfigView:
         return f"{self.endpoint_prefix}/admin/audit"
 
     @property
+    def admin_settings_path(self) -> str:
+        return f"{self.endpoint_prefix}/admin/settings"
+
+    @property
     def admin_login_path(self) -> str:
         return f"{self.endpoint_prefix}/admin/login"
 

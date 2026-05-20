@@ -607,6 +607,111 @@
         font-size: 12px;
       }
 
+      /* ----- Settings panel ----- */
+      .settings-group {
+        background: var(--surface-2);
+        padding: 12px;
+        border: 1px solid var(--border-soft);
+        border-radius: 8px;
+        margin-bottom: 14px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+      .settings-group h3 {
+        margin: 0;
+        font-size: 11px;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        font-weight: 600;
+      }
+      .settings-fields {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 12px;
+      }
+      .settings-field {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+      .settings-field.full {
+        grid-column: 1 / -1;
+      }
+      .settings-field label.field-label {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 11px;
+        color: var(--muted);
+        font-weight: 500;
+        letter-spacing: 0.02em;
+      }
+      .settings-field label.field-label .key {
+        font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 11px;
+        color: var(--text);
+        font-weight: 500;
+      }
+      .settings-field label.field-label .badge {
+        font-size: 10px;
+        padding: 1px 7px;
+      }
+      .settings-field input[type="text"],
+      .settings-field input[type="number"],
+      .settings-field textarea,
+      .settings-field select {
+        padding: 9px 11px;
+        background: var(--bg-elev);
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: 7px;
+        font: inherit;
+        width: 100%;
+      }
+      .settings-field textarea {
+        resize: vertical;
+        min-height: 48px;
+      }
+      .settings-field input:focus,
+      .settings-field textarea:focus,
+      .settings-field select:focus {
+        outline: none;
+        border-color: var(--accent);
+        box-shadow: 0 0 0 3px var(--accent-soft);
+      }
+      .settings-field.dirty input:not([type="checkbox"]),
+      .settings-field.dirty textarea,
+      .settings-field.dirty select {
+        border-color: var(--accent);
+      }
+      .settings-field .bool-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 0;
+      }
+      .settings-field .bool-row input {
+        width: auto;
+        margin: 0;
+      }
+      .settings-field .hint {
+        font-size: 11px;
+        color: var(--muted);
+      }
+      .settings-actions {
+        display: flex;
+        justify-content: flex-end;
+        align-items: center;
+        gap: 12px;
+      }
+      .settings-actions .status { font-size: 12px; }
+      .settings-actions button {
+        font-size: 12px;
+        padding: 6px 14px;
+      }
+
       .login-shell {
         display: grid;
         place-items: center;
@@ -686,6 +791,7 @@
       @media (max-width: 720px) {
         .conn { grid-template-columns: 1fr; }
         .form-grid { grid-template-columns: 1fr; }
+        .settings-fields { grid-template-columns: 1fr; }
       }
     </style>
   </head>
@@ -734,6 +840,7 @@
         <button data-tab="list">列表</button>
         <button data-tab="stats">用量</button>
         <button data-tab="audit">审计</button>
+        <button data-tab="settings">设置</button>
       </div>
 
       <!-- Issue -->
@@ -874,6 +981,18 @@
           <div class="pager" id="auditPager"></div>
         </div>
         <span id="auditStatus" class="status"></span>
+      </section>
+
+      <!-- Settings -->
+      <section id="panel-settings" class="panel hidden">
+        <div class="status-bar">
+          <h2>插件设置</h2>
+          <div>
+            <button id="refreshSettings" class="ghost">刷新</button>
+          </div>
+        </div>
+        <span id="settingsStatus" class="status"></span>
+        <div id="settingsContainer"></div>
       </section>
     </div>
 
@@ -1082,12 +1201,13 @@
       tabs.forEach((tab) => {
         tab.onclick = () => {
           tabs.forEach((t) => t.classList.toggle("active", t === tab));
-          ["issue", "list", "stats", "audit"].forEach((name) => {
+          ["issue", "list", "stats", "audit", "settings"].forEach((name) => {
             $(`panel-${name}`).classList.toggle("hidden", name !== tab.dataset.tab);
           });
           if (tab.dataset.tab === "list") loadList();
           if (tab.dataset.tab === "audit") loadAudit();
           if (tab.dataset.tab === "stats") populateNames();
+          if (tab.dataset.tab === "settings") loadSettings();
         };
       });
 
@@ -1489,6 +1609,274 @@
           .replace(/"/g, "&quot;")
           .replace(/'/g, "&#39;");
       }
+
+      // ----- Settings -----
+      // Spec: GET /api/webchat/admin/settings -> {fields: [{key, section, type,
+      // value, hint?, min?, max?, options?, restart_required}]}.
+      // PATCH /api/webchat/admin/settings with {updates: {key: value}}.
+      // Sections render in the order they appear in the response; we trust
+      // the server to emit Branding -> Behaviour -> Security -> Streaming
+      // -> Uploads as the spec pins it.
+      const SECTION_ORDER = ["Branding", "Behaviour", "Security", "Streaming", "Uploads"];
+      const settingsState = {
+        // key -> { field (server descriptor), control (input element),
+        //          read () => raw value, dirty: bool, section: string }
+        fields: new Map(),
+      };
+
+      function settingsRawValue(entry) {
+        const { field, control } = entry;
+        if (field.type === "bool") return control.checked;
+        if (field.type === "int") {
+          // Allow blank during typing; submit-time coercion turns blank into 0,
+          // but server's int validator will reject if min > 0, which is the
+          // right outcome (operator sees "out_of_range" and corrects).
+          const raw = control.value.trim();
+          if (raw === "") return "";
+          const n = Number(raw);
+          return Number.isFinite(n) ? n : raw;
+        }
+        return control.value;
+      }
+
+      function settingsCoerce(field, raw) {
+        if (field.type === "bool") return Boolean(raw);
+        if (field.type === "int") {
+          const n = Number(raw);
+          if (!Number.isFinite(n)) return raw;
+          return n;
+        }
+        return String(raw);
+      }
+
+      function settingsMarkDirty(entry) {
+        if (entry.dirty) return;
+        entry.dirty = true;
+        entry.row.classList.add("dirty");
+      }
+
+      function settingsClearDirty(entry) {
+        entry.dirty = false;
+        entry.row.classList.remove("dirty");
+      }
+
+      function buildSettingsField(field) {
+        const row = document.createElement("div");
+        row.className = "settings-field";
+        if (field.type === "csv") row.classList.add("full");
+
+        const label = document.createElement("label");
+        label.className = "field-label";
+        const labelText = document.createElement("span");
+        labelText.className = "key";
+        labelText.textContent = field.key;
+        label.appendChild(labelText);
+        if (field.restart_required) {
+          const badge = document.createElement("span");
+          badge.className = "badge expired";
+          badge.textContent = "需重启";
+          badge.title = "保存后需重启 AstrBot 才能生效";
+          label.appendChild(badge);
+        }
+        row.appendChild(label);
+
+        let control;
+        if (field.type === "bool") {
+          const wrap = document.createElement("div");
+          wrap.className = "bool-row";
+          control = document.createElement("input");
+          control.type = "checkbox";
+          control.checked = Boolean(field.value);
+          const ctrlId = `set-${field.key.replace(/\./g, "_")}`;
+          control.id = ctrlId;
+          label.setAttribute("for", ctrlId);
+          const onLabel = document.createElement("span");
+          onLabel.textContent = field.value ? "启用" : "禁用";
+          control.addEventListener("change", () => {
+            onLabel.textContent = control.checked ? "启用" : "禁用";
+          });
+          wrap.appendChild(control);
+          wrap.appendChild(onLabel);
+          row.appendChild(wrap);
+        } else if (field.type === "options") {
+          control = document.createElement("select");
+          const ctrlId = `set-${field.key.replace(/\./g, "_")}`;
+          control.id = ctrlId;
+          label.setAttribute("for", ctrlId);
+          for (const opt of field.options || []) {
+            const o = document.createElement("option");
+            o.value = String(opt);
+            o.textContent = String(opt);
+            if (String(opt) === String(field.value)) o.selected = true;
+            control.appendChild(o);
+          }
+          row.appendChild(control);
+        } else if (field.type === "csv") {
+          control = document.createElement("textarea");
+          control.rows = 2;
+          control.placeholder = "用逗号分隔";
+          control.value = field.value == null ? "" : String(field.value);
+          const ctrlId = `set-${field.key.replace(/\./g, "_")}`;
+          control.id = ctrlId;
+          label.setAttribute("for", ctrlId);
+          row.appendChild(control);
+        } else if (field.type === "int") {
+          control = document.createElement("input");
+          control.type = "number";
+          control.step = "1";
+          if (field.min != null) control.min = String(field.min);
+          if (field.max != null) control.max = String(field.max);
+          control.value = field.value == null ? "" : String(field.value);
+          const ctrlId = `set-${field.key.replace(/\./g, "_")}`;
+          control.id = ctrlId;
+          label.setAttribute("for", ctrlId);
+          row.appendChild(control);
+        } else {
+          // string fallback
+          control = document.createElement("input");
+          control.type = "text";
+          control.value = field.value == null ? "" : String(field.value);
+          const ctrlId = `set-${field.key.replace(/\./g, "_")}`;
+          control.id = ctrlId;
+          label.setAttribute("for", ctrlId);
+          row.appendChild(control);
+        }
+
+        if (field.hint) {
+          const hint = document.createElement("span");
+          hint.className = "hint";
+          hint.textContent = field.hint;
+          row.appendChild(hint);
+        }
+
+        const entry = {
+          field,
+          control,
+          row,
+          section: field.section,
+          dirty: false,
+        };
+        entry.read = () => settingsRawValue(entry);
+
+        const evt = field.type === "bool" || field.type === "options" ? "change" : "input";
+        control.addEventListener(evt, () => settingsMarkDirty(entry));
+
+        settingsState.fields.set(field.key, entry);
+        return row;
+      }
+
+      async function loadSettings() {
+        const status = $("settingsStatus");
+        const container = $("settingsContainer");
+        status.textContent = "加载中...";
+        status.className = "status";
+        container.innerHTML = "";
+        settingsState.fields.clear();
+        try {
+          const data = await api("/api/webchat/admin/settings");
+          const fields = Array.isArray(data.fields) ? data.fields : [];
+          const bySection = new Map();
+          for (const f of fields) {
+            if (!bySection.has(f.section)) bySection.set(f.section, []);
+            bySection.get(f.section).push(f);
+          }
+          // Render in pinned order first, then any unexpected section the
+          // server emits (defensive — spec says only these five).
+          const sectionsSeen = new Set();
+          const sectionOrder = [];
+          for (const s of SECTION_ORDER) {
+            if (bySection.has(s)) {
+              sectionOrder.push(s);
+              sectionsSeen.add(s);
+            }
+          }
+          for (const s of bySection.keys()) {
+            if (!sectionsSeen.has(s)) sectionOrder.push(s);
+          }
+          for (const sectionName of sectionOrder) {
+            const group = document.createElement("section");
+            group.className = "settings-group";
+            group.dataset.section = sectionName;
+
+            const heading = document.createElement("h3");
+            heading.textContent = sectionName;
+            group.appendChild(heading);
+
+            const grid = document.createElement("div");
+            grid.className = "settings-fields";
+            for (const field of bySection.get(sectionName)) {
+              grid.appendChild(buildSettingsField(field));
+            }
+            group.appendChild(grid);
+
+            const actions = document.createElement("div");
+            actions.className = "settings-actions";
+            const sectionStatus = document.createElement("span");
+            sectionStatus.className = "status";
+            actions.appendChild(sectionStatus);
+            const saveBtn = document.createElement("button");
+            saveBtn.type = "button";
+            saveBtn.textContent = "保存本节";
+            saveBtn.onclick = () => saveSettingsSection(sectionName, saveBtn, sectionStatus);
+            actions.appendChild(saveBtn);
+            group.appendChild(actions);
+
+            container.appendChild(group);
+          }
+          status.textContent = `共 ${fields.length} 项配置`;
+          status.className = "status success";
+        } catch (e) {
+          status.textContent = `加载失败: ${e.message}`;
+          status.className = "status error";
+        }
+      }
+
+      async function saveSettingsSection(sectionName, saveBtn, sectionStatus) {
+        const updates = {};
+        const dirtyEntries = [];
+        for (const entry of settingsState.fields.values()) {
+          if (entry.section !== sectionName) continue;
+          if (!entry.dirty) continue;
+          updates[entry.field.key] = settingsCoerce(entry.field, entry.read());
+          dirtyEntries.push(entry);
+        }
+        if (dirtyEntries.length === 0) {
+          sectionStatus.textContent = "无改动";
+          sectionStatus.className = "status";
+          return;
+        }
+        saveBtn.disabled = true;
+        sectionStatus.textContent = "保存中...";
+        sectionStatus.className = "status";
+        try {
+          const result = await api("/api/webchat/admin/settings", {
+            method: "PATCH",
+            body: JSON.stringify({ updates }),
+          });
+          const saved = Array.isArray(result.saved) ? result.saved : [];
+          const restartList = Array.isArray(result.restart_required) ? result.restart_required : [];
+          const savedSet = new Set(saved);
+          for (const entry of dirtyEntries) {
+            if (savedSet.has(entry.field.key)) settingsClearDirty(entry);
+          }
+          const restartCount = restartList.length;
+          if (restartCount > 0) {
+            sectionStatus.textContent = `已保存 ${saved.length} 项（${restartCount} 项需重启生效）`;
+          } else {
+            sectionStatus.textContent = `已保存 ${saved.length} 项（已生效）`;
+          }
+          sectionStatus.className = "status success";
+        } catch (e) {
+          const code = (e.payload && e.payload.error) || e.message;
+          const detail = e.payload && e.payload.detail ? ` (${e.payload.detail})` : "";
+          sectionStatus.textContent = `失败: ${code}${detail}`;
+          sectionStatus.className = "status error";
+        } finally {
+          saveBtn.disabled = false;
+        }
+      }
+
+      $("refreshSettings").onclick = () => loadSettings();
 
       // ----- Editor modal -----
       const editorModal = $("editorModal");
