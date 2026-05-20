@@ -2313,8 +2313,13 @@ function ingestConversationDetail(detail: ServerConversationDetail): void {
       ts: (m.ts ?? detail.updated_at) * 1000,
     };
     if (m.role === "assistant" && m.incomplete === true) item.incomplete = true;
-    if (m.role === "user" && Array.isArray(m.attachments) && m.attachments.length) {
-      // Cheap, server-side already validated shape — copy through.
+    if ((m.role === "user" || m.role === "assistant") && Array.isArray(m.attachments) && m.attachments.length) {
+      // Both sides of the conversation can carry attachments. User
+      // uploads, plus `/image` slash-command generations stored under
+      // the assistant turn. Gating this to "user" only used to strip
+      // the generated image on every `coldRefetch`, so a chat
+      // reopened after restart showed an empty assistant turn where
+      // the image had been.
       item.attachments = m.attachments.filter(isAttachmentRef);
     }
     return item;

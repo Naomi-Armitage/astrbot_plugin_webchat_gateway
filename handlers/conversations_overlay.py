@@ -94,12 +94,21 @@ def _renderable_entry(item: Any) -> tuple[str, str, list[str]] | None:
 
     Kept entries:
       * role is "user" or "assistant" (lowercased)
-      * NOT an empty-text assistant with no attachments (we never
-        emit those, so they're stale noise)
-      * Empty-text user messages WITH no attachments are STILL kept
-        — `content=""` carries the "image-only look at this" turn
-        whose attachments live in the chat-sync overlay layer; the
-        normalize pass then attaches them via _build_history_overlay.
+      * Empty-text turns are STILL kept for BOTH roles. The chat-sync
+        overlay layer can supply attachments on either side now that
+        `/image` produces image-only assistant turns whose body lives
+        in `webchat_updates` (and in CM via ImageURLPart segments, see
+        `_cm_persist_pair`). Dropping them here meant generated
+        images vanished on cold refresh — the bug the operator hit
+        after the placeholder-text removal. Truly-empty turns (no
+        text, no attachments, no overlay) render as empty bubbles,
+        which is acceptable visual noise.
+      * Attachments file_ids are extracted for BOTH user and
+        assistant content. Until recently `_cm_persist_pair` only
+        emitted ImageURLPart segments under the user message, so
+        assistant file_ids were always []. Image generation now
+        writes ImageURLPart under the assistant too, so this call
+        site has to surface them.
     """
     if not isinstance(item, dict):
         return None
@@ -107,13 +116,7 @@ def _renderable_entry(item: Any) -> tuple[str, str, list[str]] | None:
     if role not in ("user", "assistant"):
         return None
     text = _extract_text(item.get("content"))
-    file_ids = (
-        list(_extract_attachment_file_ids(item.get("content")))
-        if role == "user"
-        else []
-    )
-    if not text and role != "user" and not file_ids:
-        return None
+    file_ids = list(_extract_attachment_file_ids(item.get("content")))
     return role, text, file_ids
 
 
@@ -122,22 +125,21 @@ def _normalize_history(raw: Any) -> list[dict]:
     Tool calls, system messages, anything we can't flatten to text are
     dropped — the chat UI doesn't render them.
 
-    Empty-text USER messages are preserved (with `content=""`) — these
-    are image-only "look at this" turns. The chat-sync overlay layer
-    pairs them with their attachments via `_build_history_overlay`. If
-    we dropped them here the overlay would have nothing to match against
-    and the user's image-only bubble would silently vanish on cold
-    refresh.
+    Empty-text turns are preserved for BOTH user and assistant — these
+    are image-only "look at this" turns (user side) or `/image`
+    generations whose body is the image itself (assistant side, after
+    the placeholder-text removal). The chat-sync overlay layer
+    (`_build_history_overlay`) pairs them with their attachments. If
+    we dropped them here, image-only bubbles would silently vanish on
+    cold refresh.
 
-    Empty-text ASSISTANT messages are dropped — an assistant turn with
-    no text and no attachments (we don't generate images) is just noise.
-
-    Attachments: each user message that has ImageURLPart segments in
-    CM gets `attachments=[{"file_id": ...}, ...]` populated here.
-    Caller is responsible for enriching with `mime` via a batch
-    `get_file` lookup (cheap — one query per get_conversation).
-    Surfacing attachments from CM (rather than from `webchat_updates`)
-    means image references survive the 14-day chat-sync prune.
+    Attachments: each message that has ImageURLPart segments in CM
+    gets `attachments=[{"file_id": ...}, ...]` populated here, for
+    BOTH user and assistant roles. Caller is responsible for
+    enriching with `mime` via a batch `get_file` lookup (cheap — one
+    query per get_conversation). Surfacing attachments from CM
+    (rather than from `webchat_updates`) means image references
+    survive the 14-day chat-sync prune.
     """
     if not isinstance(raw, list):
         return []

@@ -313,6 +313,7 @@ class ConversationService:
         user_text: str,
         assistant_text: str,
         user_attachments: list[dict] | None = None,
+        assistant_attachments: list[dict] | None = None,
     ) -> None:
         """Append the user/assistant pair to AstrBot CM history.
 
@@ -339,7 +340,8 @@ class ConversationService:
         never raise" contract holds even if CM is temporarily broken.
         """
         umo = _umo(token_name, session_id)
-        attachments = user_attachments or []
+        user_atts = user_attachments or []
+        assistant_atts = assistant_attachments or []
         try:
             cid = await self._cm.get_curr_conversation_id(umo)
             if not cid:
@@ -349,78 +351,78 @@ class ConversationService:
                     title=session_id,
                     persona_id=None,
                 )
-            user_parts: list[Any] = [TextPart(text=user_text)] if user_text else []
-            for att in attachments:
-                file_id = att.get("file_id") if isinstance(att, dict) else None
-                if not isinstance(file_id, str) or not file_id:
-                    continue
-                try:
-                    row = await self._storage.get_file(file_id)
-                except Exception:
-                    logger.exception(
-                        "[WebChatGateway] _cm_persist_pair get_file failed file_id=%s",
-                        file_id,
-                    )
-                    continue
-                if row is None or row.token_name != token_name:
-                    logger.warning(
-                        "[WebChatGateway] _cm_persist_pair attachment missing "
-                        "or cross-token file_id=%s",
-                        file_id,
-                    )
-                    continue
-                try:
-                    local_path = await self._file_store.open_local_path(
-                        storage_key=row.storage_key
-                    )
-                except Exception:
-                    logger.exception(
-                        "[WebChatGateway] _cm_persist_pair open_local_path "
-                        "failed key=%s",
-                        row.storage_key,
-                    )
-                    local_path = None
-                if not local_path:
-                    logger.warning(
-                        "[WebChatGateway] _cm_persist_pair could not resolve "
-                        "local path for file_id=%s",
-                        file_id,
-                    )
-                    continue
-                # AstrBot's ImageURLPart accepts any URL; passing a
-                # `file://` URL keeps providers happy across backends
-                # (local fs, R2 cache) without juggling base64 inline.
-                # Use Path.as_uri() so Windows paths like
-                # `C:\Users\...\file.jpg` come out as the spec'd
-                # `file:///C:/Users/.../file.jpg` (triple-slash + forward-
-                # slashes) instead of the malformed `file://C:\Users\...`
-                # we'd get from string concatenation.
-                if local_path.startswith(("http://", "https://", "file://")):
-                    file_url = local_path
-                else:
+
+            async def _build_parts(text: str, atts: list[dict]) -> list[Any]:
+                # Shared part-building. Resolves each attachment to an
+                # `ImageURLPart(image_url=ImageURL(url=file_url, id=file_id))`
+                # using the file_store's local path (real path for
+                # LocalFileStore, LRU-cached fetch for R2). Failures
+                # log + skip the attachment so a missing file doesn't
+                # take down the whole pair-persist.
+                parts: list[Any] = [TextPart(text=text)] if text else []
+                for att in atts:
+                    file_id = att.get("file_id") if isinstance(att, dict) else None
+                    if not isinstance(file_id, str) or not file_id:
+                        continue
                     try:
-                        file_url = Path(local_path).resolve().as_uri()
-                    except ValueError:
-                        # Relative path → as_uri() refuses; fall back to
-                        # a best-effort POSIX-style file:// URI.
-                        file_url = (
-                            "file:///"
-                            + local_path.replace("\\", "/").lstrip("/")
+                        row = await self._storage.get_file(file_id)
+                    except Exception:
+                        logger.exception(
+                            "[WebChatGateway] _cm_persist_pair get_file failed file_id=%s",
+                            file_id,
                         )
-                user_parts.append(
-                    ImageURLPart(
-                        image_url=ImageURLPart.ImageURL(url=file_url, id=file_id)
+                        continue
+                    if row is None or row.token_name != token_name:
+                        logger.warning(
+                            "[WebChatGateway] _cm_persist_pair attachment missing "
+                            "or cross-token file_id=%s",
+                            file_id,
+                        )
+                        continue
+                    try:
+                        local_path = await self._file_store.open_local_path(
+                            storage_key=row.storage_key
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[WebChatGateway] _cm_persist_pair open_local_path "
+                            "failed key=%s",
+                            row.storage_key,
+                        )
+                        local_path = None
+                    if not local_path:
+                        logger.warning(
+                            "[WebChatGateway] _cm_persist_pair could not resolve "
+                            "local path for file_id=%s",
+                            file_id,
+                        )
+                        continue
+                    if local_path.startswith(("http://", "https://", "file://")):
+                        file_url = local_path
+                    else:
+                        try:
+                            file_url = Path(local_path).resolve().as_uri()
+                        except ValueError:
+                            file_url = (
+                                "file:///"
+                                + local_path.replace("\\", "/").lstrip("/")
+                            )
+                    parts.append(
+                        ImageURLPart(
+                            image_url=ImageURLPart.ImageURL(url=file_url, id=file_id)
+                        )
                     )
-                )
-            if not user_parts:
-                # Defensive: at least one part is required by Message.
-                user_parts = [TextPart(text=user_text or "")]
+                if not parts:
+                    # At least one part required by Message.
+                    parts = [TextPart(text=text or "")]
+                return parts
+
+            user_parts = await _build_parts(user_text, user_atts)
+            assistant_parts = await _build_parts(assistant_text, assistant_atts)
             await self._cm.add_message_pair(
                 cid=cid,
                 user_message=UserMessageSegment(content=user_parts),
-                assistant_message=AssistantMessageSegment(
-                    content=[TextPart(text=assistant_text)]
-                ),
+                assistant_message=AssistantMessageSegment(content=assistant_parts),
             )
         except Exception:
             logger.exception(
@@ -714,7 +716,17 @@ class ConversationService:
                     attachments_for_msg = list(
                         attachments_map_from_events.get(i, [])
                     )
-                if attachments_for_msg and msg["role"] == "user":
+                if attachments_for_msg and msg["role"] in ("user", "assistant"):
+                    # Both directions of the conversation can carry
+                    # attachments. User-side covers image uploads;
+                    # assistant-side covers `/image` slash-command
+                    # generations stored via `record_chat_pair`'s
+                    # `assistant_attachments=` path. Restricting this
+                    # gate to "user" only used to silently strip the
+                    # generated image from the wire payload on every
+                    # `coldRefetch`, so a chat reopened after restart
+                    # showed an empty assistant turn where the image
+                    # had been.
                     enriched: list[dict] = []
                     for att in attachments_for_msg:
                         fid = att.get("file_id") if isinstance(att, dict) else None
@@ -1717,6 +1729,7 @@ class ConversationService:
                 user_text=user_text,
                 assistant_text=assistant_text,
                 user_attachments=user_attachments,
+                assistant_attachments=assistant_attachments,
             )
         except Exception:
             # _cm_persist_pair already logs; the chat-sync layer below is
