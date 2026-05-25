@@ -175,6 +175,12 @@
         gap: 2px;
         border-bottom: 1px solid var(--border-soft);
         margin-bottom: 14px;
+        /* Narrow / portrait viewports squeeze the 6 flex buttons until
+           each label is a single character wide, which makes CJK labels
+           wrap one glyph per line (竖排). Keep the bar a single row and
+           let it scroll sideways instead of stacking. */
+        overflow-x: auto;
+        scrollbar-width: thin;
       }
       .tabs button {
         background: transparent;
@@ -186,6 +192,11 @@
         font-size: 13px;
         border-bottom: 2px solid transparent;
         margin-bottom: -1px;
+        /* Each label stays on one line; buttons don't shrink below
+           their content width — together these stop the per-glyph
+           vertical wrap on narrow screens. */
+        white-space: nowrap;
+        flex-shrink: 0;
       }
       .tabs button:hover {
         color: var(--text-strong);
@@ -1008,6 +1019,9 @@
         .conn { grid-template-columns: 1fr; }
         .form-grid { grid-template-columns: 1fr; }
         .settings-fields { grid-template-columns: 1fr; }
+        /* Trim tab padding so the 6 labels fit a phone-portrait row
+           without horizontal scroll in the common case. */
+        .tabs button { padding: 10px 11px; }
       }
     </style>
   </head>
