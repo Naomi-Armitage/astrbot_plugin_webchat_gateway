@@ -749,8 +749,15 @@ footer {
   display: flex;
   align-items: flex-end;
   gap: 2px;
+  /* Resting height math (box-sizing: border-box):
+       inner area = 38 − 2px border = 36px
+       textarea single line = 22px line + 14px padding = 36px → fills it
+     so the wrapper rests at exactly 38px, matching the send button's
+     min-height. No vertical padding here — the textarea's own padding
+     supplies the breathing room. Earlier `padding: 1px 0` added 2px and
+     pushed the box to 40px, leaving it taller than the 38px button. */
   min-height: 38px;
-  padding: 1px 4px;
+  padding: 0 5px;
   background: var(--card);
   border: 1px solid var(--rule);
   border-radius: 10px;
@@ -763,7 +770,7 @@ footer {
 }
 footer textarea {
   flex: 1;
-  min-height: 34px;
+  min-height: 36px;
   max-height: 200px;
   padding: 7px 6px;
   background: transparent;
@@ -785,7 +792,10 @@ footer textarea {
   scrollbar-width: none;            /* Firefox */
   -ms-overflow-style: none;         /* legacy Edge / IE */
   font: inherit;
-  line-height: 1.5;
+  /* Integer line box on purpose: 15px × 1.5 = 22.5px makes the single-line
+     scrollHeight round to 37px, which pushed .composer-input to 39px — 1px
+     past the 38px send button. 22px → 36px box, so the wrapper rests at 38. */
+  line-height: 22px;
 }
 footer textarea::-webkit-scrollbar { display: none; }  /* Chromium / WebKit */
 footer textarea::placeholder { color: var(--ink-soft); }
@@ -980,6 +990,11 @@ footer button:disabled { opacity: .5; cursor: not-allowed; }
   flex: 0 0 32px;
   width: 32px;
   height: 32px;
+  /* `footer button` sets min-height:38px for the send button, and that
+     selector also matches this <button>. Without resetting it the "+"
+     is forced to 38px and (with its 2px margin) inflates .composer-input
+     to ~41px, taller than the 38px send button. Pin it back to 32px. */
+  min-height: 32px;
   padding: 0;
   display: inline-grid;
   place-items: center;
@@ -1243,13 +1258,17 @@ body.lightbox-open { overflow: hidden; }
   .msg { max-width: 86%; padding: 9px 12px; font-size: 14px; }
   footer { gap: 6px; padding-top: 6px; }
   .composer-row { gap: 8px; }
+  /* Mobile uses 16px input text (iOS anti-zoom), so the textarea's
+     single-line height grows to ~38px and the wrapper to ~40px. Pin the
+     wrapper + send button to a shared 40px so they stay level. */
+  .composer-input { min-height: 40px; }
   footer textarea {
-    min-height: 36px;
+    min-height: 38px;
     max-height: 120px;
     font-size: 16px; /* prevent iOS Safari auto-zoom on focus */
     resize: none;
   }
-  footer button#send { padding: 0 12px; font-size: 14px; }
+  footer button#send { padding: 0 12px; font-size: 14px; min-height: 40px; }
   .plus-btn { width: 36px; height: 36px; flex-basis: 36px; }
   .plus-menu-item { padding: 11px 12px; }  /* roomier touch targets */
   .composer-chip { width: 48px; height: 48px; flex-basis: 48px; }
