@@ -265,8 +265,10 @@ const sidebarEl = $("sidebar");
 const sidebarToggleBtn = $<HTMLButtonElement>("sidebarToggle");
 const sidebarBackdrop = $("sidebarBackdrop");
 const sessionListEl = $<HTMLUListElement>("sessionList");
-const attachBtn = $<HTMLButtonElement>("attachBtn");
-const imageBtn = $<HTMLButtonElement>("imageBtn");
+const plusBtn = $<HTMLButtonElement>("plusBtn");
+const plusMenu = $<HTMLDivElement>("plusMenu");
+const menuUpload = $<HTMLButtonElement>("menuUpload");
+const menuImage = $<HTMLButtonElement>("menuImage");
 const fileInputEl = $<HTMLInputElement>("fileInput");
 const composerAttachmentsEl = $("composer-attachments");
 const dropOverlayEl = $("dropOverlay");
@@ -2686,7 +2688,7 @@ function switchSession(id: string): void {
       inputEl.value = inputEl.value.replace(IMAGE_CMD_RE, "").replace(/^\s+/, "");
       autosizeInput();
     }
-    refreshImageBtnState();
+    refreshImageModeState();
     store.activeId = id;
     saveStore();
     replayActive();
@@ -2902,21 +2904,21 @@ async function loadChatSite(): Promise<void> {
       };
       image_gen?: { enabled?: boolean };
     };
-    // 生图按钮的可见性按服务端配置切换。服务端的 image_gen.enabled
+    // 生图入口的可见性按服务端配置切换。服务端的 image_gen.enabled
     // 是基于 ImageBridge.enabled 读出来的（同时要求 endpoint + api_key
     // 都非空），所以这里的可见性与 /chat 实际行为一致。关闭后顺手
-    // 抹掉 composer 里可能残留的 /image 前缀，避免用户按下后停留在
-    // image 模式但按钮不见了。
+    // 抹掉 composer 里可能残留的 /image 前缀，避免用户停留在 image
+    // 模式但入口不见了。
     const imageEnabled = !!(data.image_gen && data.image_gen.enabled);
     if (imageEnabled) {
-      imageBtn.hidden = false;
+      menuImage.hidden = false;
     } else {
-      imageBtn.hidden = true;
+      menuImage.hidden = true;
       if (isImageCommand(inputEl.value)) {
         inputEl.value = inputEl.value.replace(IMAGE_CMD_RE, "").replace(/^\s+/, "");
         autosizeInput();
       }
-      refreshImageBtnState();
+      refreshImageModeState();
     }
     // Apply server-driven upload caps (overrides hardcoded defaults).
     // An operator who edits config to raise max_attachments_per_message
@@ -2944,10 +2946,14 @@ async function loadChatSite(): Promise<void> {
       }
     }
     if (!UPLOADS_ENABLED) {
-      // Server says uploads are off — hide the paperclip + don't accept
-      // drops/paste.
-      try { attachBtn.hidden = true; } catch {}
+      // Server says uploads are off — hide the upload menu item + don't
+      // accept drops/paste.
+      try { menuUpload.hidden = true; } catch {}
     }
+    // If neither menu item survives the gating, the plus affordance has
+    // nothing to offer — hide the whole button so the input box doesn't
+    // carry a dead control.
+    refreshPlusBtnVisibility();
     const name = (data.site_name || "").trim() || "WebChat Gateway";
     document.title = `${name} · Chat`;
     $("brandName").textContent = name;
@@ -3631,7 +3637,6 @@ function updateSendButtonState(): void {
   const hasReady = composerAttachments.some((a) => a.state === "ready");
   const hasText = inputEl.value.trim().length > 0;
   sendBtn.disabled = hasUploading || (!hasText && !hasReady);
-  attachBtn.disabled = composerAttachments.length >= MAX_ATTACHMENTS_PER_MESSAGE;
 }
 
 // ---------- Lightbox ----------
@@ -3765,7 +3770,7 @@ async function send(): Promise<void> {
   // Programmatic value change doesn't fire 'input' — refresh the
   // image-button .active class explicitly so it doesn't stay lit
   // after the /image prompt has already been sent.
-  refreshImageBtnState();
+  refreshImageModeState();
   // Clear chips post-render — the optimistic bubble already references the
   // file_ids, so revoking the local preview URLs is safe and we want the
   // composer empty for the next turn.
@@ -4650,30 +4655,85 @@ inputEl.addEventListener("keydown", (e) => {
   }
 });
 
-// Paperclip → file picker. Reset .value after each open so the change
+// ---------- Plus menu (upload + image-gen affordances) ----------
+// Both composer actions now live behind a single "+" inside the input
+// box. The menu pops upward; selecting an item runs the action and
+// closes. Visibility of each item is gated by server config (handled
+// in the /site fetch); the "+" itself hides when neither survives.
+
+function isPlusMenuOpen(): boolean {
+  return !plusMenu.hidden;
+}
+function openPlusMenu(): void {
+  if (plusBtn.disabled || plusBtn.hidden) return;
+  plusMenu.hidden = false;
+  plusBtn.setAttribute("aria-expanded", "true");
+}
+function closePlusMenu(): void {
+  if (plusMenu.hidden) return;
+  plusMenu.hidden = true;
+  plusBtn.setAttribute("aria-expanded", "false");
+}
+function togglePlusMenu(): void {
+  if (isPlusMenuOpen()) closePlusMenu();
+  else openPlusMenu();
+}
+// Hide the whole "+" when neither menu item is available — an empty
+// menu is worse than no button. Called after the server-config gating
+// flips menuUpload / menuImage hidden flags.
+function refreshPlusBtnVisibility(): void {
+  const anyItem = !menuUpload.hidden || !menuImage.hidden;
+  plusBtn.hidden = !anyItem;
+  if (!anyItem) closePlusMenu();
+}
+
+plusBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  togglePlusMenu();
+});
+// Outside-click closes. Pointerdown (not click) so it fires before the
+// textarea steals focus, and we ignore clicks within the menu/button.
+document.addEventListener("pointerdown", (e) => {
+  if (!isPlusMenuOpen()) return;
+  const t = e.target as Node;
+  if (plusMenu.contains(t) || plusBtn.contains(t)) return;
+  closePlusMenu();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && isPlusMenuOpen()) {
+    closePlusMenu();
+    plusBtn.focus();
+  }
+});
+
+// Upload → file picker. Reset .value after each open so the change
 // handler fires even when the user re-selects the same file (the browser
 // suppresses change events on identical selections otherwise).
-attachBtn.addEventListener("click", () => {
-  if (attachBtn.disabled) return;
+menuUpload.addEventListener("click", () => {
+  closePlusMenu();
+  // At the per-message cap the picker would reject everything, so surface
+  // the limit instead of opening it to a no-op.
+  if (composerAttachments.length >= MAX_ATTACHMENTS_PER_MESSAGE) {
+    addMessageBubble("notice", `最多 ${MAX_ATTACHMENTS_PER_MESSAGE} 张`);
+    return;
+  }
   fileInputEl.value = "";
   fileInputEl.click();
 });
-// 生成图片 button. Prepends "/image " to the textarea if the prefix
-// isn't already there; clicking again with the prefix present
-// removes it (toggle behaviour). Mirrors how operators can also just
-// type the trigger themselves — the button is an affordance, not a
-// modal mode.
-function refreshImageBtnState(): void {
-  if (isImageCommand(inputEl.value)) {
-    imageBtn.classList.add("active");
-    imageBtn.setAttribute("aria-pressed", "true");
-  } else {
-    imageBtn.classList.remove("active");
-    imageBtn.setAttribute("aria-pressed", "false");
-  }
+// 生成图片. Prepends "/image " to the textarea if the prefix isn't
+// already there; selecting again with the prefix present removes it
+// (toggle behaviour). Mirrors how operators can also just type the
+// trigger themselves — the menu item is an affordance, not a modal mode.
+function refreshImageModeState(): void {
+  const armed = isImageCommand(inputEl.value);
+  menuImage.setAttribute("aria-pressed", armed ? "true" : "false");
+  // Tint the "+" so the operator can tell they're in image mode even
+  // with the menu closed.
+  plusBtn.classList.toggle("active", armed);
 }
-imageBtn.addEventListener("click", () => {
-  if (imageBtn.disabled) return;
+menuImage.addEventListener("click", () => {
+  if (menuImage.disabled) return;
+  closePlusMenu();
   if (isImageCommand(inputEl.value)) {
     // Toggle off — strip the prefix + leading whitespace.
     inputEl.value = inputEl.value.replace(IMAGE_CMD_RE, "").replace(/^\s+/, "");
@@ -4681,14 +4741,14 @@ imageBtn.addEventListener("click", () => {
     inputEl.value = `/image ${inputEl.value.trimStart()}`;
   }
   autosizeInput();
-  refreshImageBtnState();
+  refreshImageModeState();
   inputEl.focus();
   // Move caret to end so the prompt typing continues naturally.
   const len = inputEl.value.length;
   try { inputEl.setSelectionRange(len, len); } catch {}
 });
-inputEl.addEventListener("input", refreshImageBtnState);
-refreshImageBtnState();
+inputEl.addEventListener("input", refreshImageModeState);
+refreshImageModeState();
 fileInputEl.addEventListener("change", () => {
   if (fileInputEl.files && fileInputEl.files.length) {
     addAttachmentFiles(fileInputEl.files);

@@ -740,15 +740,36 @@ footer {
   gap: 10px;
   align-items: flex-end;
 }
-footer textarea {
+/* The visible input "box" now wraps the plus button + textarea so the
+   button sits INSIDE the field. The border / background / focus-ring
+   that used to live on the textarea move here; the textarea becomes a
+   transparent, borderless child that still drives auto-grow. */
+.composer-input {
   flex: 1;
-  min-height: 36px;
-  max-height: 200px;
-  padding: 6px 12px;
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  min-height: 38px;
+  padding: 1px 4px;
   background: var(--card);
-  color: var(--ink);
   border: 1px solid var(--rule);
   border-radius: 10px;
+  position: relative;
+  transition: border-color .15s ease, box-shadow .15s ease;
+}
+.composer-input:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--ring);
+}
+footer textarea {
+  flex: 1;
+  min-height: 34px;
+  max-height: 200px;
+  padding: 7px 6px;
+  background: transparent;
+  color: var(--ink);
+  border: none;
+  border-radius: 0;
   /* Auto-grow handled by JS (autosizeInput) — drives height from
      scrollHeight on input. Manual drag-to-resize is removed because the
      handle sits in the bottom-right corner, awkwardly close to the
@@ -765,23 +786,22 @@ footer textarea {
   -ms-overflow-style: none;         /* legacy Edge / IE */
   font: inherit;
   line-height: 1.5;
-  transition: border-color .15s ease, box-shadow .15s ease;
 }
 footer textarea::-webkit-scrollbar { display: none; }  /* Chromium / WebKit */
 footer textarea::placeholder { color: var(--ink-soft); }
 footer textarea:focus {
+  /* The focus ring is now owned by .composer-input:focus-within so the
+     button + text light up as one field. Suppress the textarea's own. */
   outline: none;
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--ring);
+  box-shadow: none;
 }
 footer button {
   padding: 0 14px;
-  /* Match the row's other 36px-tall controls (.attach-btn + the
-     textarea's min-height) so the send button aligns top-and-bottom
-     instead of sitting as a short floater anchored to the row's
-     bottom edge by align-items: flex-end. min-height lets it still
-     grow if it ever wraps. */
-  min-height: 36px;
+  /* Match the input box's 38px min-height so the send button aligns
+     top-and-bottom with .composer-input instead of sitting as a short
+     floater anchored to the row's bottom edge by align-items:
+     flex-end. min-height lets it still grow if it ever wraps. */
+  min-height: 38px;
   background: var(--accent);
   color: #fff;
   border: 1px solid var(--accent);
@@ -953,36 +973,83 @@ footer button:disabled { opacity: .5; cursor: not-allowed; }
   to   { transform: rotate(360deg); }
 }
 
-.attach-btn {
-  flex: 0 0 36px;
-  width: 36px;
-  height: 36px;
+/* Plus button — sits inside .composer-input at the bottom-left and
+   toggles the secondary menu. Transparent so it reads as part of the
+   field, not a separate control. */
+.plus-btn {
+  flex: 0 0 32px;
+  width: 32px;
+  height: 32px;
   padding: 0;
   display: inline-grid;
   place-items: center;
-  background: var(--card);
+  background: transparent;
   color: var(--ink-soft);
-  border: 1px solid var(--rule);
-  border-radius: 10px;
+  border: none;
+  border-radius: 8px;
   cursor: pointer;
   align-self: flex-end;
-  transition: color .15s ease, border-color .15s ease, background .15s ease;
+  margin-bottom: 2px;
+  transition: color .15s ease, background .15s ease;
 }
-.attach-btn:hover {
-  color: var(--accent);
-  border-color: color-mix(in oklab, var(--accent) 40%, var(--rule));
+.plus-btn:hover { color: var(--accent); background: var(--accent-soft); }
+.plus-btn:disabled { opacity: .5; cursor: not-allowed; }
+.plus-btn svg { width: 20px; height: 20px; transition: transform .2s ease; }
+/* Open state rotates the + into an ×; image-mode keeps it accent-tinted. */
+.plus-btn[aria-expanded="true"] svg { transform: rotate(45deg); }
+.plus-btn.active { color: var(--accent); }
+/* When the whole plus affordance is suppressed (uploads + image gen
+   both off server-side) the input box loses its left inset so text
+   doesn't float with a dead gap. */
+.plus-btn[hidden] { display: none; }
+
+/* Secondary menu — pops upward above the input box. */
+.plus-menu {
+  position: absolute;
+  left: 2px;
+  bottom: calc(100% + 8px);
+  min-width: 160px;
+  padding: 6px;
+  background: var(--card);
+  border: 1px solid var(--rule);
+  border-radius: 12px;
+  box-shadow: 0 8px 28px var(--shadow-strong);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  z-index: 50;
+  animation: plusMenuIn .14s ease both;
+}
+.plus-menu[hidden] { display: none; }
+@keyframes plusMenuIn {
+  from { opacity: 0; transform: translateY(6px) scale(.98); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+.plus-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  background: transparent;
+  border: none;
+  border-radius: 8px;
+  color: var(--ink);
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+  text-align: left;
+  white-space: nowrap;
+  transition: background .12s ease, color .12s ease;
+}
+.plus-menu-item:hover {
   background: var(--accent-soft);
+  color: var(--accent-strong);
 }
-.attach-btn svg { width: 16px; height: 16px; }
-.attach-btn:disabled { opacity: .5; cursor: not-allowed; }
-/* Image-generation button (next to attach paperclip). When the
-   composer text starts with /image|/img|/draw the JS flips an .active
-   class so the operator can see they're in image mode. */
-.attach-btn.active {
-  color: var(--accent);
-  border-color: color-mix(in oklab, var(--accent) 55%, var(--rule));
-  background: var(--accent-soft);
-}
+.plus-menu-item svg { width: 18px; height: 18px; flex: 0 0 18px; }
+/* Image-gen item reflects whether /image mode is currently armed. */
+.plus-menu-item[aria-pressed="true"] { color: var(--accent); font-weight: 600; }
+/* Server-config gating hides individual items. */
+.plus-menu-item[hidden] { display: none; }
 
 /* Drag-and-drop overlay */
 .drop-overlay {
@@ -1183,7 +1250,8 @@ body.lightbox-open { overflow: hidden; }
     resize: none;
   }
   footer button#send { padding: 0 12px; font-size: 14px; }
-  .attach-btn { width: 36px; height: 36px; flex-basis: 36px; }
+  .plus-btn { width: 36px; height: 36px; flex-basis: 36px; }
+  .plus-menu-item { padding: 11px 12px; }  /* roomier touch targets */
   .composer-chip { width: 48px; height: 48px; flex-basis: 48px; }
   .lightbox-nav { width: 38px; height: 38px; margin-top: -19px; }
   .lightbox-close { width: 36px; height: 36px; top: 12px; right: 12px; }
