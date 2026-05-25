@@ -4635,7 +4635,16 @@ sidebarBackdrop.addEventListener("click", closeMobileSidebar);
 // trap's onEscape and double-fire closeMobileSidebar.
 
 inputEl.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
+  if (e.key !== "Enter" || e.isComposing || e.keyCode === 229) return;
+  // Touch-primary devices (phones / tablets): the on-screen keyboard's
+  // Enter inserts a newline and sending is button-only — the native
+  // messaging-app convention. Pointer-fine devices (desktop): Enter
+  // sends, Shift+Enter inserts a newline. Evaluated per-keystroke so a
+  // device that gains/loses a fine pointer (e.g. tablet + keyboard
+  // dock) picks up the right behaviour without a reload.
+  const touchPrimary = window.matchMedia("(pointer: coarse)").matches;
+  if (touchPrimary) return; // let Enter fall through to a newline
+  if (!e.shiftKey) {
     e.preventDefault();
     void send();
   }
