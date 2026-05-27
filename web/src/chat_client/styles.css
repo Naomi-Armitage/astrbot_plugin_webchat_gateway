@@ -387,6 +387,20 @@ header h1 {
   flex-direction: column;
   gap: 10px;
 }
+/* Telegram-style bottom anchoring. Once the conversation has any message,
+   a flexible spacer above the list soaks up the free space so a short
+   conversation sits at the BOTTOM of the chat area (just above the
+   composer) and grows upward as messages arrive — instead of starting at
+   the top where the first reply tucked under the translucent header. When
+   messages overflow the viewport the spacer collapses to 0 and scrolling
+   is normal, so the 72px top padding still clears the header at the top.
+   Scoped to :has(.msg) so the empty-state keeps its own margin:auto
+   centering (a spacer would otherwise consume the free space its auto
+   margins need). */
+#messages:has(.msg)::before {
+  content: "";
+  flex: 1;
+}
 #messages::-webkit-scrollbar { width: 8px; }
 #messages::-webkit-scrollbar-track { background: transparent; }
 #messages::-webkit-scrollbar-thumb {
