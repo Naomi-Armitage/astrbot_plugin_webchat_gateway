@@ -89,6 +89,7 @@ const BACKOFF_LADDER_MS = [1_000, 2_000, 5_000, 10_000, 30_000];
 const FETCH_TIMEOUT_FAST_MS = 15_000;       // list/detail/PATCH/clear
 const FETCH_TIMEOUT_LONG_POLL_MS = (LONG_POLL_TIMEOUT_S + 10) * 1000;
 const FETCH_TIMEOUT_CHAT_MS = 90_000;       // covers llm_timeout (60s default) + slack
+const FETCH_TIMEOUT_PROBE_MS = 3_000;       // pre-send connectivity confirm — short, fail-fast
 // User message: optimistic record happens BEFORE /chat fires, but the
 // backend stamps event.ts only AFTER LLM responds (record_chat_pair runs
 // at chat.py step 9). LLM is typically 5–30s, can be up to llm_timeout
@@ -1000,7 +1001,7 @@ function applyUserFailureChrome(
   badge.setAttribute("aria-label", "重试发送");
   badge.title = "重试";
   badge.innerHTML = ICON_BADGE_REFRESH;
-  badge.addEventListener("click", () => retryFailedUserMessage(bubble, text, attachments));
+  badge.addEventListener("click", () => void retryFailedUserMessage(bubble, text, attachments));
   wrapper.appendChild(badge);
   wrapper.appendChild(bubble);
   const edit = document.createElement("button");
@@ -1113,16 +1114,20 @@ function removeFailedHistoryEntry(text: string, attachments: AttachmentRef[] | u
   }
 }
 
-function retryFailedUserMessage(
+async function retryFailedUserMessage(
   bubble: HTMLDivElement,
   text: string,
   attachments: AttachmentRef[] | undefined,
-): void {
+): Promise<void> {
   // While a stream is in flight retry would race the live POST; we'd
   // either 429 concurrent_request or duplicate the user echo. Silently
   // ignore — the failure caption stays put, user can retry once the
   // current turn settles.
   if (sync.streamAbort) return;
+  // Confirm connectivity before tearing down the failed bubble — an
+  // offline retry must not delete the user's message only to fail again
+  // after a long timeout. Keep the failed bubble in place and notify.
+  if (!(await confirmConnectivity())) { notifyOffline(); return; }
   removeUserBubbleAndFailureChrome(bubble);
   removeFailedHistoryEntry(text, attachments);
   void performSend(text, attachments ? [...attachments] : []);
@@ -1927,7 +1932,7 @@ async function regenerateMessage(bubble: HTMLDivElement): Promise<void> {
 // different answer than the original. Intentionally distinct from the
 // bot-side "重新生成" (`regenerateMessage`), which truncates and
 // replaces the bot reply in place.
-function regenerateUserMessage(bubble: HTMLDivElement): void {
+async function regenerateUserMessage(bubble: HTMLDivElement): Promise<void> {
   const idx = indexOfRenderedBubble(bubble);
   if (idx < 0) return;
   const sess = currentSession();
@@ -1937,6 +1942,7 @@ function regenerateUserMessage(bubble: HTMLDivElement): void {
     addMessageBubble("notice", "正在处理中，稍候。");
     return;
   }
+  if (!(await confirmConnectivity())) { notifyOffline(); return; }
   void performSend(item.text, item.attachments ? [...item.attachments] : []);
 }
 
@@ -3756,15 +3762,83 @@ function recordStreamFailure(): void {
   }
 }
 
+// ---------- Pre-send connectivity gate ----------
+//
+// Chat platforms refuse to send while disconnected instead of firing a
+// doomed request. Without a gate, a send in an offline / abnormal-network
+// environment renders the optimistic echo + reply box and then burns the
+// /chat/stream (90s) + /chat fallback (90s) deadlines before failing — the
+// user waits on a reply that can never arrive. Every send entry point
+// (composer send, 重试, 再问一次) calls confirmConnectivity() before any
+// irreversible prep so an offline send is blocked up front, nothing is
+// lost, and no reply box is left spinning.
+const OFFLINE_NOTICE = "网络连接异常，消息未发送。请检查网络后重试。";
+
+// Returns false when the client is offline (caller should notify + abort).
+// Fast path adds zero latency: navigator.onLine === false is an instant,
+// reliable negative, and when the sync badge isn't "offline" we trust the
+// maintained connection state and send immediately. Only when the badge
+// already reads "offline" do we fire ONE short-deadline probe at the
+// non-blocking events endpoint (the one short-poll uses): a resolved
+// response (any status) means the server is reachable and the badge was
+// merely stale — the poll loop hasn't promoted out of backoff yet — so we
+// clear the stale label and allow the send; a network error / timeout
+// means we are genuinely offline.
+async function confirmConnectivity(): Promise<boolean> {
+  if (!navigator.onLine) return false;
+  if (syncStatusEl.dataset.state !== "offline") return true;
+  try {
+    // Reachability probe only: we discard the response body and do NOT
+    // advance sync.lastPts. This relies on the events endpoint being
+    // idempotent on the `since` cursor — a later poll re-fetches from the
+    // same lastPts, so this probe consumes nothing. If the endpoint ever
+    // starts advancing server-side state on read, this would swallow
+    // events and must be revisited.
+    await fetchWithTimeout(
+      `${EVENTS_URL}?since=${sync.lastPts}&timeout=0`,
+      { credentials: "same-origin", headers: bearer() },
+      FETCH_TIMEOUT_PROBE_MS,
+    );
+    // Reachable: the badge lagged reality. Reflect the real transport so
+    // the "离线" label clears immediately.
+    setSyncStatus(sync.transport);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Single, non-stacking offline notice — dedups against an immediately
+// preceding identical notice so repeated clicks while offline don't pile
+// up bubbles.
+function notifyOffline(): void {
+  const last = msgs.lastElementChild;
+  const dup = last instanceof HTMLElement
+    && last.classList.contains("notice")
+    && last.textContent === OFFLINE_NOTICE;
+  if (!dup) addMessageBubble("notice", OFFLINE_NOTICE);
+}
+
 async function send(): Promise<void> {
+  // Don't fire while uploads are still in flight — server would reject
+  // unknown file_ids and the user would lose their text.
+  if (composerAttachments.some((a) => a.state === "uploading")) return;
+  // Nothing to send → don't bother probing connectivity.
+  const hasReady = composerAttachments.some((a) => a.state === "ready" && a.file_id);
+  if (!inputEl.value.trim() && !hasReady) return;
+  // Confirm connectivity BEFORE clearing the composer + rendering the
+  // optimistic echo. If we're offline, keep the composer intact and
+  // surface a notice instead of stranding the user on a reply box that
+  // can't fill.
+  if (!(await confirmConnectivity())) { notifyOffline(); return; }
+  // Read the composer AFTER the gate: the connectivity probe can await for
+  // a few seconds, and whatever the user typed in that window must not be
+  // dropped by the clear below.
   const message = inputEl.value.trim();
   const readyAttachments: AttachmentRef[] = composerAttachments
     .filter((a) => a.state === "ready" && a.file_id)
     .map((a) => ({ file_id: a.file_id!, mime: a.mime }));
   if (!message && !readyAttachments.length) return;
-  // Don't fire while uploads are still in flight — server would reject
-  // unknown file_ids and the user would lose their text.
-  if (composerAttachments.some((a) => a.state === "uploading")) return;
   inputEl.value = "";
   autosizeInput();
   // Programmatic value change doesn't fire 'input' — refresh the
