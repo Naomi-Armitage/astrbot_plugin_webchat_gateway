@@ -443,6 +443,15 @@ header h1 {
    replies look identical to the old textContent rendering, then style
    the structural elements (lists, code, headings, tables, blockquotes,
    links) with the existing design tokens. */
+/* Rendered markdown manages its own whitespace through block elements,
+   <br>, and <pre>. The base `.msg` `white-space: pre-wrap` (needed so
+   plain-text user/streaming bubbles keep their newlines) would otherwise
+   render marked's *source* newlines BETWEEN block tags as visible blank
+   lines — a stray gap before every list/table and between paragraphs.
+   Reset to normal once the bubble holds real HTML. The streaming bubble
+   still shows plain text, so it keeps pre-wrap via the higher-specificity
+   `.msg.bot.md.streaming` rule. */
+.msg.md:not(.streaming) { white-space: normal; }
 .msg.md > :first-child { margin-top: 0; }
 .msg.md > :last-child { margin-bottom: 0; }
 .msg.md p { margin: 0 0 0.6em; }
@@ -1376,19 +1385,27 @@ body.lightbox-open { overflow: hidden; }
   pointer-events: none;
 }
 
-.msg-edit-icon {
+/* Trailing failure controls (edit + delete) grouped on one line below the
+   failed bubble, hugging its bottom-right. The container carries the
+   positioning; the buttons inside are plain icon buttons. Negative top
+   margin pulls the row tight to the bubble; right margin aligns with the
+   bubble's right edge (the bubble has a small built-in inset already). */
+.msg-fail-actions {
+  align-self: flex-end;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin: -4px 2px 2px 0;
+}
+.msg-edit-icon,
+.msg-fail-delete {
   appearance: none;
   border: none;
   padding: 5px;
-  /* Pull tight to the bubble: negative top margin so the icon hugs
-     the bubble's bottom edge instead of floating in a gap. Right
-     margin aligns it with the bubble's right edge (the bubble has
-     a small built-in inset from the chat list edge already). */
-  margin: -4px 2px 2px 0;
+  margin: 0;
   background: none;
   color: var(--ink-soft);
   cursor: pointer;
-  align-self: flex-end;
   display: inline-flex;
   border-radius: 8px;
   opacity: 0.5;
@@ -1400,12 +1417,21 @@ body.lightbox-open { overflow: hidden; }
   background: color-mix(in oklab, var(--ink) 6%, transparent);
   color: var(--ink);
 }
-.msg-edit-icon:focus-visible {
+/* Delete is destructive — red tint on hover, matching .msg-action-delete
+   and the retry badge so dangerous actions read consistently. */
+.msg-fail-delete:hover {
+  opacity: 1;
+  background: color-mix(in oklab, var(--bad) 10%, transparent);
+  color: var(--bad);
+}
+.msg-edit-icon:focus-visible,
+.msg-fail-delete:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
   opacity: 1;
 }
-.msg-edit-icon svg {
+.msg-edit-icon svg,
+.msg-fail-delete svg {
   width: 16px;
   height: 16px;
   pointer-events: none;
@@ -1537,6 +1563,45 @@ body.lightbox-open { overflow: hidden; }
   color: var(--bad);
 }
 
+/* Floating "已复制" hint on a successful copy (message bubble, code block,
+   or single code line). The per-element flashes are tactile but easy to
+   miss; this is the one explicit confirmation. pointer-events:none so it
+   never intercepts a click; main.ts anchors it above the pointer. */
+.copy-toast {
+  position: fixed;
+  z-index: 9999;
+  transform: translate(-50%, -100%);
+  pointer-events: none;
+  display: inline-flex;
+  align-items: center;
+  background: var(--card);
+  color: var(--ink);
+  border: 1px solid var(--rule);
+  box-shadow: 0 6px 20px var(--shadow-strong);
+  padding: 5px 11px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.3;
+  white-space: nowrap;
+  opacity: 0;
+  transition: opacity 0.16s ease, transform 0.16s ease;
+}
+.copy-toast::before {
+  content: "✓";
+  color: var(--good);
+  font-weight: 700;
+  margin-right: 6px;
+}
+.copy-toast.show {
+  opacity: 1;
+  transform: translate(-50%, calc(-100% - 5px));
+}
+@media (prefers-reduced-motion: reduce) {
+  .copy-toast { transition: opacity 0.16s ease; }
+  .copy-toast.show { transform: translate(-50%, -100%); }
+}
+
 /* Regenerate in-progress: dim the bubble + show a small spinning
    indicator. We don't lay a full overlay over the bubble — the
    action button's disabled state already signals "wait", and a
@@ -1563,11 +1628,11 @@ body.lightbox-open { overflow: hidden; }
   to { transform: rotate(360deg); }
 }
 
-/* The .msg-user-failed wrapper now sits INSIDE the .msg-row so the
-   row can host both the wrapper + the .msg-edit-icon trailing sibling
-   + the .msg-actions cluster without the wrapper's flex layout
-   fighting the row's column flex. Reset wrapper's align-self so it
-   doesn't try to anchor itself relative to the row's column axis. */
+/* The .msg-user-failed wrapper sits INSIDE the .msg-row so the row can
+   host the wrapper + the .msg-fail-actions trailing sibling + the
+   .msg-actions cluster without the wrapper's flex layout fighting the
+   row's column flex. Reset wrapper's align-self so it doesn't try to
+   anchor itself relative to the row's column axis. */
 .msg-row.user-row .msg-user-failed {
   align-self: stretch;
 }

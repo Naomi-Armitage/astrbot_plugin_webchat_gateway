@@ -616,6 +616,42 @@ function gatherBlockText(block: Element): string {
   lineEls.forEach((el) => { lines.push(el.textContent ?? ""); });
   return lines.join("\n");
 }
+
+// Floating "已复制" hint shown on every successful copy (message bubble,
+// code block, single code line). The per-element flashes (button .copied,
+// line highlight) are tactile but easy to miss — especially click-to-copy
+// on a code line — so this gives one consistent, explicit confirmation.
+// A single reusable node, anchored above the pointer (or the activated
+// element's rect for keyboard activation, where click coords are 0,0).
+let copyToastTimer = 0;
+function copyToastAnchor(e: MouseEvent, el: Element): { x: number; y: number } {
+  if (e.clientX || e.clientY) return { x: e.clientX, y: e.clientY };
+  const r = el.getBoundingClientRect();
+  return { x: r.left + r.width / 2, y: r.top };
+}
+function showCopyToast(x: number, y: number): void {
+  let toast = document.getElementById("_copyToast");
+  if (!toast) {
+    toast = document.createElement("div");
+    toast.id = "_copyToast";
+    toast.className = "copy-toast";
+    toast.setAttribute("role", "status");
+    toast.setAttribute("aria-live", "polite");
+    document.body.appendChild(toast);
+  }
+  toast.textContent = "已复制";
+  // Clamp so the hint never clips off the top/sides of the viewport.
+  toast.style.left = `${Math.min(Math.max(44, x), window.innerWidth - 44)}px`;
+  toast.style.top = `${Math.max(30, y - 10)}px`;
+  // Re-trigger the show transition even on rapid repeat copies.
+  toast.classList.remove("show");
+  void toast.offsetWidth;
+  toast.classList.add("show");
+  window.clearTimeout(copyToastTimer);
+  copyToastTimer = window.setTimeout(() => {
+    document.getElementById("_copyToast")?.classList.remove("show");
+  }, 1100);
+}
 msgs.addEventListener("click", (e: MouseEvent) => {
   const target = e.target as Element | null;
   if (!target) return;
@@ -632,6 +668,8 @@ msgs.addEventListener("click", (e: MouseEvent) => {
         copyBtn.textContent = orig;
         copyBtn.classList.remove("copied");
       }, 1200);
+      const a = copyToastAnchor(e, copyBtn);
+      showCopyToast(a.x, a.y);
     });
     return;
   }
@@ -641,6 +679,8 @@ msgs.addEventListener("click", (e: MouseEvent) => {
       if (!ok) return;
       line.classList.add("copied");
       window.setTimeout(() => { line.classList.remove("copied"); }, 600);
+      const a = copyToastAnchor(e, line);
+      showCopyToast(a.x, a.y);
     });
     return;
   }
@@ -661,7 +701,8 @@ msgs.addEventListener("click", (e: MouseEvent) => {
       const text = idx >= 0 && sess.history[idx]
         ? sess.history[idx]!.text
         : bubble.textContent ?? "";
-      void copyMessage(text, actionBtn);
+      const a = copyToastAnchor(e, actionBtn);
+      void copyMessage(text, actionBtn).then((ok) => { if (ok) showCopyToast(a.x, a.y); });
       return;
     }
     case "delete":
@@ -843,9 +884,6 @@ function addMessageBubble(
       div.textContent = text;
     }
   }
-  if (role === "user" && failure) {
-    applyUserFailureChrome(div, text, attachments);
-  }
   // Wrap user/bot bubbles in a row container so the hover-action chrome
   // (.msg-actions) can sit as a sibling next to the bubble without
   // breaking the bubble's existing align-self anchoring. error/notice
@@ -855,25 +893,17 @@ function addMessageBubble(
   if (role === "user" || role === "bot") {
     const row = document.createElement("div");
     row.className = "msg-row " + role + "-row";
-    // If failure chrome wrapped the bubble already, lift the wrapper
-    // into the row instead of the bare bubble; otherwise put the
-    // bubble directly into the row.
-    const wrapper = div.parentElement && div.parentElement.classList.contains("msg-user-failed")
-      ? div.parentElement
-      : null;
-    if (wrapper) {
-      // applyUserFailureChrome appended a sibling .msg-edit-icon after
-      // the wrapper. Move both into the row so they stay glued.
-      const editIcon = wrapper.nextElementSibling;
-      row.appendChild(wrapper);
-      if (editIcon && (editIcon as HTMLElement).classList?.contains("msg-edit-icon")) {
-        row.appendChild(editIcon);
-      }
-    } else {
-      row.appendChild(div);
-    }
+    row.appendChild(div);
     row.appendChild(buildMessageActions(role, div));
     msgs.appendChild(row);
+    // Failure chrome is applied AFTER the bubble is in the row so its
+    // retry/edit/delete controls land as real DOM siblings in BOTH the
+    // live-failure path and the replay path. On replay the bubble isn't
+    // in the DOM yet when addMessageBubble runs, so wrapping it earlier
+    // left the trailing controls parent-less and they were dropped.
+    if (role === "user" && failure) {
+      applyUserFailureChrome(div, text, attachments);
+    }
   } else {
     msgs.appendChild(div);
   }
@@ -985,12 +1015,10 @@ function applyUserFailureChrome(
   if (bubble.parentElement && bubble.parentElement.classList.contains("msg-user-failed")) {
     return;
   }
-  // parent here is either the .msg-row (post-addMessageBubble) or the
-  // raw message list (when called from addMessageBubble itself, before
-  // the row wrap happens). Both cases work: insertBefore writes the
-  // wrapper into the same parent the bubble currently sits in, and
-  // addMessageBubble's lift-into-row code picks up the wrapper either
-  // way via `div.parentElement.classList.contains("msg-user-failed")`.
+  // parent is the .msg-row the bubble already sits in — both the live
+  // failure path and replay call this after the bubble is in the DOM.
+  // We insert the retry-badge wrapper around the bubble and the
+  // edit/delete controls as a trailing sibling within that same row.
   const parent = bubble.parentElement;
   const wrapper = document.createElement("div");
   wrapper.className = "msg-user-failed";
@@ -1004,6 +1032,11 @@ function applyUserFailureChrome(
   badge.addEventListener("click", () => void retryFailedUserMessage(bubble, text, attachments));
   wrapper.appendChild(badge);
   wrapper.appendChild(bubble);
+  // Edit + delete grouped in one container so they sit side-by-side on a
+  // single line below the bubble — the row is a column flex, so two bare
+  // siblings would stack vertically instead.
+  const failActions = document.createElement("div");
+  failActions.className = "msg-fail-actions";
   const edit = document.createElement("button");
   edit.type = "button";
   edit.className = "msg-edit-icon";
@@ -1011,7 +1044,16 @@ function applyUserFailureChrome(
   edit.title = "编辑";
   edit.innerHTML = ICON_PENCIL;
   edit.addEventListener("click", () => editFailedUserMessage(bubble, text, attachments));
-  if (parent) parent.insertBefore(edit, wrapper.nextSibling);
+  const del = document.createElement("button");
+  del.type = "button";
+  del.className = "msg-fail-delete";
+  del.setAttribute("aria-label", "删除消息");
+  del.title = "删除";
+  del.innerHTML = ICON_TRASH;
+  del.addEventListener("click", () => deleteFailedUserMessage(bubble, text, attachments));
+  failActions.appendChild(edit);
+  failActions.appendChild(del);
+  if (parent) parent.insertBefore(failActions, wrapper.nextSibling);
 }
 
 // Inline SVGs kept local so the rest of the file stays the single
@@ -1075,9 +1117,9 @@ function removeUserBubbleAndFailureChrome(bubble: HTMLDivElement): void {
   if (row) { row.remove(); return; }
   const wrapper = bubble.closest<HTMLElement>(".msg-user-failed");
   if (wrapper) {
-    const edit = wrapper.nextElementSibling;
-    if (edit && (edit as HTMLElement).classList?.contains("msg-edit-icon")) {
-      edit.remove();
+    const trailing = wrapper.nextElementSibling;
+    if (trailing && (trailing as HTMLElement).classList?.contains("msg-fail-actions")) {
+      trailing.remove();
     }
     wrapper.remove();
     return;
@@ -1165,10 +1207,26 @@ function editFailedUserMessage(
   updateSendButtonState();
 }
 
+// Discard a failed user turn entirely. Failed messages never reached the
+// server (no CM entry), so this is a purely local removal: drop the bubble
+// + its chrome and the matching history entry. Confirm first since the
+// three failure icons sit close together and a misclick would otherwise
+// throw away the text.
+function deleteFailedUserMessage(
+  bubble: HTMLDivElement,
+  text: string,
+  attachments: AttachmentRef[] | undefined,
+): void {
+  if (!confirm("删除该消息？")) return;
+  removeUserBubbleAndFailureChrome(bubble);
+  removeFailedHistoryEntry(text, attachments);
+  renderSessionList();
+}
+
 // Find the last optimistic user history item matching (text, attachments)
 // and mark it failed. Re-decorates the matching DOM bubble by wrapping
-// it with the failure chrome (badge + edit-icon). Called by the
-// streaming POST error branches when the failure happens before any
+// it with the failure chrome (retry badge + edit/delete controls). Called
+// by the streaming POST error branches when the failure happens before any
 // chunk lands (close_failed-side outcomes).
 function markLastUserAsFailed(
   text: string,
@@ -1205,10 +1263,10 @@ function markLastUserAsFailed(
 
 const scrollToEnd = (): void => { msgs.scrollTop = msgs.scrollHeight; };
 const clearMsgList = (): void => {
-  // Wipe ALL chat-list children, not just .msg nodes — failed user
-  // turns wrap the bubble in .msg-user-failed and append a sibling
-  // .msg-edit-icon; matching only .msg would leave those orphans
-  // behind on replayActive / history_cleared.
+  // Wipe ALL chat-list children, not just .msg nodes — notice/error
+  // statuses are bare divs and failed turns carry extra chrome (retry
+  // wrapper + edit/delete controls), so matching only .msg would leave
+  // nodes behind on replayActive / history_cleared.
   msgs.replaceChildren();
   // Any pending long-press refers to a row we just detached. Drop the
   // module-level state so the 350ms timer doesn't fire against a
@@ -1575,9 +1633,13 @@ function flashActionButton(btn: HTMLButtonElement): void {
   window.setTimeout(() => { btn.classList.remove("copied"); }, 1200);
 }
 
-async function copyMessage(text: string, btn: HTMLButtonElement): Promise<void> {
-  if (!text) return;
-  if (await writeClipboard(text)) flashActionButton(btn);
+async function copyMessage(text: string, btn: HTMLButtonElement): Promise<boolean> {
+  if (!text) return false;
+  if (await writeClipboard(text)) {
+    flashActionButton(btn);
+    return true;
+  }
+  return false;
 }
 
 async function deleteMessage(bubble: HTMLDivElement): Promise<void> {
