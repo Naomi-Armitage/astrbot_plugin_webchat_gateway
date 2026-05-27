@@ -216,6 +216,23 @@ def make_upload_handler(deps: UploadDeps):
                     except Exception:
                         raw = ""
                     session_id = raw.strip()
+        except (ConnectionResetError, ConnectionError):
+            # Client went away mid-upload (closed the tab, dropped network,
+            # cancelled the request). This is an expected client-side event,
+            # not a server fault — and the response below can't reach a
+            # dropped connection anyway. Log quietly at debug so it stops
+            # surfacing as an ERROR + traceback in normal logs (mirrors the
+            # peer-disconnect handling in chat_stream.py).
+            logger.debug(
+                "[WebChatGateway] upload aborted: client disconnected mid-stream"
+            )
+            return json_response(
+                {"error": "client_disconnected"},
+                status=400,
+                origin=origin,
+                allowed_origins=allowed,
+                same_origin_host=same_host,
+            )
         except Exception:
             logger.exception("[WebChatGateway] upload multipart parse failed")
             return json_response(
