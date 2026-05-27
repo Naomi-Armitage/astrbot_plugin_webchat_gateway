@@ -604,6 +604,16 @@ header h1 {
   transition: background 0.6s ease-out;
 }
 .msg.md table {
+  /* `display: block` (instead of the default `table`) lets the element
+     carry its own `overflow-x`, so a table wider than the bubble scrolls
+     horizontally instead of spilling past the bubble's rounded border on
+     narrow screens. `width: max-content` keeps columns at their natural
+     width (rather than squishing every cell), and `max-width: 100%` caps
+     the visible box at the bubble so only the overflow scrolls. */
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  overflow-x: auto;
   margin: 0.5em 0;
   border-collapse: collapse;
   font-size: 0.95em;
@@ -872,8 +882,8 @@ footer button:disabled { opacity: .5; cursor: not-allowed; }
      parse per frame — too expensive for the rAF typewriter loop).
      pre-wrap keeps newlines + multiple spaces visible so paragraph
      structure stays readable; on terminal the bubble swaps to .innerHTML
-     with the full markdown render and `white-space` reverts to normal
-     via the class removal. */
+     with the full markdown render and the `.msg.md:not(.streaming)` rule
+     above takes over, resetting white-space to normal. */
   white-space: pre-wrap;
 }
 .stream-caret {
