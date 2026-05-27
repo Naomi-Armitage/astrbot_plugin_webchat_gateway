@@ -1288,7 +1288,14 @@ body.lightbox-open { overflow: hidden; }
   .actions { gap: 4px; }
   .actions a, .actions button { padding: 4px 9px; font-size: 12px; }
   #messages { padding: 56px 0 14px; gap: 8px; }
-  .msg { max-width: 86%; padding: 9px 12px; font-size: 14px; }
+  /* Do NOT put a percentage max-width on .msg here: its containing block is
+     the shrink-to-fit .msg-row, so a % cap resolves against the row's own
+     content width and spirals short messages down to a few characters wide
+     (the desktop layout fixed this by capping the row, not the bubble — see
+     the .msg-row comment). Cap the row against the definite-width #messages
+     instead; mobile gets a slightly wider 86% than desktop's 78%. */
+  .msg { padding: 9px 12px; font-size: 14px; }
+  .msg-row { max-width: 86%; }
   footer { gap: 6px; padding-top: 6px; }
   .composer-row { gap: 8px; }
   /* Mobile uses 16px input text (iOS anti-zoom), so the textarea's
