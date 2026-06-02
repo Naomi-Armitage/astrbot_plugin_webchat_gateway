@@ -1718,20 +1718,28 @@ async function flushSessionDeletes(): Promise<void> {
         await patchSession(sid, { deleted: true });
         dropSessionDelete(sid); // 2xx → done
       } catch (e) {
-        const msg = (e as Error)?.message ?? "";
+        const status = (e as { status?: number })?.status;
         const name = (e as { name?: string })?.name;
-        if (msg === "http_404") { dropSessionDelete(sid); continue; } // already gone server-side
-        if (name === "AbortError" || msg.startsWith("http_5") || !msg.startsWith("http_")) {
-          // Transient abort/timeout, 5xx, or "unauthorized" (handle401 already
-          // redirected). The network likely just dropped, so every subsequent
-          // PATCH would also time out — bail and let the next trigger retry.
-          // Entries stay queued.
+        // 404 (not found) / 410 (gone): the session is already absent
+        // server-side, so an idempotent delete is satisfied — drop it.
+        // Classify on the HTTP status, NOT the message: patchSession
+        // overwrites the message with the body's `error` field when present,
+        // so a 404 carrying `{"error":"session_not_found"}` would otherwise
+        // fall through to the transient branch and retry forever.
+        if (status === 404 || status === 410) { dropSessionDelete(sid); continue; }
+        if (name === "AbortError" || status === undefined || (status >= 500 && status < 600)) {
+          // Transient: abort/timeout, offline / network error (no status),
+          // 5xx, or the 401 "unauthorized" throw (handle401 already
+          // redirected). The network likely just dropped, so every
+          // subsequent PATCH would also fail — bail and let the next trigger
+          // retry. Entries stay queued.
           return;
         }
-        // Permanent non-404 4xx (403/410/422): the delete will never succeed.
-        // Drop it and surface once; no rollback — the user chose to delete and
-        // the row is already gone locally.
+        // Permanent non-404/410 4xx (403/422/...): the delete will never
+        // succeed. Drop it and surface once; no rollback — the user chose to
+        // delete and the row is already gone locally.
         dropSessionDelete(sid);
+        const msg = (e as Error)?.message ?? `http_${status}`;
         addMessageBubble("error", `删除未能同步到服务器 (${msg})，已从本地移除。`);
       }
     }
@@ -3002,7 +3010,13 @@ async function patchSession(sessionId: string, body: Record<string, unknown>): P
   if (!resp.ok) {
     let err = `http_${resp.status}`;
     try { const j = await resp.json() as { error?: string }; if (j.error) err = j.error; } catch {}
-    throw new Error(err);
+    // Attach the HTTP status so callers can classify reliably. `err` above is
+    // overwritten by the body's `error` field when present, so status-based
+    // branching (e.g. the delete-outbox's 404/410 = "already gone") must not
+    // depend on the message string.
+    const e = new Error(err) as Error & { status?: number };
+    e.status = resp.status;
+    throw e;
   }
 }
 
