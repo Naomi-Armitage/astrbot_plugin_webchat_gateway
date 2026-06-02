@@ -1510,8 +1510,23 @@ function consumeIfDuplicate(
     if (p.sessionId !== sessionId || p.role !== role || p.contentKey !== key) continue;
     if (p.attachmentsKey !== aKey) continue;
     if (Math.abs(eventTs - p.recordedAtSec) > DEDUP_TS_WINDOW_S) continue;
-    pendingLocals.splice(i, 1);
-    savePendingLocals();
+    // Dedup the event either way (return true → the caller won't re-render).
+    // But only CONSUME (delete) the entry for assistant messages. User
+    // entries are KEPT as survivor vouch until their hard TTL, because the
+    // server emits the user's message_added at stream START
+    // (emit_stream_started) yet writes it to CM only at stream CLOSE
+    // (record_chat_pair, after the LLM finishes — even later on a stalled /
+    // recovered stream). In that gap get_conversation (CM-backed) returns the
+    // turn WITHOUT the user message, so a coldRefetch on refresh would drop
+    // the optimistic user bubble if nothing vouched for it — the reported
+    // "question disappears after refresh". Holding the entry until expiresAt
+    // (PENDING_TTL_MS) keeps the bubble across that window; once CM catches
+    // up, the server copy matches and survivor-merge skips the duplicate.
+    if (role === "assistant") {
+      pendingLocals.splice(i, 1);
+      mutated = true;
+    }
+    if (mutated) savePendingLocals();
     return true;
   }
   if (mutated) savePendingLocals();
@@ -1889,7 +1904,7 @@ async function regenerateMessage(bubble: HTMLDivElement): Promise<void> {
 
   try {
     while (true) {
-      const { value, done } = await reader.read();
+      const { value, done } = await readSseChunk(reader);
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       let nl: number;
@@ -3179,6 +3194,55 @@ function isImageCommand(text: string): boolean {
 //   - error: `{"error": "<code>", "seq": N}`
 // Legacy frames without `seq` are tolerated — we synthesize last_seq+1 so
 // the persistence path keeps advancing.
+
+// Idle/stall guard for SSE reads. The server heartbeats every 20s
+// (_HEARTBEAT_INTERVAL) and content chunks flow faster, so a threshold well
+// above 2× that — with slack for one dropped keepalive — means only a
+// genuinely half-open connection trips it: the TCP socket stays up but no
+// bytes arrive at all because the server's done/error frame (or the FIN) was
+// swallowed by a proxy or lost on a network handoff. Without this the read
+// loop awaits forever, so the send never settles — the button stays stuck on
+// "stop" and retry is blocked by `if (sync.streamAbort) return`, exactly the
+// reported hang. Overridable for tests via window.__WCG_SSE_IDLE_MS.
+const SSE_IDLE_TIMEOUT_MS = ((): number => {
+  const o = (window as unknown as { __WCG_SSE_IDLE_MS?: unknown }).__WCG_SSE_IDLE_MS;
+  return typeof o === "number" && o > 0 ? o : 45_000;
+})();
+
+// Thrown when a stream stalls (no bytes within SSE_IDLE_TIMEOUT_MS). Distinct
+// from StreamChatError / AbortError so attachStreamingBubble's catch routes it
+// to the NETWORK-drop branch (keep the PendingStream when the server already
+// took the turn, reset the button, recover via resume / long-poll) instead of
+// rendering an inline server error or treating it as a user cancel.
+class SseIdleError extends Error {
+  constructor() {
+    super("sse_idle_timeout");
+    this.name = "SseIdleError";
+  }
+}
+
+// One reader.read() raced against the idle timer. On stall we reject with
+// SseIdleError; the caller's finally cancels the reader, releasing the fetch.
+// We attach a no-op handler to the orphaned read so its eventual post-cancel
+// rejection doesn't surface as an unhandled promise rejection.
+async function readSseChunk(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  let idleId = 0;
+  const idleGuard = new Promise<never>((_, reject) => {
+    idleId = window.setTimeout(() => reject(new SseIdleError()), SSE_IDLE_TIMEOUT_MS);
+  });
+  const readPromise = reader.read();
+  try {
+    return await Promise.race([readPromise, idleGuard]);
+  } catch (e) {
+    readPromise.then(() => {}, () => {});
+    throw e;
+  } finally {
+    clearTimeout(idleId);
+  }
+}
+
 async function consumeSseStream(
   resp: Response,
   ctx: {
@@ -3256,7 +3320,7 @@ async function consumeSseStream(
 
   try {
     while (true) {
-      const { value, done } = await reader.read();
+      const { value, done } = await readSseChunk(reader);
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       let idx: number;
