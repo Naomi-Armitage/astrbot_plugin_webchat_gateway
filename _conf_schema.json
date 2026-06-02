@@ -169,6 +169,12 @@
         "description": "请求总超时（秒）",
         "hint": "范围 5-1800，默认 180。生图通常 30-180 秒，gpt-image-1 / 高画质场景可能 180-300 秒。",
         "default": 180
+      },
+      "img2img": {
+        "type": "bool",
+        "description": "启用图生图（参考图编辑）",
+        "hint": "开启后，/image 命令携带上传图片时改走 POST {endpoint}/images/edits（以图生图），否则仍走纯文生图。要求所配模型支持 edits 端点（如 gpt-image-1；dall-e-3 不支持）。关闭时携带的参考图会被忽略。",
+        "default": false
       }
     }
   },

@@ -319,6 +319,7 @@ class WebChatGatewayPlugin(Star):
                     model=cfg.image_gen.model,
                     size=cfg.image_gen.size,
                     timeout_seconds=cfg.image_gen.timeout_seconds,
+                    img2img=cfg.image_gen.img2img,
                 ),
                 allowed_origins=cfg.allowed_origins,
                 max_message_length=cfg.max_message_length,
@@ -489,6 +490,7 @@ class WebChatGatewayPlugin(Star):
                     model=self._cfg.image_gen.model,
                     size=self._cfg.image_gen.size,
                     timeout_seconds=self._cfg.image_gen.timeout_seconds,
+                    img2img=self._cfg.image_gen.img2img,
                 )
             except Exception:
                 logger.exception(

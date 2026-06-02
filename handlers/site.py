@@ -50,6 +50,11 @@ class SiteDeps:
     # that forgets to wire the callback degrades safely (button
     # hidden) instead of false-positive (button shown, sends fail).
     image_gen_enabled_provider: Callable[[], bool] = lambda: False
+    # Live read of img2img (reference-image edit) capability:
+    # `image_gen.enabled AND image_gen.img2img` resolved on the bridge.
+    # Drives whether the chat client keeps an attached image on an /image
+    # command (vs dropping it). Default False → safe degrade (drop + notice).
+    image_gen_img2img_provider: Callable[[], bool] = lambda: False
 
 
 def make_site_handlers(deps: SiteDeps):
@@ -90,9 +95,18 @@ def make_site_handlers(deps: SiteDeps):
             image_gen_enabled = bool(deps.image_gen_enabled_provider())
         except Exception:
             image_gen_enabled = False
+        try:
+            image_gen_img2img = image_gen_enabled and bool(
+                deps.image_gen_img2img_provider()
+            )
+        except Exception:
+            image_gen_img2img = False
         payload = {
             **static_payload,
-            "image_gen": {"enabled": image_gen_enabled},
+            "image_gen": {
+                "enabled": image_gen_enabled,
+                "img2img": image_gen_img2img,
+            },
         }
         return json_response(
             payload,

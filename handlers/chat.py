@@ -126,19 +126,66 @@ def make_chat_handler(deps: ChatDeps):
                 )
 
             # Image-generation slash branch: `/image …` / `/draw …` /
-            # `/img …` short-circuits the LLM call. Attachments that the
-            # operator sent alongside an image command are ignored (the
-            # OpenAI Images API doesn't accept input images on the
-            # generation endpoint); we still release them so quota
-            # doesn't leak.
+            # `/img …` short-circuits the LLM call.
+            #
+            # Two sub-paths depending on attachments + operator config:
+            #   * img2img (edits): when the operator opted into
+            #     `image_gen.img2img` (edit-capable model) AND the user
+            #     attached a reference image — route to the /images/edits
+            #     endpoint with the input image. The reference image is
+            #     committed + recorded on the user turn (so it shows in
+            #     history AND the client's optimistic echo matches → no
+            #     duplicate bubble).
+            #   * text-only generation: otherwise. The /images/generations
+            #     endpoint can't accept input images, so any attachment is
+            #     released (quota doesn't leak).
             if is_image_command(data.message):
-                if attachment_rows:
+                use_img2img = (
+                    bool(attachment_rows)
+                    and deps.image_bridge is not None
+                    and deps.image_bridge.edit_enabled
+                )
+                edit_bytes: bytes | None = None
+                edit_mime = "image/png"
+                # User-turn attachments to record — only the committed
+                # reference image, and only on the img2img success path.
+                image_user_attachments: list[dict] | None = None
+                if use_img2img:
+                    base_row = attachment_rows[0]
+                    # Read the reference bytes for the multipart upload. The
+                    # row is still committed=0 here; FileStore.read works on
+                    # the stored bytes regardless of the commit flag. We
+                    # commit only AFTER a successful edit (below), so a failed
+                    # turn leaves the row committed=0 → swept by the 1h orphan
+                    # GC (no leak, no release-on-failure bookkeeping needed).
+                    try:
+                        edit_bytes = await deps.file_store.read(
+                            storage_key=base_row.storage_key
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[WebChatGateway] image edit: read base image failed"
+                        )
+                        edit_bytes = None
+                    if edit_bytes:
+                        edit_mime = base_row.mime or "image/png"
+                    else:
+                        # Couldn't read the reference → fall back to text2img.
+                        use_img2img = False
+                # Release attachments we won't use: all of them when not doing
+                # img2img, or just the extras (v1 uses a single reference).
+                drop_rows = attachment_rows if not use_img2img else attachment_rows[1:]
+                if drop_rows:
                     try:
                         await release_files_safely(
                             storage=deps.storage,
                             file_store=deps.file_store,
-                            rows=attachment_rows,
-                            log_label="image_cmd_drop_attachments",
+                            rows=drop_rows,
+                            log_label=(
+                                "image_cmd_drop_attachments"
+                                if not use_img2img
+                                else "image_edit_drop_extra"
+                            ),
                         )
                     except Exception:
                         logger.exception(
@@ -171,7 +218,12 @@ def make_chat_handler(deps: ChatDeps):
                         same_origin_host=same_host,
                     )
                 try:
-                    result = await deps.image_bridge.generate(prompt)
+                    if use_img2img:
+                        result = await deps.image_bridge.edit(
+                            prompt, edit_bytes, edit_mime
+                        )
+                    else:
+                        result = await deps.image_bridge.generate(prompt)
                 except ImageBridgeError as exc:
                     status_code = 504 if exc.code == "image_timeout" else 502
                     if exc.code == "image_disabled":
@@ -262,6 +314,32 @@ def make_chat_handler(deps: ChatDeps):
                         allowed_origins=allowed,
                         same_origin_host=same_host,
                     )
+                # Reference image survived an img2img edit → commit it now so
+                # it persists with the chat history and the user turn echoes
+                # it. Matching the client's optimistic bubble is what makes
+                # the events long-poll's message_added DEDUP (equal attachment
+                # keys) instead of rendering a second, image-less copy of the
+                # question. Commit-after-success means a failed edit left the
+                # row committed=0 → swept by the orphan GC, no leak.
+                if use_img2img:
+                    try:
+                        committed_ok = await commit_attachments_or_release(
+                            storage=deps.storage,
+                            file_store=deps.file_store,
+                            rows=[attachment_rows[0]],
+                            log_label="image_edit_commit",
+                            audit=deps.audit,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[WebChatGateway] image edit: commit base raised"
+                        )
+                        committed_ok = False
+                    if committed_ok:
+                        _base = attachment_rows[0]
+                        image_user_attachments = [
+                            {"file_id": _base.file_id, "mime": _base.mime}
+                        ]
                 new_count = await deps.storage.increment_daily_usage(
                     token.name, day=today
                 )
@@ -280,6 +358,7 @@ def make_chat_handler(deps: ChatDeps):
                     session_id=data.session_id,
                     user_text=data.message,
                     assistant_text=assistant_text,
+                    user_attachments=image_user_attachments,
                     assistant_attachments=[attachment],
                 )
                 await deps.audit.write(

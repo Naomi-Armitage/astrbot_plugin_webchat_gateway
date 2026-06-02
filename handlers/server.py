@@ -292,6 +292,12 @@ def build_app(deps: ServerDeps) -> web.Application:
                 deps.chat.image_bridge is not None
                 and deps.chat.image_bridge.enabled
             ),
+            # img2img capability — same live-off-the-bridge reasoning;
+            # edit_enabled already folds in enabled + the img2img opt-in.
+            image_gen_img2img_provider=lambda: (
+                deps.chat.image_bridge is not None
+                and deps.chat.image_bridge.edit_enabled
+            ),
         )
     )
     app.router.add_get(cfg.site_info_path, site["get_site"])

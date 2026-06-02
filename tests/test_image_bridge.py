@@ -138,8 +138,10 @@ class _StubSession:
     async def __aexit__(self, *a):
         return False
 
-    def post(self, url, *, json=None, headers=None):
-        self.calls.append({"url": url, "json": json, "headers": headers})
+    def post(self, url, *, json=None, data=None, headers=None):
+        self.calls.append(
+            {"url": url, "json": json, "data": data, "headers": headers}
+        )
         if isinstance(self._response, Exception):
             raise self._response
         return self._response
@@ -408,6 +410,100 @@ class TestImageBridgeGenerate:
             await bridge.generate("a cat")
         assert exc.value.code == "image_call_failed"
         assert "Unknown parameter" in str(exc.value)
+
+
+# ---------------------------------------------------------------------
+# ImageBridge.edit (img2img via /images/edits)
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestImageBridgeEdit:
+    def _make_bridge(self, **overrides):
+        from astrbot_plugin_webchat_gateway.core.image_bridge import (
+            ImageBridge,
+        )
+
+        defaults = {
+            "enabled": True,
+            "endpoint": "https://api.openai.com/v1",
+            "api_key": "sk-test-1234",
+            "model": "gpt-image-1",
+            "size": "1024x1024",
+            "timeout_seconds": 30,
+            "img2img": True,
+        }
+        defaults.update(overrides)
+        return ImageBridge(**defaults)
+
+    @staticmethod
+    def _field_names(form):
+        # aiohttp.FormData stores fields as (type_options, headers, value);
+        # the field name lives in type_options["name"].
+        names = []
+        for type_options, _headers, _value in form._fields:
+            names.append(type_options.get("name"))
+        return names
+
+    async def test_edit_disabled_when_img2img_off(self, patch_aiohttp):
+        from astrbot_plugin_webchat_gateway.core.image_bridge import (
+            ImageBridgeError,
+        )
+
+        # Feature on, but img2img opt-in off → edit_enabled False → refuse.
+        bridge = self._make_bridge(img2img=False)
+        assert bridge.enabled is True
+        assert bridge.edit_enabled is False
+        with pytest.raises(ImageBridgeError) as exc:
+            await bridge.edit("make it watercolor", b"\x89PNG...", "image/png")
+        assert exc.value.code == "image_disabled"
+
+    async def test_edit_request_shape(self, patch_aiohttp):
+        # 1x1 PNG, base64.
+        png_b64 = (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4"
+            "nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
+        )
+        session = patch_aiohttp(
+            _StubResponse(status=200, json_body={"data": [{"b64_json": png_b64}]})
+        )
+        bridge = self._make_bridge()
+        result = await bridge.edit("make it watercolor", b"rawbytes", "image/png")
+        assert result.content  # decoded bytes
+        call = session.calls[0]
+        # Multipart, not JSON, and aimed at the edits endpoint.
+        assert call["url"].endswith("/images/edits")
+        assert call["json"] is None
+        assert call["data"] is not None
+        # The reference image rides as the `image` form field.
+        assert "image" in self._field_names(call["data"])
+        # Authorization carried; Content-Type left to FormData's boundary.
+        assert call["headers"].get("Authorization") == "Bearer sk-test-1234"
+        assert "Content-Type" not in call["headers"]
+
+    async def test_edit_empty_input_image_raises(self, patch_aiohttp):
+        from astrbot_plugin_webchat_gateway.core.image_bridge import (
+            ImageBridgeError,
+        )
+
+        patch_aiohttp(_StubResponse(status=200, json_body={"data": []}))
+        bridge = self._make_bridge()
+        with pytest.raises(ImageBridgeError) as exc:
+            await bridge.edit("prompt", b"", "image/png")
+        assert exc.value.code == "image_call_failed"
+
+    async def test_edit_dalle2_sends_response_format(self, patch_aiohttp):
+        # Non-gpt-image edit-capable model (dall-e-2) keeps response_format.
+        png_b64 = (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4"
+            "nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
+        )
+        session = patch_aiohttp(
+            _StubResponse(status=200, json_body={"data": [{"b64_json": png_b64}]})
+        )
+        bridge = self._make_bridge(model="dall-e-2")
+        await bridge.edit("prompt", b"rawbytes", "image/png")
+        assert "response_format" in self._field_names(session.calls[0]["data"])
 
 
 # ---------------------------------------------------------------------

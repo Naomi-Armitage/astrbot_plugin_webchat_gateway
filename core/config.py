@@ -188,6 +188,11 @@ class ImageGenConfig:
     model: str
     size: str
     timeout_seconds: int
+    # Image-to-image (reference-image edit via POST /v1/images/edits).
+    # Opt-in because it requires a model that supports the edits endpoint
+    # (e.g. gpt-image-1; dall-e-3 does not). When False, /image commands
+    # ignore any attached image and stay on the text-only generations path.
+    img2img: bool
 
 
 @dataclass(frozen=True)
@@ -583,6 +588,9 @@ class ConfigView:
             lo=5,
             hi=1800,
         )
+        image_gen_img2img = _parse_bool(
+            _get(raw_image_gen, "img2img"), default=False
+        )
         view = cls(
             host=host,
             port=port,
@@ -647,6 +655,7 @@ class ConfigView:
                 model=image_gen_model,
                 size=image_gen_size,
                 timeout_seconds=image_gen_timeout,
+                img2img=image_gen_img2img,
             ),
         )
         view._emit_warnings()
