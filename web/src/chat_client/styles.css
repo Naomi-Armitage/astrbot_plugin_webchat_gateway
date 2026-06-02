@@ -1299,10 +1299,10 @@ body.lightbox-open { overflow: hidden; }
      is defined EARLIER in the file than the base `.msg-row { max-width: 78% }`
      rule, and media queries add no specificity — so a bare `.msg-row` here
      would tie at (0,1,0) and LOSE to the later 78% on source order, even on
-     phones (the bug this comment replaces). `#messages .msg-row` is (0,1,1)
-     and outranks it, so 86% actually applies. Every row lives in #messages,
-     so the ancestor only changes specificity, not which rows match. Don't
-     drop it. */
+     phones (the bug this comment replaces). `#messages .msg-row` is (1,1,0)
+     — one ID + one class — and outranks it, so 86% actually applies. Every
+     row lives in #messages, so the ancestor only changes specificity, not
+     which rows match. Don't drop it. */
   .msg { padding: 9px 12px; font-size: 14px; }
   #messages .msg-row { max-width: 86%; }
   footer { gap: 6px; padding-top: 6px; }
