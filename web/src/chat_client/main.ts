@@ -4002,17 +4002,23 @@ async function send(): Promise<void> {
     .filter((a) => a.state === "ready" && a.file_id)
     .map((a) => ({ file_id: a.file_id!, mime: a.mime }));
   if (!message && !readyAttachments.length) return;
-  // Image-generation command + attachment, but the server can't img2img:
-  // drop the attachment client-side (matching the server, which ignores
-  // input images on the /images/generations endpoint) so the optimistic
-  // echo + dedup entry carry no image — otherwise the server's
-  // attachment-less message_added wouldn't match (consumeIfDuplicate
-  // requires equal attachment keys) and the user's question would render a
-  // second time without the image. Surface a notice so the dropped image
-  // isn't silent. When img2img IS supported the attachment is kept and sent.
-  if (isImageCommand(message) && readyAttachments.length && !IMG2IMG_SUPPORTED) {
-    readyAttachments = [];
-    addMessageBubble("notice", "图片生成不支持参考图，已忽略所选图片。");
+  // Align an /image command's attachments with what the server actually
+  // records on the user turn — otherwise the optimistic echo's attachment
+  // key won't match the eventual message_added (consumeIfDuplicate requires
+  // equal keys) and the question re-renders a second time.
+  //   * img2img off → server ignores input images on the /images/generations
+  //     endpoint → drop them all.
+  //   * img2img on  → server edits a SINGLE reference image (uses the first,
+  //     drops the rest) → keep only the first.
+  // Either way surface a notice so the ignored image(s) aren't silent.
+  if (isImageCommand(message) && readyAttachments.length) {
+    if (!IMG2IMG_SUPPORTED) {
+      readyAttachments = [];
+      addMessageBubble("notice", "图片生成不支持参考图，已忽略所选图片。");
+    } else if (readyAttachments.length > 1) {
+      readyAttachments = readyAttachments.slice(0, 1);
+      addMessageBubble("notice", "图生图仅使用 1 张参考图，已忽略其余。");
+    }
   }
   inputEl.value = "";
   autosizeInput();
