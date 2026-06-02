@@ -36,6 +36,11 @@ const LS_PENDING_LOCALS = "wcg.chat.pending_locals";
 // the only place where two different messages can share identical text but
 // must be tracked as separate optimistic actions.
 const LS_PENDING_LOCAL_DELETES = "wcg.chat.pending_local_deletes";
+// Session-delete OUTBOX (distinct from the message-delete dedup buffer
+// above). A persisted queue of session ids whose `PATCH {deleted:true}` has
+// not yet been ack'd, driving idempotent background retry so a delete
+// survives a backgrounded / timed-out request instead of rolling back.
+const LS_PENDING_SESSION_DELETES = "wcg.chat.pending_session_deletes";
 
 const API = "/api/webchat";
 const CHAT_URL = `${API}/chat`;
@@ -1351,6 +1356,7 @@ interface SyncState {
   stopped: boolean;                  // logout sets this; loops bail out
   loopRunning: boolean;              // re-entrancy guard for runLongPoll/runShortPoll
   streamAbort: AbortController | null;  // active /chat/stream POST fetch+reader; null when not streaming
+  sendAbort: AbortController | null;    // active non-streaming POST /chat (incl. image-gen); abortable on session ops
   // stream_id of the active POST stream, captured on the first SSE frame
   // via onStreamId. Lets the stop button POST /chat/stream/{id}/cancel so
   // the server-side LLM iteration actually terminates — without this the
@@ -1398,6 +1404,7 @@ const sync: SyncState = {
   stopped: false,
   loopRunning: false,
   streamAbort: null,
+  sendAbort: null,
   streamAbortId: null,
   streamFailedAt: [],
   streamSkipRemaining: 0,
@@ -1623,6 +1630,114 @@ function consumeIfDeleteDuplicate(sessionId: string, index: number, role: Server
   }
   if (mutated) savePendingLocalDeletes();
   return false;
+}
+
+// ---------- Session-delete outbox (idempotent background retry) ----------
+//
+// Distinct from the pendingLocalDeletes dedup buffer above: that one drops a
+// duplicate *message*-delete event; this is a persisted queue of *session*
+// ids whose `PATCH {deleted:true}` has not yet been acknowledged by the
+// server. On a weak network the delete request is often cut off (a 15s
+// timeout, or the mobile WebView cancelling it on backgrounding) and
+// surfaces as an AbortError. Rather than roll the row back and show an
+// error, deleteSession enqueues here and we retry in the background until
+// the server confirms — at-least-once, which is safe because {deleted:true}
+// is idempotent and monotonic. Entries clear on a 2xx OR a 404 (already
+// gone server-side), or on the server's own session_meta_updated{deleted}
+// event arriving (e.g. from another device).
+//
+// No expiresAt (unlike PendingLocalDelete): a delete must keep retrying
+// until it lands, so entries never auto-expire on load. No snapshot: we
+// never roll back.
+interface PendingSessionDelete {
+  sessionId: string;
+  enqueuedAt: number;
+}
+
+function loadPendingSessionDeletes(): PendingSessionDelete[] {
+  let parsed: unknown = null;
+  try { parsed = JSON.parse(localStorage.getItem(LS_PENDING_SESSION_DELETES) || "null"); } catch {}
+  if (!Array.isArray(parsed)) return [];
+  const out: PendingSessionDelete[] = [];
+  const seen = new Set<string>();
+  for (const v of parsed) {
+    if (!v || typeof v !== "object") continue;
+    const o = v as Record<string, unknown>;
+    if (typeof o.sessionId !== "string" || !o.sessionId || seen.has(o.sessionId)) continue;
+    seen.add(o.sessionId);
+    out.push({
+      sessionId: o.sessionId,
+      enqueuedAt: typeof o.enqueuedAt === "number" ? o.enqueuedAt : Date.now(),
+    });
+  }
+  return out;
+}
+
+const pendingSessionDeletes: PendingSessionDelete[] = loadPendingSessionDeletes();
+
+function savePendingSessionDeletes(): void {
+  try {
+    localStorage.setItem(LS_PENDING_SESSION_DELETES, JSON.stringify(pendingSessionDeletes));
+  } catch {}
+}
+
+function enqueueSessionDelete(sessionId: string): void {
+  if (pendingSessionDeletes.some((p) => p.sessionId === sessionId)) return; // collapse dupes
+  pendingSessionDeletes.push({ sessionId, enqueuedAt: Date.now() });
+  savePendingSessionDeletes();
+}
+
+function dropSessionDelete(sessionId: string): void {
+  const i = pendingSessionDeletes.findIndex((p) => p.sessionId === sessionId);
+  if (i >= 0) { pendingSessionDeletes.splice(i, 1); savePendingSessionDeletes(); }
+}
+
+// Re-entrancy guard, mirroring sync.loopRunning: many triggers (each poll
+// tick, the "online" event, startup, the delete click itself) can fire a
+// flush concurrently; only one should be in flight.
+let flushingSessionDeletes = false;
+
+// Drain the outbox: retry each queued session delete once. Idempotent, so a
+// 404 (already deleted server-side) counts as success. Transient failures
+// (abort / timeout / 5xx / offline) leave the entry queued for the next
+// trigger; a permanent non-404 4xx is surfaced once and dropped.
+async function flushSessionDeletes(): Promise<void> {
+  if (flushingSessionDeletes) return;
+  if (!pendingSessionDeletes.length) return;
+  // Offline: don't burn a 15s timeout per entry. A trigger (online event,
+  // poll recovery, startup) retries once connectivity is back.
+  if (!navigator.onLine) return;
+  flushingSessionDeletes = true;
+  try {
+    // Snapshot ids: a concurrent enqueue during an await appends to the live
+    // array (not this copy) and is picked up on the next flush.
+    const ids = pendingSessionDeletes.map((p) => p.sessionId);
+    for (const sid of ids) {
+      if (!pendingSessionDeletes.some((p) => p.sessionId === sid)) continue; // drained meanwhile
+      try {
+        await patchSession(sid, { deleted: true });
+        dropSessionDelete(sid); // 2xx → done
+      } catch (e) {
+        const msg = (e as Error)?.message ?? "";
+        const name = (e as { name?: string })?.name;
+        if (msg === "http_404") { dropSessionDelete(sid); continue; } // already gone server-side
+        if (name === "AbortError" || msg.startsWith("http_5") || !msg.startsWith("http_")) {
+          // Transient abort/timeout, 5xx, or "unauthorized" (handle401 already
+          // redirected). The network likely just dropped, so every subsequent
+          // PATCH would also time out — bail and let the next trigger retry.
+          // Entries stay queued.
+          return;
+        }
+        // Permanent non-404 4xx (403/410/422): the delete will never succeed.
+        // Drop it and surface once; no rollback — the user chose to delete and
+        // the row is already gone locally.
+        dropSessionDelete(sid);
+        addMessageBubble("error", `删除未能同步到服务器 (${msg})，已从本地移除。`);
+      }
+    }
+  } finally {
+    flushingSessionDeletes = false;
+  }
 }
 
 // ---------- Per-message action handlers ----------
@@ -2085,6 +2200,11 @@ function applyEvent(ev: ServerEvent): void {
       // know about (e.g. we already optimistically removed it) doesn't
       // resurrect it just to delete it again.
       if (payload["deleted"] === true) {
+        // Server confirmed the delete (our own retry whose 2xx we never saw,
+        // or another device) — stop retrying. Must run before the no-op break
+        // below, since the common case is the row is already locally gone.
+        // dropSessionDelete is a no-op for ids not in the outbox.
+        dropSessionDelete(sid);
         if (!store.sessions[sid]) break;
         const wasActive = sid === store.activeId;
         delete store.sessions[sid];
@@ -2385,6 +2505,13 @@ function ingestConversationList(resp: ServerConversationsResponse): void {
   }
   const next: Record<string, SessionMeta> = {};
   for (const row of incoming) {
+    // A session we've optimistically deleted but whose PATCH hasn't landed is
+    // still in the server's list — skip it so a coldRefetch doesn't resurrect
+    // the row in the sidebar. The outbox keeps retrying; once the server
+    // confirms (2xx/404 or the deleted event) the id leaves both the list and
+    // the outbox. If the delete is permanently rejected, dropSessionDelete
+    // clears the entry and the row legitimately reappears on the next refetch.
+    if (pendingSessionDeletes.some((p) => p.sessionId === row.session_id)) continue;
     const existing = store.sessions[row.session_id];
     next[row.session_id] = {
       id: row.session_id,
@@ -2558,6 +2685,10 @@ function handle401(): void {
   // session indices; clear them so the new login starts clean.
   localStorage.removeItem(LS_PENDING_LOCAL_DELETES);
   pendingLocalDeletes.length = 0;
+  // Outbox entries are keyed on the old token's session ids; a stuck delete
+  // must not carry across a re-login.
+  localStorage.removeItem(LS_PENDING_SESSION_DELETES);
+  pendingSessionDeletes.length = 0;
   location.replace("/login");
 }
 
@@ -2594,6 +2725,10 @@ async function runLongPoll(): Promise<void> {
         sync.consecutiveBackoffSteps = 0;
         sync.recentFails = [];
         const { needsImmediateRefetch } = handleEventsResponse(data);
+        // A 200 just came back → connectivity is good right now; drain any
+        // queued session deletes. void so we never block the poll; the flush
+        // guard makes overlap with other triggers harmless.
+        void flushSessionDeletes();
         if (needsImmediateRefetch) {
           await coldRefetch();
           continue;
@@ -2645,6 +2780,7 @@ async function shortPollOnce(): Promise<void> {
     sync.recentFails = [];
     sync.consecutiveBackoffSteps = 0;
     const { needsImmediateRefetch } = handleEventsResponse(data);
+    void flushSessionDeletes(); // degraded transport drains too (see runLongPoll)
     if (needsImmediateRefetch) {
       await coldRefetch();
     }
@@ -2791,6 +2927,10 @@ function renderSessionList(): void {
 function switchSession(id: string): void {
   if (!store.sessions[id]) return;
   if (id !== store.activeId) {
+    // Leaving this session abandons any non-streaming send started under it;
+    // cancel it so it can't hold the connection (streaming sends self-recover
+    // via pendingStreams, so they're left to the resume path below).
+    cancelInflightSend();
     // Composer attachments are bound to the upload-time session_id at
     // the server. Switching sessions invalidates the queued file_ids
     // (they'd be rejected as `invalid_attachment` if the user clicked
@@ -2918,7 +3058,10 @@ function beginRename(sid: string): void {
 async function deleteSession(id: string): Promise<void> {
   if (!store.sessions[id]) return;
   if (!confirm("删除该会话？")) return;
-  const snapshot = store.sessions[id];
+  // Free any in-flight non-streaming send (image-gen) first: its long POST can
+  // otherwise tie up the connection and starve this delete into a timeout —
+  // the exact "图生图失败后删不掉会话" symptom.
+  cancelInflightSend();
   const wasActive = id === store.activeId;
   delete store.sessions[id];
   if (wasActive) {
@@ -2927,21 +3070,17 @@ async function deleteSession(id: string): Promise<void> {
     else { const fresh = blankSession(); store.sessions[fresh.id] = fresh; store.activeId = fresh.id; }
     replayActive();
   }
+  // Optimistic success: the row is gone locally and stays gone. The actual
+  // PATCH {deleted:true} is delegated to the idempotent outbox so a
+  // backgrounded / timed-out request retries in the background instead of
+  // rolling the row back and showing an error. flushSessionDeletes sends it
+  // now if we're online; otherwise a later trigger (online event, poll tick,
+  // next boot) drains the queue. ingestConversationList skips queued ids so a
+  // coldRefetch can't resurrect the row before the delete lands.
+  enqueueSessionDelete(id);
   saveStore();
   renderSessionList();
-  try {
-    await patchSession(id, { deleted: true });
-  } catch (e) {
-    // Restore the local entry on failure so the user doesn't silently lose it.
-    store.sessions[id] = snapshot;
-    if (wasActive) {
-      store.activeId = id;
-      replayActive();
-    }
-    saveStore();
-    renderSessionList();
-    addMessageBubble("error", `删除失败: ${(e as Error).message}`);
-  }
+  void flushSessionDeletes();
 }
 
 async function clearActiveHistory(): Promise<void> {
@@ -2970,6 +3109,7 @@ async function clearActiveHistory(): Promise<void> {
 }
 
 function newSession(): void {
+  cancelInflightSend();
   const fresh = blankSession();
   store.sessions[fresh.id] = fresh;
   store.activeId = fresh.id;
@@ -4064,6 +4204,18 @@ async function send(): Promise<void> {
 // composer state is preserved (user may have started typing the next
 // turn already) and the resend reuses the same file_ids the failed turn
 // originally uploaded.
+// Cancel an in-flight non-streaming send (image-gen, or the /chat text
+// fallback). Called by the session ops (delete / switch / new) so leaving the
+// current turn's context also frees its long-running POST — an image-gen
+// request can otherwise hold the connection long enough to starve a follow-up
+// delete PATCH into a timeout. Streaming sends are deliberately NOT cancelled
+// here: they self-recover via pendingStreams, handled by the switch/resume
+// machinery. runNonStreamingSend treats this abort as "turn abandoned" (no
+// failure marker) by checking its own ac.signal.aborted.
+function cancelInflightSend(): void {
+  if (sync.sendAbort) { sync.sendAbort.abort(); sync.sendAbort = null; }
+}
+
 async function performSend(message: string, readyAttachments: AttachmentRef[]): Promise<void> {
   if (!message && !readyAttachments.length) return;
   // Re-entry guard: while a stream is in flight the same button is the
@@ -4705,6 +4857,10 @@ function streamErrorCopy(code: string): string {
 }
 
 async function runNonStreamingSend(sid: string, message: string, attachments: AttachmentRef[]): Promise<void> {
+  // Expose this POST's controller so a session op can cancel it (see
+  // cancelInflightSend). Passed as fetchWithTimeout's parentSignal below.
+  const ac = new AbortController();
+  sync.sendAbort = ac;
   try {
     const body: Record<string, unknown> = { session_id: sid, username, message };
     if (attachments.length) body.attachments = attachments.map((a) => ({ file_id: a.file_id }));
@@ -4717,6 +4873,7 @@ async function runNonStreamingSend(sid: string, message: string, attachments: At
         body: JSON.stringify(body),
       },
       FETCH_TIMEOUT_CHAT_MS,
+      ac.signal,
     );
     let payload: Record<string, unknown> = {};
     try { payload = await resp.json(); } catch {}
@@ -4866,9 +5023,18 @@ async function runNonStreamingSend(sid: string, message: string, attachments: At
     // where they sent, matching ChatGPT/iMessage patterns.
     markLastUserAsFailed(message, attachments, "send_failed");
   } catch (error) {
+    // A session op (delete / switch / new) aborted this send via
+    // cancelInflightSend — the turn was abandoned on purpose (its bubble may
+    // even belong to a now-deleted session), so don't mark it failed.
+    // ac.signal.aborted is true ONLY for that external abort; a fetch timeout
+    // trips fetchWithTimeout's INTERNAL controller and leaves ac untouched,
+    // so genuine timeouts still fall through to the failure marker below.
+    if (ac.signal.aborted) return;
     // Network error, fetch timeout, etc. Same treatment as retryable
     // server failures above.
     markLastUserAsFailed(message, attachments, "send_failed");
+  } finally {
+    if (sync.sendAbort === ac) sync.sendAbort = null;
   }
 }
 
@@ -4932,7 +5098,7 @@ $<HTMLButtonElement>("logout").onclick = () => {
       }).catch(() => {});
     } catch { /* fall through */ }
   }
-  for (const k of [LS_TOKEN, LS_USERNAME, LS_STORE, LS_LAST_PTS, LS_PENDING_STREAMS, LS_PENDING_LOCALS]) localStorage.removeItem(k);
+  for (const k of [LS_TOKEN, LS_USERNAME, LS_STORE, LS_LAST_PTS, LS_PENDING_STREAMS, LS_PENDING_LOCALS, LS_PENDING_LOCAL_DELETES, LS_PENDING_SESSION_DELETES]) localStorage.removeItem(k);
   location.replace("/");
 };
 
@@ -5216,6 +5382,10 @@ sendBtn.onclick = (): void => {
 };
 
 document.addEventListener("visibilitychange", onVisibilityChange);
+// Regaining connectivity (phone leaves a tunnel / returns from background) is
+// the fastest, most reliable moment to drain the session-delete outbox — the
+// long-poll loop is gated on !document.hidden and may be sitting in backoff.
+window.addEventListener("online", () => { void flushSessionDeletes(); });
 
 // Cold boot: paint cache, then refetch authoritative state, then start sync.
 // probeQuota() is fired EARLY (sync-kicked, before replayActive) so the
@@ -5239,6 +5409,11 @@ void (async (): Promise<void> => {
     // through the status badge.
     setSyncStatus("offline");
   }
+  // coldRefetch rebuilds the sidebar from the server list, which still
+  // includes any session whose delete never landed — drain the outbox now so
+  // such a row is re-deleted immediately. (ingestConversationList already
+  // skips queued ids, so this just hurries the server-side confirmation.)
+  void flushSessionDeletes();
   // Recovery resume on boot. If the active session has a PendingStream
   // (from a prior session that was cut off mid-stream), reattach to it
   // before the long-poll spins up — the long-poll's eventual
