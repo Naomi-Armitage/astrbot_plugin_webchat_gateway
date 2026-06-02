@@ -1293,9 +1293,18 @@ body.lightbox-open { overflow: hidden; }
      content width and spirals short messages down to a few characters wide
      (the desktop layout fixed this by capping the row, not the bubble — see
      the .msg-row comment). Cap the row against the definite-width #messages
-     instead; mobile gets a slightly wider 86% than desktop's 78%. */
+     instead; mobile gets a slightly wider 86% than desktop's 78%.
+
+     The `#messages` ancestor is REQUIRED, not decorative. This media query
+     is defined EARLIER in the file than the base `.msg-row { max-width: 78% }`
+     rule, and media queries add no specificity — so a bare `.msg-row` here
+     would tie at (0,1,0) and LOSE to the later 78% on source order, even on
+     phones (the bug this comment replaces). `#messages .msg-row` is (0,1,1)
+     and outranks it, so 86% actually applies. Every row lives in #messages,
+     so the ancestor only changes specificity, not which rows match. Don't
+     drop it. */
   .msg { padding: 9px 12px; font-size: 14px; }
-  .msg-row { max-width: 86%; }
+  #messages .msg-row { max-width: 86%; }
   footer { gap: 6px; padding-top: 6px; }
   .composer-row { gap: 8px; }
   /* Mobile uses 16px input text (iOS anti-zoom), so the textarea's
