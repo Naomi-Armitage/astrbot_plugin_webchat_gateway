@@ -838,7 +838,14 @@ footer textarea:focus {
   outline: none;
   box-shadow: none;
 }
-footer button {
+/* Send-button styling is scoped to #send, NOT `footer button`. The footer
+   holds several other buttons (the "+" menu trigger, its menu items, the
+   per-chip remove ×), and a broad `footer button` rule leaked the send
+   button's fill + 38px min-height onto every one of them — each then needed
+   its own reset (the recurring "tall vertical bar" / inflated-input bugs).
+   Keeping this on #send stops the leak at the source; other footer buttons
+   define their own appearance. */
+#send {
   padding: 0 14px;
   /* Match the input box's 38px min-height so the send button aligns
      top-and-bottom with .composer-input instead of sitting as a short
@@ -862,13 +869,13 @@ footer button {
   gap: 7px;
   transition: background .15s ease, transform .12s ease;
 }
-footer button svg { width: 14px; height: 14px; }
-footer button:hover:not(:disabled) {
+#send svg { width: 14px; height: 14px; }
+#send:hover:not(:disabled) {
   background: var(--accent-strong);
   border-color: var(--accent-strong);
 }
-footer button:active:not(:disabled) { transform: translateY(1px); }
-footer button:disabled { opacity: .5; cursor: not-allowed; }
+#send:active:not(:disabled) { transform: translateY(1px); }
+#send:disabled { opacity: .5; cursor: not-allowed; }
 
 /* Send/Stop mode switch on the composer button. The button has two child
    spans; CSS shows exactly one based on data-mode. Stop mode flips the
@@ -999,11 +1006,6 @@ footer button:disabled { opacity: .5; cursor: not-allowed; }
   right: 2px;
   width: 18px;
   height: 18px;
-  /* Reset the `footer button { min-height: 38px }` floor (added to align
-     the send button with the input box). Without this the 18px-tall
-     remove button inherits the 38px min-height and renders as a tall
-     vertical bar in the chip corner. */
-  min-height: 0;
   display: inline-grid;
   place-items: center;
   background: rgba(0, 0, 0, 0.55);
@@ -1030,11 +1032,6 @@ footer button:disabled { opacity: .5; cursor: not-allowed; }
   flex: 0 0 32px;
   width: 32px;
   height: 32px;
-  /* `footer button` sets min-height:38px for the send button, and that
-     selector also matches this <button>. Without resetting it the "+"
-     is forced to 38px and (with its 2px margin) inflates .composer-input
-     to ~41px, taller than the 38px send button. Pin it back to 32px. */
-  min-height: 32px;
   padding: 0;
   display: inline-grid;
   place-items: center;
