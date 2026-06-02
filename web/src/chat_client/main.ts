@@ -2095,6 +2095,19 @@ function applyEvent(ev: ServerEvent): void {
       const content = payload["content"];
       const incomplete = payload["incomplete"] === true;
       if ((role !== "user" && role !== "assistant") || typeof content !== "string") break;
+      // Authoritative end-of-turn for this session. When NO resume is
+      // actively driving it, the assistant reply is being recovered purely
+      // via this long-poll event (e.g. a weak-network / backgrounded stream
+      // that dropped after the server took the turn — see
+      // attachStreamingBubble's net-drop path). Clear any parked
+      // PendingStream now so the next send isn't blocked by performSend's
+      // "正在恢复上一次回复…" gate. A still-active resume owns its own
+      // PendingStream and clears it on settle, so leave that case alone.
+      if (role === "assistant" && !sync.activeResumeAborts[sid] && store.pendingStreams[sid]) {
+        delete store.pendingStreams[sid];
+        savePendingStreams();
+        updateClearButtonState();
+      }
       let attachments: AttachmentRef[] | undefined;
       const rawAttachments = payload["attachments"];
       if (Array.isArray(rawAttachments) && rawAttachments.length) {
@@ -2663,6 +2676,17 @@ function onVisibilityChange(): void {
   } else if (!sync.stopped) {
     if (sync.transport === "live") void runLongPoll();
     else if (sync.transport === "polling") void shortPollOnce();
+    // Back to foreground: if the active session has a PendingStream — e.g.
+    // a stream that dropped while backgrounded on weak network AFTER the
+    // server took the turn — resume it now so the reply streams in live and
+    // the PendingStream is cleared on settle, instead of waiting for the
+    // full message_added. attemptResumeOnLoad no-ops when there's nothing
+    // pending or a resume is already in flight, and handles the past-grace
+    // 404 / stale cases. This mirrors the session-switch resume path.
+    const activeId = store.activeId;
+    if (activeId && store.pendingStreams[activeId] && !sync.activeResumeAborts[activeId]) {
+      void attemptResumeOnLoad(activeId);
+    }
   }
 }
 
@@ -4428,16 +4452,41 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
       return "ok";
     }
 
-    // Network/timeout/abort-from-timeout. If we have partial content,
-    // keep it and don't re-fire /chat (the server already started
-    // generating; a second hit would either 429 concurrent_request or
-    // double-charge quota). If we have nothing, fall back.
+    // Network/timeout/abort-from-timeout. If the server already accepted
+    // this turn we must NOT re-fire /chat: a second hit would 429
+    // concurrent_request (the per-token slot stays held while the server
+    // keeps generating after our disconnect — see chat_stream.py
+    // "Client-disconnect semantics") or double-charge quota.
+    //
+    // "Accepted" has TWO signals, and using only the first was the bug:
+    //   * firstChunkSeen — a content chunk reached the bubble.
+    //   * streamId truthy — the `{"stream_id"}` control frame arrived, so
+    //     the server took the per-token lock and persisted a PendingStream,
+    //     but on weak network / a backgrounded tab the connection can drop
+    //     AFTER that frame and BEFORE the first content chunk. The old
+    //     guard (firstChunkSeen only) fell through to "fallback" here, so
+    //     performSend re-POSTed /chat, collided with the still-held lock,
+    //     and surfaced "上一条还在处理中，稍候。" — while the original turn
+    //     finished fine and arrived via long-poll.
     if (firstChunkSeen) {
       settlePartial("error", false);
       // Leave PendingStream alive on net-drop so a future attach can
       // recover; settlePartial cleared it, restore.
       persistPending();
       if (kind === "post") recordStreamFailure();
+      return "ok";
+    }
+    if (kind === "post" && streamId) {
+      // Server took the turn (stream_id seen) but no chunk reached us.
+      // Drop the empty placeholder bubble yet KEEP the PendingStream
+      // (already persisted on the stream_id frame) so resume-on-foreground
+      // / long-poll message_added recovers the reply. Crucially do NOT
+      // return "fallback": re-POSTing /chat would 429 against the held
+      // lock. Mirror discardBubble's cleanup minus clearPending.
+      cancelRender();
+      delete sync.streamFinalizeSuppressed[sid];
+      removeBubbleWithRow(bubble);
+      recordStreamFailure();
       return "ok";
     }
     discardBubble();
