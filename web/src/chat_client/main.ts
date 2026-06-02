@@ -168,6 +168,9 @@ interface PendingAttachment {
   preview_url: string;
   state: "uploading" | "ready" | "error";
   error_message?: string;
+  // The (possibly resized) blob actually uploaded — retained so a failed
+  // upload can be retried in place without re-picking the file.
+  blob?: Blob;
 }
 interface HistoryItem {
   role: Role;
@@ -3728,6 +3731,9 @@ function addAttachmentFiles(rawFiles: FileList | File[]): void {
       if (blob.type && blob.type !== file.type) {
         attachment.mime = blob.type;
       }
+      // Retain the upload blob so a failed upload can be retried in place
+      // (tap the chip) without re-selecting the file.
+      attachment.blob = blob;
       await uploadAttachment(blob, sid, attachment);
     })();
   }
@@ -3759,6 +3765,19 @@ function clearComposerAttachments(): void {
   updateSendButtonState();
 }
 
+// Retry a failed upload in place (tap the errored chip). Reuses the
+// retained blob so the user doesn't have to re-pick the file. No-op if the
+// chip isn't in an error state or the blob is gone (shouldn't happen).
+function retryAttachment(local_id: string): void {
+  const att = composerAttachments.find((a) => a.local_id === local_id);
+  if (!att || att.state !== "error" || !att.blob) return;
+  att.state = "uploading";
+  att.error_message = undefined;
+  renderComposerAttachments();
+  updateSendButtonState();
+  void uploadAttachment(att.blob, currentSession().id, att);
+}
+
 function renderComposerAttachments(): void {
   composerAttachmentsEl.replaceChildren();
   for (const a of composerAttachments) {
@@ -3766,7 +3785,14 @@ function renderComposerAttachments(): void {
     chip.className = "composer-chip";
     chip.dataset.state = a.state;
     chip.dataset.localId = a.local_id;
-    if (a.state === "error" && a.error_message) chip.title = a.error_message;
+    if (a.state === "error") {
+      // Failed upload: the whole chip is a retry target. Surface the
+      // server's reason in the tooltip plus the tap-to-retry hint.
+      chip.title = a.error_message ? `${a.error_message}（点击重试）` : "上传失败，点击重试";
+      chip.setAttribute("role", "button");
+      chip.setAttribute("aria-label", "上传失败，点击重试");
+      chip.addEventListener("click", () => retryAttachment(a.local_id));
+    }
 
     const img = document.createElement("img");
     img.src = a.preview_url;

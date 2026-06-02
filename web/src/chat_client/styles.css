@@ -979,14 +979,16 @@ footer button:disabled { opacity: .5; cursor: not-allowed; }
 .composer-chip:not([data-state="uploading"]) .chip-spinner { display: none; }
 .composer-chip[data-state="error"] {
   border-color: color-mix(in oklab, var(--bad) 60%, var(--rule));
+  cursor: pointer;
 }
 .composer-chip[data-state="error"]::before {
-  content: "!";
+  content: "↻";
   position: absolute;
   inset: 0;
   display: grid;
   place-items: center;
   font-weight: 700;
+  font-size: 20px;
   color: #fff;
   background: color-mix(in oklab, var(--bad) 70%, transparent);
   pointer-events: none;
@@ -997,6 +999,11 @@ footer button:disabled { opacity: .5; cursor: not-allowed; }
   right: 2px;
   width: 18px;
   height: 18px;
+  /* Reset the `footer button { min-height: 38px }` floor (added to align
+     the send button with the input box). Without this the 18px-tall
+     remove button inherits the 38px min-height and renders as a tall
+     vertical bar in the chip corner. */
+  min-height: 0;
   display: inline-grid;
   place-items: center;
   background: rgba(0, 0, 0, 0.55);
