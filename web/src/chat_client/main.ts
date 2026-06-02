@@ -63,6 +63,14 @@ let MAX_ATTACHMENTS_PER_MESSAGE = 4;
 let MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024;
 let ALLOWED_MIME: readonly string[] = ["image/jpeg", "image/png", "image/webp", "image/gif"];
 let UPLOADS_ENABLED = true;
+// Whether the server's image-generation backend supports image-to-image
+// (reference image → edited image via the /images/edits endpoint). Driven by
+// /site's `image_gen.img2img`. When false (default), an attachment sent
+// alongside an /image command is dropped client-side with a notice so the
+// optimistic echo matches what the server stores (the server can't img2img
+// and records the user turn without the image) — otherwise the attachment-key
+// mismatch in consumeIfDuplicate renders the user's question a second time.
+let IMG2IMG_SUPPORTED = false;
 const RESIZE_TARGET_LONG_EDGE = 2048;
 const RESIZE_JPEG_QUALITY = 0.85;
 // Files already comfortably below the long-edge cap AND under this size get
@@ -3009,7 +3017,7 @@ async function loadChatSite(): Promise<void> {
         max_attachments_per_message?: number;
         allowed_mime?: string[];
       };
-      image_gen?: { enabled?: boolean };
+      image_gen?: { enabled?: boolean; img2img?: boolean };
     };
     // 生图入口的可见性按服务端配置切换。服务端的 image_gen.enabled
     // 是基于 ImageBridge.enabled 读出来的（同时要求 endpoint + api_key
@@ -3017,6 +3025,11 @@ async function loadChatSite(): Promise<void> {
     // 抹掉 composer 里可能残留的 /image 前缀，避免用户停留在 image
     // 模式但入口不见了。
     const imageEnabled = !!(data.image_gen && data.image_gen.enabled);
+    // img2img (reference-image edit) capability. Only true when the server
+    // both has image-gen on AND the configured model/endpoint supports the
+    // edits path. Gates whether send() keeps an attachment on an /image
+    // command (see IMG2IMG_SUPPORTED comment).
+    IMG2IMG_SUPPORTED = imageEnabled && !!(data.image_gen && data.image_gen.img2img);
     if (imageEnabled) {
       menuImage.hidden = false;
     } else {
@@ -3985,10 +3998,22 @@ async function send(): Promise<void> {
   // a few seconds, and whatever the user typed in that window must not be
   // dropped by the clear below.
   const message = inputEl.value.trim();
-  const readyAttachments: AttachmentRef[] = composerAttachments
+  let readyAttachments: AttachmentRef[] = composerAttachments
     .filter((a) => a.state === "ready" && a.file_id)
     .map((a) => ({ file_id: a.file_id!, mime: a.mime }));
   if (!message && !readyAttachments.length) return;
+  // Image-generation command + attachment, but the server can't img2img:
+  // drop the attachment client-side (matching the server, which ignores
+  // input images on the /images/generations endpoint) so the optimistic
+  // echo + dedup entry carry no image — otherwise the server's
+  // attachment-less message_added wouldn't match (consumeIfDuplicate
+  // requires equal attachment keys) and the user's question would render a
+  // second time without the image. Surface a notice so the dropped image
+  // isn't silent. When img2img IS supported the attachment is kept and sent.
+  if (isImageCommand(message) && readyAttachments.length && !IMG2IMG_SUPPORTED) {
+    readyAttachments = [];
+    addMessageBubble("notice", "图片生成不支持参考图，已忽略所选图片。");
+  }
   inputEl.value = "";
   autosizeInput();
   // Programmatic value change doesn't fire 'input' — refresh the
