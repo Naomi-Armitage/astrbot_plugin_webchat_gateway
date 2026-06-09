@@ -292,7 +292,7 @@ const plusMenu = $<HTMLDivElement>("plusMenu");
 const menuUpload = $<HTMLButtonElement>("menuUpload");
 const menuImage = $<HTMLButtonElement>("menuImage");
 const fileInputEl = $<HTMLInputElement>("fileInput");
-const imgRatio = $<HTMLSelectElement>("imgRatio");
+const imgRatioBar = $<HTMLDivElement>("imgRatioBar");
 const composerAttachmentsEl = $("composer-attachments");
 const dropOverlayEl = $("dropOverlay");
 const footerEl = document.querySelector("footer") as HTMLElement;
@@ -4773,7 +4773,12 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
       } else {
         discardBubble();
       }
-      addMessageBubble("error", streamErrorCopy(sce.code));
+      // Suppress the red error if the turn's reply already landed via
+      // long-poll (a stale/race resume onto a closed buffer); otherwise
+      // the recovery genuinely failed and we surface it.
+      if (!sessionEndsWithRecentBotReply(sid)) {
+        addMessageBubble("error", streamErrorCopy(sce.code));
+      }
       return "ok";
     }
 
@@ -4799,7 +4804,11 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
           settlePartial("incomplete", true);
         } else {
           settlePartial("error", false);
-          addMessageBubble("error", streamErrorCopy(sce.code));
+          // Suppress the red error if the reply already arrived (stale
+          // resume onto a closed buffer); otherwise surface it.
+          if (!sessionEndsWithRecentBotReply(sid)) {
+            addMessageBubble("error", streamErrorCopy(sce.code));
+          }
         }
         return "ok";
       }
@@ -4811,11 +4820,11 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
       // own a user echo to attach the failure to.
       if (kind === "post") {
         markLastUserAsFailed(opts.message ?? "", opts.attachments, "send_failed");
-      } else {
-        addMessageBubble(
-          isSoft ? "notice" : "error",
-          streamErrorCopy(sce.code),
-        );
+      } else if (isSoft) {
+        addMessageBubble("notice", streamErrorCopy(sce.code));
+      } else if (!sessionEndsWithRecentBotReply(sid)) {
+        // resume hard error with no backfilled reply → surface honestly
+        addMessageBubble("error", streamErrorCopy(sce.code));
       }
       return "ok";
     }
@@ -4888,6 +4897,19 @@ async function runStreamingSend(sid: string, message: string, attachments: Attac
 // from last_seq. On 404 (past grace TTL) we drop the pending state and
 // settle the bubble with the incomplete notice; the long-poll will fill
 // in the actual completed message_added when (and if) it lands.
+// True if this session's most recent history entry is a bot reply that
+// landed within the last 30s — the turn already completed. Used to
+// suppress false-positive resume errors (a stale/race resume onto a
+// closed_failed buffer) when the real reply is already on screen. Gated
+// on an ALREADY-PRESENT reply, never on kind, so a genuine no-reply
+// failure still surfaces.
+function sessionEndsWithRecentBotReply(sid: string): boolean {
+  const sess = store.sessions[sid];
+  if (!sess || !sess.history.length) return false;
+  const last = sess.history[sess.history.length - 1];
+  return !!last && last.role === "bot" && (Date.now() - last.ts) < 30_000;
+}
+
 async function attemptResumeOnLoad(sid: string): Promise<void> {
   const pending = store.pendingStreams[sid];
   if (!pending) return;
@@ -4903,6 +4925,16 @@ async function attemptResumeOnLoad(sid: string): Promise<void> {
   const STALE_AFTER_MS = 5 * 60 * 1000;
   const startedAt = typeof pending.started_at === "number" ? pending.started_at : 0;
   if (!startedAt || Date.now() - startedAt > STALE_AFTER_MS) {
+    delete store.pendingStreams[sid];
+    savePendingStreams();
+    updateClearButtonState();
+    return;
+  }
+  // Turn already completed (its reply is the most recent entry): the
+  // PendingStream is superseded. Resuming would re-attach to a closed
+  // buffer and, on a closed_failed snapshot, surface a false-positive red
+  // error beside the reply that already arrived via long-poll. Drop it.
+  if (sessionEndsWithRecentBotReply(sid)) {
     delete store.pendingStreams[sid];
     savePendingStreams();
     updateClearButtonState();
@@ -5315,35 +5347,120 @@ menuUpload.addEventListener("click", () => {
 // already there; selecting again with the prefix present removes it
 // (toggle behaviour). Mirrors how operators can also just type the
 // trigger themselves — the menu item is an affordance, not a modal mode.
-function sizeLabel(size: string): string {
-  if (size === "auto") return "自动";
+// Friendly aspect label for a concrete output size. The size set is the
+// model's own allow-list (from /site), so this maps the known gpt-image /
+// DALL-E sizes to a clean ratio; anything else falls back to a gcd-reduced
+// ratio so an unfamiliar gateway size still reads sensibly.
+const RATIO_LABEL: Record<string, string> = {
+  auto: "自动",
+  "1024x1024": "1:1",
+  "1792x1024": "16:9",
+  "1024x1792": "9:16",
+  "1536x1024": "3:2",
+  "1024x1536": "2:3",
+};
+function ratioLabel(size: string): string {
+  const known = RATIO_LABEL[size];
+  if (known) return known;
   const m = size.match(/^(\d+)x(\d+)$/);
   if (!m) return size;
   const w = Number(m[1]);
   const h = Number(m[2]);
-  if (w === h) return "1:1";
-  return w > h ? `横 ${size}` : `竖 ${size}`;
+  let a = w;
+  let b = h;
+  while (b) [a, b] = [b, a % b];
+  const g = a || 1;
+  return `${w / g}:${h / g}`;
 }
 
-// Fill the ratio <select> from the model's allowed sizes (from /site).
-// Preserves the current selection where possible so a /site refresh
-// doesn't reset the user's pick mid-compose.
+// A small rectangle previewing the true proportions of `size` (longer edge
+// fixed at 14px). `auto` has no fixed shape, so it renders label-only.
+function glyphDims(size: string): { w: number; h: number } | null {
+  const m = size.match(/^(\d+)x(\d+)$/);
+  if (!m) return null;
+  const w = Number(m[1]);
+  const h = Number(m[2]);
+  const EDGE = 14;
+  if (w === h) return { w: 12, h: 12 };
+  return w > h
+    ? { w: EDGE, h: Math.max(6, Math.round((EDGE * h) / w)) }
+    : { w: Math.max(6, Math.round((EDGE * w) / h)), h: EDGE };
+}
+
+// Per-request output size, "" when the model offers no choice (server then
+// uses the operator default). Tracks the picked chip, not DOM state.
+let selectedImgSize = "";
+
+// Build the ratio chips from the model's allowed sizes (from /site) as a
+// single-select radiogroup. Preserves the current pick across a /site
+// refresh so it doesn't reset mid-compose.
 function populateImgRatio(): void {
-  const prev = imgRatio.value;
-  imgRatio.replaceChildren();
+  const prev = selectedImgSize;
+  selectedImgSize = IMAGE_SIZES.includes(prev) ? prev : (IMAGE_SIZES[0] ?? "");
+  imgRatioBar.replaceChildren();
   for (const s of IMAGE_SIZES) {
-    const opt = document.createElement("option");
-    opt.value = s;
-    opt.textContent = sizeLabel(s);
-    imgRatio.appendChild(opt);
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "ratio-chip";
+    chip.setAttribute("role", "radio");
+    chip.dataset.size = s;
+    const checked = s === selectedImgSize;
+    chip.setAttribute("aria-checked", checked ? "true" : "false");
+    chip.tabIndex = checked ? 0 : -1;
+
+    const dims = glyphDims(s);
+    if (dims) {
+      const glyph = document.createElement("span");
+      glyph.className = "ratio-glyph";
+      glyph.setAttribute("aria-hidden", "true");
+      glyph.style.width = `${dims.w}px`;
+      glyph.style.height = `${dims.h}px`;
+      chip.appendChild(glyph);
+    }
+    const label = document.createElement("span");
+    label.textContent = ratioLabel(s);
+    chip.appendChild(label);
+
+    chip.addEventListener("click", () => selectRatio(s));
+    chip.addEventListener("keydown", onRatioKeydown);
+    imgRatioBar.appendChild(chip);
   }
-  if (prev && IMAGE_SIZES.includes(prev)) imgRatio.value = prev;
+}
+
+// Roving-tabindex single Tab stop: ←/↑ prev, →/↓ next (wrapping), Home/End
+// first/last — focus moves and selection follows (WAI-ARIA radio pattern).
+function onRatioKeydown(e: KeyboardEvent): void {
+  const chips = [...imgRatioBar.querySelectorAll<HTMLButtonElement>(".ratio-chip")];
+  const i = chips.findIndex((c) => c === document.activeElement);
+  if (i < 0) return;
+  let next = -1;
+  if (e.key === "ArrowRight" || e.key === "ArrowDown") next = (i + 1) % chips.length;
+  else if (e.key === "ArrowLeft" || e.key === "ArrowUp") next = (i - 1 + chips.length) % chips.length;
+  else if (e.key === "Home") next = 0;
+  else if (e.key === "End") next = chips.length - 1;
+  else if (e.key === " " || e.key === "Enter") next = i;
+  else return;
+  e.preventDefault();
+  const size = chips[next]?.dataset.size;
+  if (size) selectRatio(size, true);
+}
+
+// Commit a pick: update state + sync aria-checked / roving tabindex across
+// all chips. `focus` moves keyboard focus to the picked chip.
+function selectRatio(size: string, focus = false): void {
+  selectedImgSize = size;
+  for (const chip of imgRatioBar.querySelectorAll<HTMLButtonElement>(".ratio-chip")) {
+    const on = chip.dataset.size === size;
+    chip.setAttribute("aria-checked", on ? "true" : "false");
+    chip.tabIndex = on ? 0 : -1;
+    if (on && focus) chip.focus();
+  }
 }
 
 // Size token to send with an /image request, or "" to let the server
 // use the operator default (no selector options offered).
 function currentImgSize(): string {
-  return IMAGE_SIZES.length ? imgRatio.value : "";
+  return IMAGE_SIZES.length ? selectedImgSize : "";
 }
 
 function refreshImageModeState(): void {
@@ -5352,9 +5469,9 @@ function refreshImageModeState(): void {
   // Tint the "+" so the operator can tell they're in image mode even
   // with the menu closed.
   plusBtn.classList.toggle("active", armed);
-  // Show the ratio selector only in image mode AND when the model
-  // actually offers a choice.
-  imgRatio.hidden = !armed || IMAGE_SIZES.length === 0;
+  // Show the ratio chips only in image mode AND when the model actually
+  // offers a choice.
+  imgRatioBar.hidden = !armed || IMAGE_SIZES.length === 0;
 }
 menuImage.addEventListener("click", () => {
   if (menuImage.disabled) return;

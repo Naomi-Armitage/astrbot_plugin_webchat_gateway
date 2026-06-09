@@ -773,6 +773,49 @@ footer {
   gap: 10px;
   align-items: flex-end;
 }
+/* Image aspect-ratio picker — a single-select radiogroup of ratio chips
+   shown above the composer row in image mode. Replaces the old unstyled
+   native <select>; chips reuse the same tokens as .plus-menu-item / #send
+   so the composer reads as one designed surface. */
+.ratio-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.ratio-bar[hidden] { display: none; }
+.ratio-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 30px;
+  padding: 4px 10px;
+  background: var(--card);
+  color: var(--ink-soft);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  transition: border-color .15s ease, color .15s ease, background .15s ease;
+}
+.ratio-chip:hover { border-color: var(--accent); color: var(--ink); }
+.ratio-chip:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--ring); }
+.ratio-chip[aria-checked="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+  font-weight: 600;
+}
+/* True-proportion preview rectangle; width/height set inline per option. */
+.ratio-glyph {
+  display: inline-block;
+  box-sizing: border-box;
+  flex: 0 0 auto;
+  border: 1.5px solid currentColor;
+  border-radius: 2px;
+}
 /* The visible input "box" now wraps the plus button + textarea so the
    button sits INSIDE the field. The border / background / focus-ring
    that used to live on the textarea move here; the textarea becomes a
@@ -1324,6 +1367,7 @@ body.lightbox-open { overflow: hidden; }
   footer button#send { padding: 0 12px; font-size: 14px; min-height: 40px; }
   .plus-btn { width: 36px; height: 36px; flex-basis: 36px; }
   .plus-menu-item { padding: 11px 12px; }  /* roomier touch targets */
+  .ratio-chip { min-height: 34px; padding: 6px 12px; font-size: 14px; }
   .composer-chip { width: 48px; height: 48px; flex-basis: 48px; }
   .lightbox-nav { width: 38px; height: 38px; margin-top: -19px; }
   .lightbox-close { width: 36px; height: 36px; top: 12px; right: 12px; }
