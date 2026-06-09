@@ -764,7 +764,7 @@ def make_chat_stream_handler(deps: ChatDeps):
                         )
                 else:
                     await deps.registry.close_failed(
-                        handle_obj, error_code="internal_error"
+                        handle_obj, error_code="llm_call_failed"
                     )
                     terminal_emitted = True
                     if not client_gone:
@@ -772,7 +772,7 @@ def make_chat_stream_handler(deps: ChatDeps):
                             (
                                 "data: "
                                 + json.dumps(
-                                    {"error": "internal_error", "seq": last_seq},
+                                    {"error": "llm_call_failed", "seq": last_seq},
                                     ensure_ascii=False,
                                 )
                                 + "\n\n"
