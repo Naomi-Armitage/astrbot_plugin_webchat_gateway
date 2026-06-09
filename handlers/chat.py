@@ -13,6 +13,8 @@ callers continue to work after the split.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from datetime import date
 from typing import Any
 
@@ -55,6 +57,33 @@ from .common import (
     json_response,
     preflight_response,
 )
+
+
+async def _await_or_cancel_on_disconnect(
+    request: web.Request, task: "asyncio.Task[Any]"
+):
+    """Await ``task`` but cancel it if the client disconnects.
+
+    aiohttp's ``handler_cancellation`` defaults to False, so a client
+    abort does NOT cancel this handler — image generation would
+    otherwise run to its full timeout even after the user hit stop or
+    closed the tab. We poll ``request.transport.is_closing()`` in a
+    0.5s loop racing the generation task and cancel it on disconnect.
+    Returns the task result on completion (re-raising whatever the task
+    raised), or ``None`` if it was cancelled due to disconnect.
+
+    Proxy buffering can delay the disconnect signal, so the bridge's own
+    total timeout stays the hard backstop for the worst case.
+    """
+    while True:
+        done, _ = await asyncio.wait({task}, timeout=0.5)
+        if task in done:
+            return task.result()
+        if request.transport is None or request.transport.is_closing():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+            return None
 
 
 def make_chat_handler(deps: ChatDeps):
@@ -219,11 +248,32 @@ def make_chat_handler(deps: ChatDeps):
                     )
                 try:
                     if use_img2img:
-                        result = await deps.image_bridge.edit(
-                            prompt, edit_bytes, edit_mime
+                        gen_task = asyncio.create_task(
+                            deps.image_bridge.edit(
+                                prompt, edit_bytes, edit_mime, size=data.size
+                            )
                         )
                     else:
-                        result = await deps.image_bridge.generate(prompt)
+                        gen_task = asyncio.create_task(
+                            deps.image_bridge.generate(prompt, size=data.size)
+                        )
+                    # Make generation cancellable: race it against a
+                    # client-disconnect poll. A cancel here lands BEFORE
+                    # any commit / quota increment / record_chat_pair
+                    # below, so a stopped generation charges no quota,
+                    # writes no CM turn, and leaves an img2img reference
+                    # committed=0 for the orphan GC — no leak.
+                    result = await _await_or_cancel_on_disconnect(
+                        request, gen_task
+                    )
+                    if result is None:
+                        await deps.audit.write(
+                            "image_cancelled",
+                            name=token.name,
+                            ip=ip,
+                            detail={"prompt_len": len(prompt)},
+                        )
+                        return web.Response(status=499)
                 except ImageBridgeError as exc:
                     status_code = 504 if exc.code == "image_timeout" else 502
                     if exc.code == "image_disabled":
@@ -368,7 +418,7 @@ def make_chat_handler(deps: ChatDeps):
                     detail={
                         "prompt_len": len(prompt),
                         "model": deps.image_bridge.model,
-                        "size": deps.image_bridge.size,
+                        "size": result.size,
                         "file_id": attachment["file_id"],
                     },
                 )
@@ -377,7 +427,7 @@ def make_chat_handler(deps: ChatDeps):
                     "size=%s bytes=%d file_id=%s",
                     token.name,
                     deps.image_bridge.model,
-                    deps.image_bridge.size,
+                    result.size,
                     len(result.content),
                     attachment["file_id"],
                 )
@@ -385,6 +435,7 @@ def make_chat_handler(deps: ChatDeps):
                     {
                         "reply": assistant_text,
                         "attachments": [attachment],
+                        "size": result.size,
                         "remaining": remaining,
                         "daily_quota": token.daily_quota,
                     },

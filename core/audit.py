@@ -52,6 +52,10 @@ Chat path (per request):
                       ImageBridgeError taxonomy (image_disabled /
                       image_timeout / image_call_failed /
                       empty_image_reply).
+    image_cancelled — /image generation aborted because the client
+                      disconnected (user hit stop / closed tab) before
+                      completion; detail: {prompt_len}. No quota charged,
+                      no CM turn written.
     file_release_failed — `commit_attachments_or_release` hit the double-
                       failure path: mark_files_committed raised AND the
                       compensating release also raised. Detail:

@@ -76,6 +76,7 @@ let UPLOADS_ENABLED = true;
 // and records the user turn without the image) — otherwise the attachment-key
 // mismatch in consumeIfDuplicate renders the user's question a second time.
 let IMG2IMG_SUPPORTED = false;
+let IMAGE_SIZES: string[] = [];  // allowed output sizes for the configured model (from /site)
 const RESIZE_TARGET_LONG_EDGE = 2048;
 const RESIZE_JPEG_QUALITY = 0.85;
 // Files already comfortably below the long-edge cap AND under this size get
@@ -102,6 +103,7 @@ const BACKOFF_LADDER_MS = [1_000, 2_000, 5_000, 10_000, 30_000];
 const FETCH_TIMEOUT_FAST_MS = 15_000;       // list/detail/PATCH/clear
 const FETCH_TIMEOUT_LONG_POLL_MS = (LONG_POLL_TIMEOUT_S + 10) * 1000;
 const FETCH_TIMEOUT_CHAT_MS = 90_000;       // covers llm_timeout (60s default) + slack
+const FETCH_TIMEOUT_IMAGE_MS = 200_000;     // image gen: > operator default 180s + slack
 const FETCH_TIMEOUT_PROBE_MS = 3_000;       // pre-send connectivity confirm — short, fail-fast
 // User message: optimistic record happens BEFORE /chat fires, but the
 // backend stamps event.ts only AFTER LLM responds (record_chat_pair runs
@@ -183,6 +185,9 @@ interface HistoryItem {
   ts: number;
   incomplete?: boolean;
   attachments?: AttachmentRef[];
+  // Per-request image size/aspect chosen when this turn was an /image
+  // command — persisted so a regenerate can re-thread it to the bridge.
+  size?: string;
   // Local-only failure marker for user-side turns that didn't go through
   // (cancelled before any chunk, network error, server rejected, etc).
   // We render a small status caption + retry/edit links under the bubble
@@ -287,6 +292,7 @@ const plusMenu = $<HTMLDivElement>("plusMenu");
 const menuUpload = $<HTMLButtonElement>("menuUpload");
 const menuImage = $<HTMLButtonElement>("menuImage");
 const fileInputEl = $<HTMLInputElement>("fileInput");
+const imgRatio = $<HTMLSelectElement>("imgRatio");
 const composerAttachmentsEl = $("composer-attachments");
 const dropOverlayEl = $("dropOverlay");
 const footerEl = document.querySelector("footer") as HTMLElement;
@@ -1390,6 +1396,11 @@ interface SyncState {
   // server-stamped ts can be more than 30s old by the time finalize
   // runs and the existing time-window check would miss.
   streamFinalizeSuppressed: Record<string, true>;
+  // Set true when the user clicks stop during an /image generation
+  // (non-streaming POST). Distinguishes a user-initiated stop from a
+  // session-op abort (cancelInflightSend) so the catch arm marks the
+  // bubble '已停止' + retry only for the former.
+  imageStopRequested: boolean;
 }
 
 const sync: SyncState = {
@@ -1412,6 +1423,7 @@ const sync: SyncState = {
   peerStreamsBySession: {},
   sidebarTypingFor: new Set(),
   streamFinalizeSuppressed: {},
+  imageStopRequested: false,
 };
 setSyncStatus("live");
 
@@ -1942,13 +1954,26 @@ async function regenerateMessage(bubble: HTMLDivElement): Promise<void> {
     if (newBubble.parentElement) removeBubbleWithRow(newBubble);
   };
 
+  // Recover the size chosen for the originating /image turn (if any) so
+  // the regenerate re-runs the bridge at the same aspect ratio. History
+  // is already truncated to [0, idx); the user turn sits just before idx.
+  let regenSize = "";
+  for (let i = idx - 1; i >= 0; i--) {
+    const h = sess.history[i];
+    if (h && h.role === "user") { regenSize = h.size || ""; break; }
+  }
+
   let resp: Response;
   try {
     resp = await fetch(regenerateUrl(sid), {
       method: "POST",
       credentials: "same-origin",
       headers: { "Content-Type": "application/json", ...bearer() },
-      body: JSON.stringify({ message_index: idx }),
+      body: JSON.stringify(
+        regenSize
+          ? { message_index: idx, size: regenSize }
+          : { message_index: idx },
+      ),
       signal: ac.signal,
     });
   } catch (e) {
@@ -1997,7 +2022,12 @@ async function regenerateMessage(bubble: HTMLDivElement): Promise<void> {
   // `!doneInfo` truthiness check (a known TS narrowing limitation
   // around closure assignment).
   const out: {
-    done: { reply: string; remaining: number; daily_quota: number } | null;
+    done: {
+      reply: string;
+      remaining: number;
+      daily_quota: number;
+      attachments: AttachmentRef[];
+    } | null;
     errorCode: string;
   } = { done: null, errorCode: "" };
 
@@ -2026,10 +2056,20 @@ async function regenerateMessage(bubble: HTMLDivElement): Promise<void> {
         scrollToEnd();
       }
     } else if (t === "done") {
+      const rawAtt = (obj as { attachments?: unknown }).attachments;
+      const atts: AttachmentRef[] = Array.isArray(rawAtt)
+        ? rawAtt
+            .filter((a): a is { file_id: string; mime: string } =>
+              !!a && typeof a === "object"
+              && typeof (a as { file_id?: unknown }).file_id === "string"
+              && typeof (a as { mime?: unknown }).mime === "string")
+            .map((a) => ({ file_id: a.file_id, mime: a.mime }))
+        : [];
       out.done = {
         reply: typeof obj.reply === "string" ? obj.reply : accumulated,
         remaining: typeof obj.remaining === "number" ? obj.remaining : 0,
         daily_quota: typeof obj.daily_quota === "number" ? obj.daily_quota : 0,
+        attachments: atts,
       };
     } else if (t === "error" && typeof obj.code === "string") {
       out.errorCode = obj.code;
@@ -2111,6 +2151,31 @@ async function regenerateMessage(bubble: HTMLDivElement): Promise<void> {
       renderSessionList();
       return;
     }
+  }
+
+  // Image regenerate: the done frame carries the freshly generated
+  // attachment(s) and an empty reply. Drop the streaming text bubble and
+  // render a proper image bubble via the standard renderer (image-only
+  // layout, same as the /chat image path). Raw empty reply keeps the
+  // optimistic dedup aligned with the server's message_added.
+  if (finalDone.attachments.length) {
+    cleanupBubble();
+    addMessageBubble("bot", finalDone.reply, finalDone.attachments);
+    if (sNow) {
+      const it: HistoryItem = {
+        role: "bot",
+        text: finalDone.reply,
+        ts: Date.now(),
+        attachments: finalDone.attachments,
+      };
+      sNow.history.push(it);
+      sNow.lastActiveAt = Date.now();
+      saveStore();
+    }
+    setBadge(finalDone.remaining, finalDone.daily_quota);
+    recordOptimistic(sid, "assistant", finalDone.reply, finalDone.attachments);
+    renderSessionList();
+    return;
   }
 
   // Normal finalize. Strip the streaming chrome and swap the bubble
@@ -3174,7 +3239,7 @@ async function loadChatSite(): Promise<void> {
         max_attachments_per_message?: number;
         allowed_mime?: string[];
       };
-      image_gen?: { enabled?: boolean; img2img?: boolean };
+      image_gen?: { enabled?: boolean; img2img?: boolean; sizes?: string[] };
     };
     // 生图入口的可见性按服务端配置切换。服务端的 image_gen.enabled
     // 是基于 ImageBridge.enabled 读出来的（同时要求 endpoint + api_key
@@ -3187,6 +3252,10 @@ async function loadChatSite(): Promise<void> {
     // edits path. Gates whether send() keeps an attachment on an /image
     // command (see IMG2IMG_SUPPORTED comment).
     IMG2IMG_SUPPORTED = imageEnabled && !!(data.image_gen && data.image_gen.img2img);
+    IMAGE_SIZES = imageEnabled && Array.isArray(data.image_gen?.sizes)
+      ? data.image_gen!.sizes!.filter((s): s is string => typeof s === "string")
+      : [];
+    populateImgRatio();
     if (imageEnabled) {
       menuImage.hidden = false;
     } else {
@@ -4257,6 +4326,10 @@ async function performSend(message: string, readyAttachments: AttachmentRef[]): 
   addMessageBubble("user", message, readyAttachments.length ? readyAttachments : undefined);
   const userItem: HistoryItem = { role: "user", text: message, ts: Date.now() };
   if (readyAttachments.length) userItem.attachments = readyAttachments;
+  if (isImageCommand(message)) {
+    const sz = currentImgSize();
+    if (sz) userItem.size = sz;
+  }
   sessBefore.history.push(userItem);
   sessBefore.lastActiveAt = Date.now();
   if (sessBefore.title === "新会话" || !sessBefore.title) sessBefore.title = deriveTitle(sessBefore.history);
@@ -4286,6 +4359,14 @@ async function performSend(message: string, readyAttachments: AttachmentRef[]): 
       }
     } else {
       showTyping();
+      // Image generation is non-streaming but can be slow (up to the
+      // operator's image timeout, default 180s). Show the stop button so
+      // the user can abort — the click aborts sync.sendAbort and the
+      // server's disconnect poll cancels the upstream call.
+      if (isImageCommand(message)) {
+        setSendMode("stop");
+        sendBtn.disabled = false;
+      }
       await runNonStreamingSend(sid, message, readyAttachments);
     }
   } finally {
@@ -4878,6 +4959,10 @@ async function runNonStreamingSend(sid: string, message: string, attachments: At
   try {
     const body: Record<string, unknown> = { session_id: sid, username, message };
     if (attachments.length) body.attachments = attachments.map((a) => ({ file_id: a.file_id }));
+    if (isImageCommand(message)) {
+      const sz = currentImgSize();
+      if (sz) body.size = sz;
+    }
     const resp = await fetchWithTimeout(
       CHAT_URL,
       {
@@ -4886,7 +4971,7 @@ async function runNonStreamingSend(sid: string, message: string, attachments: At
         headers: { "Content-Type": "application/json", ...bearer() },
         body: JSON.stringify(body),
       },
-      FETCH_TIMEOUT_CHAT_MS,
+      isImageCommand(message) ? FETCH_TIMEOUT_IMAGE_MS : FETCH_TIMEOUT_CHAT_MS,
       ac.signal,
     );
     let payload: Record<string, unknown> = {};
@@ -4894,7 +4979,6 @@ async function runNonStreamingSend(sid: string, message: string, attachments: At
 
     if (resp.ok) {
       setBadge(payload.remaining as number, payload.daily_quota as number);
-      const reply = (payload.reply as string) || "(空回复)";
       // Image-gen path: /image / /img / /draw returns the same JSON
       // envelope plus an `attachments` array carrying the generated
       // file_id(s). Forward those onto the assistant bubble + history
@@ -4911,6 +4995,16 @@ async function runNonStreamingSend(sid: string, message: string, attachments: At
             )
             .map((a) => ({ file_id: a.file_id, mime: a.mime }))
         : [];
+      // Image turns return an empty `reply` (the image IS the reply). Use
+      // a REAL empty string so it renders as an image-only bubble AND the
+      // dedup keys (optimistic + the message_added event) match the
+      // server's empty content. The old "(空回复)" placeholder broke both:
+      // it rendered a stray text line and made the text-keyed dedup miss,
+      // producing a duplicate image bubble (persisting across coldRefetch).
+      // Keep the placeholder only for the text-with-no-attachments case so
+      // an older / non-conforming server build still shows something.
+      const reply = (payload.reply as string)
+        || (replyAttachments.length ? "" : "(空回复)");
       // Race: long-poll's `/events` response can land BEFORE /chat 200,
       // because record_chat_pair fires + notifies the EventBus right
       // before the chat handler returns. The two responses then race on
@@ -5043,7 +5137,18 @@ async function runNonStreamingSend(sid: string, message: string, attachments: At
     // ac.signal.aborted is true ONLY for that external abort; a fetch timeout
     // trips fetchWithTimeout's INTERNAL controller and leaves ac untouched,
     // so genuine timeouts still fall through to the failure marker below.
-    if (ac.signal.aborted) return;
+    if (ac.signal.aborted) {
+      // User clicked stop during an /image generation → mark '已停止'
+      // with a retry badge (reusing the streaming-stop chrome). A
+      // session-op abort leaves imageStopRequested false and stays silent
+      // (the turn was abandoned on purpose).
+      if (sync.imageStopRequested) {
+        sync.imageStopRequested = false;
+        hideTyping();
+        markLastUserAsFailed(message, attachments, "stopped");
+      }
+      return;
+    }
     // Network error, fetch timeout, etc. Same treatment as retryable
     // server failures above.
     markLastUserAsFailed(message, attachments, "send_failed");
@@ -5210,12 +5315,46 @@ menuUpload.addEventListener("click", () => {
 // already there; selecting again with the prefix present removes it
 // (toggle behaviour). Mirrors how operators can also just type the
 // trigger themselves — the menu item is an affordance, not a modal mode.
+function sizeLabel(size: string): string {
+  if (size === "auto") return "自动";
+  const m = size.match(/^(\d+)x(\d+)$/);
+  if (!m) return size;
+  const w = Number(m[1]);
+  const h = Number(m[2]);
+  if (w === h) return "1:1";
+  return w > h ? `横 ${size}` : `竖 ${size}`;
+}
+
+// Fill the ratio <select> from the model's allowed sizes (from /site).
+// Preserves the current selection where possible so a /site refresh
+// doesn't reset the user's pick mid-compose.
+function populateImgRatio(): void {
+  const prev = imgRatio.value;
+  imgRatio.replaceChildren();
+  for (const s of IMAGE_SIZES) {
+    const opt = document.createElement("option");
+    opt.value = s;
+    opt.textContent = sizeLabel(s);
+    imgRatio.appendChild(opt);
+  }
+  if (prev && IMAGE_SIZES.includes(prev)) imgRatio.value = prev;
+}
+
+// Size token to send with an /image request, or "" to let the server
+// use the operator default (no selector options offered).
+function currentImgSize(): string {
+  return IMAGE_SIZES.length ? imgRatio.value : "";
+}
+
 function refreshImageModeState(): void {
   const armed = isImageCommand(inputEl.value);
   menuImage.setAttribute("aria-pressed", armed ? "true" : "false");
   // Tint the "+" so the operator can tell they're in image mode even
   // with the menu closed.
   plusBtn.classList.toggle("active", armed);
+  // Show the ratio selector only in image mode AND when the model
+  // actually offers a choice.
+  imgRatio.hidden = !armed || IMAGE_SIZES.length === 0;
 }
 menuImage.addEventListener("click", () => {
   if (menuImage.disabled) return;
@@ -5390,6 +5529,17 @@ sendBtn.onclick = (): void => {
       }).catch(() => {});
     }
     sync.streamAbort.abort();
+    return;
+  }
+  // Non-streaming /image generation in flight: the same button is the
+  // stop button. Abort the POST (the server's disconnect poll cancels the
+  // upstream call) and flag it as a user stop so the catch arm renders
+  // '已停止' + retry. Return BEFORE void send() so a stop click can't fire
+  // a duplicate send.
+  if (sync.sendAbort) {
+    sync.imageStopRequested = true;
+    sync.sendAbort.abort();
+    sync.sendAbort = null;
     return;
   }
   void send();

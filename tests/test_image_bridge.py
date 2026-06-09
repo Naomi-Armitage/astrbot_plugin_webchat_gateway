@@ -507,6 +507,137 @@ class TestImageBridgeEdit:
 
 
 # ---------------------------------------------------------------------
+# resolve_size / resolve_size_for_reference (per-request aspect ratio)
+# ---------------------------------------------------------------------
+
+
+def _png_bytes(width: int, height: int) -> bytes:
+    from io import BytesIO
+
+    from PIL import Image
+
+    buf = BytesIO()
+    Image.new("RGB", (width, height), (200, 30, 30)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _bridge_for(model: str, size: str = "1024x1024", img2img: bool = False):
+    from astrbot_plugin_webchat_gateway.core.image_bridge import ImageBridge
+
+    return ImageBridge(
+        enabled=True,
+        endpoint="https://api.openai.com/v1",
+        api_key="sk-test",
+        model=model,
+        size=size,
+        timeout_seconds=30,
+        img2img=img2img,
+    )
+
+
+class TestResolveSize:
+    def test_gpt_image_aspect_tokens(self):
+        b = _bridge_for("gpt-image-1")
+        assert b.resolve_size("1:1") == "1024x1024"
+        assert b.resolve_size("16:9") == "1536x1024"
+        assert b.resolve_size("9:16") == "1024x1536"
+        assert b.resolve_size("landscape") == "1536x1024"
+        assert b.resolve_size("portrait") == "1024x1536"
+
+    def test_gpt_image_auto_allowed(self):
+        assert _bridge_for("gpt-image-1").resolve_size("auto") == "auto"
+
+    def test_dalle_aspect_tokens(self):
+        b = _bridge_for("dall-e-3")
+        assert b.resolve_size("16:9") == "1792x1024"
+        assert b.resolve_size("9:16") == "1024x1792"
+        assert b.resolve_size("1:1") == "1024x1024"
+
+    def test_dalle_rejects_auto_falls_back(self):
+        # auto is gpt-image-only; dall-e falls back to the default.
+        assert _bridge_for("dall-e-3").resolve_size("auto") == "1024x1024"
+
+    def test_concrete_size_passthrough(self):
+        assert _bridge_for("dall-e-3").resolve_size("1792x1024") == "1792x1024"
+
+    def test_garbage_and_none_fall_back_to_default(self):
+        b = _bridge_for("gpt-image-1", size="1536x1024")
+        assert b.resolve_size("garbage") == "1536x1024"
+        assert b.resolve_size(None) == "1536x1024"
+        assert b.resolve_size("") == "1536x1024"
+
+    def test_default_invalid_for_model_falls_back_1024(self):
+        # DALL-E size left in config but model is gpt-image → 1024x1024.
+        b = _bridge_for("gpt-image-1", size="1792x1024")
+        assert b.resolve_size(None) == "1024x1024"
+        assert b.resolve_size("nonsense") == "1024x1024"
+
+    def test_never_raises(self):
+        b = _bridge_for("gpt-image-1")
+        for v in (None, "", "  ", "abc", "1x", "x1", "999x999", "16:9", "auto"):
+            out = b.resolve_size(v)
+            assert isinstance(out, str) and out
+
+
+class TestResolveSizeForReference:
+    def test_landscape_reference_gpt_image(self):
+        b = _bridge_for("gpt-image-1", img2img=True)
+        assert b.resolve_size_for_reference(_png_bytes(1600, 900)) == "1536x1024"
+
+    def test_portrait_reference_gpt_image(self):
+        b = _bridge_for("gpt-image-1", img2img=True)
+        assert b.resolve_size_for_reference(_png_bytes(900, 1600)) == "1024x1536"
+
+    def test_square_reference(self):
+        b = _bridge_for("gpt-image-1", img2img=True)
+        assert b.resolve_size_for_reference(_png_bytes(512, 512)) == "1024x1024"
+
+    def test_landscape_reference_dalle(self):
+        b = _bridge_for("dall-e-2", img2img=True)
+        assert b.resolve_size_for_reference(_png_bytes(1920, 1080)) == "1792x1024"
+
+    def test_unreadable_returns_none(self):
+        b = _bridge_for("gpt-image-1", img2img=True)
+        assert b.resolve_size_for_reference(b"not an image") is None
+        assert b.resolve_size_for_reference(b"") is None
+
+
+@pytest.mark.asyncio
+class TestPerRequestSize:
+    async def test_generate_resolved_size_in_request_and_result(self, patch_aiohttp):
+        b64 = base64.b64encode(b"\x89PNG").decode()
+        session = patch_aiohttp(
+            _StubResponse(status=200, json_body={"data": [{"b64_json": b64}]})
+        )
+        bridge = _bridge_for("gpt-image-1", size="1024x1024")
+        result = await bridge.generate("a cat", size="16:9")
+        assert session.calls[0]["json"]["size"] == "1536x1024"
+        assert result.size == "1536x1024"
+
+    async def test_generate_default_when_no_size(self, patch_aiohttp):
+        b64 = base64.b64encode(b"\x89PNG").decode()
+        session = patch_aiohttp(
+            _StubResponse(status=200, json_body={"data": [{"b64_json": b64}]})
+        )
+        bridge = _bridge_for("dall-e-3", size="1792x1024")
+        result = await bridge.generate("a forest")  # no size → operator default
+        assert session.calls[0]["json"]["size"] == "1792x1024"
+        assert result.size == "1792x1024"
+
+    async def test_edit_prefers_reference_aspect_over_request(self, patch_aiohttp):
+        b64 = base64.b64encode(b"\x89PNG").decode()
+        patch_aiohttp(
+            _StubResponse(status=200, json_body={"data": [{"b64_json": b64}]})
+        )
+        bridge = _bridge_for("gpt-image-1", size="1024x1024", img2img=True)
+        # Landscape reference + a square request → reference wins.
+        result = await bridge.edit(
+            "make it watercolor", _png_bytes(1600, 900), "image/png", size="1:1"
+        )
+        assert result.size == "1536x1024"
+
+
+# ---------------------------------------------------------------------
 # persist_generated_image
 # ---------------------------------------------------------------------
 

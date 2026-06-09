@@ -38,6 +38,8 @@ import aiohttp
 
 from astrbot.api import logger
 
+from .image_util import detect_image_size
+
 
 _PREFIX_PATTERN = re.compile(r"^\s*/(?:image|img|draw)\b\s*", re.IGNORECASE)
 
@@ -46,6 +48,25 @@ _PREFIX_PATTERN = re.compile(r"^\s*/(?:image|img|draw)\b\s*", re.IGNORECASE)
 # not per-token, so we keep the same limit for UX consistency rather
 # than a tighter one. OpenAI itself caps DALL-E 3 at 4000 chars.
 _DEFAULT_PROMPT_CAP = 4000
+
+
+# Per-model-family output size allow-lists + aspect→size maps. The
+# `_is_gpt_image_model` predicate selects the family; everything else
+# uses the DALL-E set. `resolve_size` validates a per-request size/aspect
+# against these so an unsupported value can never reach the upstream API
+# (which would 400). `auto` is gpt-image-only.
+_GPT_IMAGE_SIZES = ("auto", "1024x1024", "1536x1024", "1024x1536")
+_DALLE_SIZES = ("1024x1024", "1792x1024", "1024x1792")
+_GPT_IMAGE_ASPECT = {
+    "1:1": "1024x1024",
+    "3:2": "1536x1024", "16:9": "1536x1024", "landscape": "1536x1024",
+    "2:3": "1024x1536", "9:16": "1024x1536", "portrait": "1024x1536",
+}
+_DALLE_ASPECT = {
+    "1:1": "1024x1024",
+    "16:9": "1792x1024", "3:2": "1792x1024", "landscape": "1792x1024",
+    "9:16": "1024x1792", "2:3": "1024x1792", "portrait": "1024x1792",
+}
 
 
 def is_image_command(message: str) -> bool:
@@ -92,6 +113,7 @@ class ImageResult:
     content: bytes
     mime: str  # always "image/png" for OpenAI image models today
     prompt: str  # echoed back so the audit event records what was asked
+    size: str = ""  # effective size sent upstream (per-request resolved)
 
 
 class ImageBridge:
@@ -151,6 +173,77 @@ class ImageBridge:
     def size(self) -> str:
         return self._size
 
+    @property
+    def _is_gpt_image_model(self) -> bool:
+        return "gpt-image" in (self._model or "").lower()
+
+    def _allowed_sizes(self) -> tuple[str, ...]:
+        return _GPT_IMAGE_SIZES if self._is_gpt_image_model else _DALLE_SIZES
+
+    def _aspect_map(self) -> dict[str, str]:
+        return _GPT_IMAGE_ASPECT if self._is_gpt_image_model else _DALLE_ASPECT
+
+    def allowed_sizes(self) -> list[str]:
+        """Public: the concrete sizes (+ ``auto`` for gpt-image) the
+        current model accepts. Surfaced via /site so the UI ratio
+        selector only offers valid choices for the configured model."""
+        return list(self._allowed_sizes())
+
+    def _default_size(self) -> str:
+        """Operator default, normalised + validated for the current
+        model. Falls back to 1024x1024 if the configured size isn't
+        valid for this model family (e.g. a DALL-E size left in config
+        after switching to gpt-image)."""
+        s = (self._size or "").strip().lower()
+        if s in self._allowed_sizes():
+            return s
+        return "1024x1024"
+
+    def resolve_size(self, requested: str | None) -> str:
+        """Resolve a per-request size/aspect to a concrete, model-valid
+        size string. NEVER raises — any unsupported / malformed value
+        falls back to the operator default (then 1024x1024). Accepts a
+        concrete size (``1536x1024``), an aspect token (``16:9`` /
+        ``portrait`` / ``1:1``), or ``auto`` (gpt-image only)."""
+        req = (requested or "").strip().lower()
+        if not req:
+            return self._default_size()
+        if req in self._allowed_sizes():
+            return req
+        mapped = self._aspect_map().get(req)
+        if mapped:
+            return mapped
+        return self._default_size()
+
+    def resolve_size_for_reference(self, image_bytes: bytes) -> str | None:
+        """Map a reference image's aspect ratio to the closest supported
+        output size (img2img: keep the original proportions). Returns
+        None if the dimensions can't be read, so the caller can fall
+        back to ``resolve_size``."""
+        dims = detect_image_size(image_bytes)
+        if not dims:
+            return None
+        width, height = dims
+        if height <= 0:
+            return None
+        target = width / height
+        best: str | None = None
+        best_diff: float | None = None
+        for s in self._allowed_sizes():
+            if s == "auto":
+                continue
+            try:
+                sw, sh = (int(p) for p in s.split("x"))
+            except (ValueError, AttributeError):
+                continue
+            if sh <= 0:
+                continue
+            diff = abs((sw / sh) - target)
+            if best_diff is None or diff < best_diff:
+                best_diff = diff
+                best = s
+        return best
+
     def _clean_prompt(self, prompt: str) -> str:
         cleaned = (prompt or "").strip()
         if not cleaned:
@@ -164,6 +257,7 @@ class ImageBridge:
         session: aiohttp.ClientSession,
         resp: aiohttp.ClientResponse,
         prompt: str,
+        size: str,
     ) -> ImageResult:
         # Shared response handler for both /images/generations (generate)
         # and /images/edits (edit): identical envelope (data[0].b64_json or
@@ -217,7 +311,7 @@ class ImageBridge:
                 ) from exc
             if not raw:
                 raise ImageBridgeError("empty_image_reply")
-            return ImageResult(content=raw, mime="image/png", prompt=prompt)
+            return ImageResult(content=raw, mime="image/png", prompt=prompt, size=size)
         # Some OpenAI-compatible gateways (and DALL-E without
         # `response_format=b64_json`) only return a URL pointing at the
         # rendered image. Fetch the bytes ourselves so the rest of the
@@ -242,7 +336,7 @@ class ImageBridge:
                         ";", 1
                     )[0].strip().lower()
                     mime = ct if ct.startswith("image/") else "image/png"
-                    return ImageResult(content=raw, mime=mime, prompt=prompt)
+                    return ImageResult(content=raw, mime=mime, prompt=prompt, size=size)
             except aiohttp.ClientError as exc:
                 raise ImageBridgeError(
                     "image_call_failed",
@@ -250,10 +344,11 @@ class ImageBridge:
                 ) from exc
         raise ImageBridgeError("empty_image_reply")
 
-    async def generate(self, prompt: str) -> ImageResult:
+    async def generate(self, prompt: str, size: str | None = None) -> ImageResult:
         if not self.enabled:
             raise ImageBridgeError("image_disabled")
         cleaned = self._clean_prompt(prompt)
+        eff_size = self.resolve_size(size)
         url = f"{self._endpoint}/images/generations"
         # `response_format` is NOT accepted by GPT-image-* models —
         # OpenAI explicitly returns 400 "Unknown parameter" for those.
@@ -264,13 +359,12 @@ class ImageBridge:
         # The reference plugin (Railgun19457/astrbot_plugin_image_generation)
         # uses the same predicate; matching it keeps the cross-plugin
         # behaviour consistent on the same operator config.
-        model_lower = self._model.lower()
-        is_gpt_image = "gpt-image" in model_lower
+        is_gpt_image = self._is_gpt_image_model
         body: dict[str, Any] = {
             "model": self._model,
             "prompt": cleaned,
             "n": 1,
-            "size": self._size,
+            "size": eff_size,
         }
         if not is_gpt_image:
             body["response_format"] = "b64_json"
@@ -282,7 +376,7 @@ class ImageBridge:
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(url, json=body, headers=headers) as resp:
-                    return await self._read_image_response(session, resp, cleaned)
+                    return await self._read_image_response(session, resp, cleaned, eff_size)
         except asyncio.TimeoutError as exc:
             raise ImageBridgeError("image_timeout") from exc
         except aiohttp.ClientError as exc:
@@ -294,7 +388,7 @@ class ImageBridge:
             ) from exc
 
     async def edit(
-        self, prompt: str, image_bytes: bytes, mime: str
+        self, prompt: str, image_bytes: bytes, mime: str, size: str | None = None
     ) -> ImageResult:
         """Image-to-image via POST {endpoint}/images/edits (multipart).
 
@@ -307,9 +401,12 @@ class ImageBridge:
         cleaned = self._clean_prompt(prompt)
         if not image_bytes:
             raise ImageBridgeError("image_call_failed", "empty input image")
+        # img2img: keep the reference image's proportions. Map its aspect
+        # ratio onto the closest model-supported size; fall back to the
+        # per-request / operator default only if dimensions can't be read.
+        eff_size = self.resolve_size_for_reference(image_bytes) or self.resolve_size(size)
         url = f"{self._endpoint}/images/edits"
-        model_lower = self._model.lower()
-        is_gpt_image = "gpt-image" in model_lower
+        is_gpt_image = self._is_gpt_image_model
         # Multipart form: the input image rides as a file part. Give it a
         # filename with an extension matching its mime so upstream content
         # sniffing accepts it (OpenAI rejects unknown/extensionless parts).
@@ -318,7 +415,7 @@ class ImageBridge:
         form.add_field("model", self._model)
         form.add_field("prompt", cleaned)
         form.add_field("n", "1")
-        form.add_field("size", self._size)
+        form.add_field("size", eff_size)
         if not is_gpt_image:
             form.add_field("response_format", "b64_json")
         form.add_field(
@@ -335,7 +432,7 @@ class ImageBridge:
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(url, data=form, headers=headers) as resp:
-                    return await self._read_image_response(session, resp, cleaned)
+                    return await self._read_image_response(session, resp, cleaned, eff_size)
         except asyncio.TimeoutError as exc:
             raise ImageBridgeError("image_timeout") from exc
         except aiohttp.ClientError as exc:

@@ -144,6 +144,33 @@ async def detect_image_mime_async(content: bytes) -> str | None:
     return await asyncio.to_thread(detect_image_mime, content)
 
 
+def detect_image_size(content: bytes) -> tuple[int, int] | None:
+    """Return (width, height) of a raster image, or None on failure.
+
+    Used by the image-gen edit (img2img) path to map a reference
+    image's aspect ratio onto the closest model-supported output size.
+    Reuses the same decompression-bomb guard as ``detect_image_mime``;
+    ``.size`` is read lazily from the header without a full pixel
+    decode, so this stays cheap and constant-memory.
+    """
+    if not content:
+        return None
+    with _scoped_max_pixels(PIL_MAX_PIXELS):
+        try:
+            img = Image.open(BytesIO(content))
+            width, height = img.size
+        except Exception:
+            return None
+    if (
+        not isinstance(width, int)
+        or not isinstance(height, int)
+        or width <= 0
+        or height <= 0
+    ):
+        return None
+    return (width, height)
+
+
 def ext_for_mime(mime: str) -> str | None:
     """Return the on-disk extension for a validated MIME, or None.
 
@@ -161,5 +188,6 @@ __all__ = [
     "PIL_MAX_PIXELS",
     "detect_image_mime",
     "detect_image_mime_async",
+    "detect_image_size",
     "ext_for_mime",
 ]

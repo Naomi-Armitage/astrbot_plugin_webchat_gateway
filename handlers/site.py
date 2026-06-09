@@ -55,6 +55,13 @@ class SiteDeps:
     # Drives whether the chat client keeps an attached image on an /image
     # command (vs dropping it). Default False → safe degrade (drop + notice).
     image_gen_img2img_provider: Callable[[], bool] = lambda: False
+    # Live read of the current model's allowed output sizes (incl.
+    # ``auto`` for gpt-image). Surfaced so the chat client's ratio
+    # selector only offers sizes the configured model accepts; the
+    # selector sends one back as ``body.size`` and the bridge's
+    # resolve_size validates it again. Default [] → FE falls back to a
+    # single default ratio.
+    image_gen_sizes_provider: Callable[[], list[str]] = lambda: []
 
 
 def make_site_handlers(deps: SiteDeps):
@@ -101,11 +108,20 @@ def make_site_handlers(deps: SiteDeps):
             )
         except Exception:
             image_gen_img2img = False
+        try:
+            image_gen_sizes = (
+                list(deps.image_gen_sizes_provider())
+                if image_gen_enabled
+                else []
+            )
+        except Exception:
+            image_gen_sizes = []
         payload = {
             **static_payload,
             "image_gen": {
                 "enabled": image_gen_enabled,
                 "img2img": image_gen_img2img,
+                "sizes": image_gen_sizes,
             },
         }
         return json_response(

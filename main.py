@@ -212,6 +212,21 @@ class WebChatGatewayPlugin(Star):
                 file_store = LocalFileStore(root=cfg.uploads.local_path)
             self._file_store = file_store
 
+            # Image bridge shared by the /chat image branch AND the
+            # regenerate path (so a regenerated /image turn re-runs the
+            # same bridge instead of feeding the slash command to the
+            # chat model). Rebuilt wholesale on config reload; both
+            # references are swapped together in _reload_cfg.
+            image_bridge = ImageBridge(
+                enabled=cfg.image_gen.enabled,
+                endpoint=cfg.image_gen.endpoint,
+                api_key=cfg.image_gen.api_key,
+                model=cfg.image_gen.model,
+                size=cfg.image_gen.size,
+                timeout_seconds=cfg.image_gen.timeout_seconds,
+                img2img=cfg.image_gen.img2img,
+            )
+
             conv_service = ConversationService(
                 storage=storage,
                 audit=audit,
@@ -220,6 +235,7 @@ class WebChatGatewayPlugin(Star):
                 file_store=file_store,
                 concurrency=concurrency,
                 llm_bridge=llm_bridge,
+                image_bridge=image_bridge,
             )
 
             # Streaming buffer + registry. Redis backend is opt-in via
@@ -312,15 +328,7 @@ class WebChatGatewayPlugin(Star):
                 conv_service=conv_service,
                 registry=registry,
                 file_store=file_store,
-                image_bridge=ImageBridge(
-                    enabled=cfg.image_gen.enabled,
-                    endpoint=cfg.image_gen.endpoint,
-                    api_key=cfg.image_gen.api_key,
-                    model=cfg.image_gen.model,
-                    size=cfg.image_gen.size,
-                    timeout_seconds=cfg.image_gen.timeout_seconds,
-                    img2img=cfg.image_gen.img2img,
-                ),
+                image_bridge=image_bridge,
                 allowed_origins=cfg.allowed_origins,
                 max_message_length=cfg.max_message_length,
                 max_attachments_per_message=cfg.uploads.max_attachments_per_message,
@@ -483,7 +491,7 @@ class WebChatGatewayPlugin(Star):
         self._cfg = ConfigView.from_raw(self.config)
         if self._chat_deps is not None:
             try:
-                self._chat_deps.image_bridge = ImageBridge(
+                new_image_bridge = ImageBridge(
                     enabled=self._cfg.image_gen.enabled,
                     endpoint=self._cfg.image_gen.endpoint,
                     api_key=self._cfg.image_gen.api_key,
@@ -492,6 +500,10 @@ class WebChatGatewayPlugin(Star):
                     timeout_seconds=self._cfg.image_gen.timeout_seconds,
                     img2img=self._cfg.image_gen.img2img,
                 )
+                self._chat_deps.image_bridge = new_image_bridge
+                # Keep the regenerate path's bridge in sync with /chat's
+                # so a hot-reloaded model / size / key is honoured there too.
+                self._chat_deps.conv_service._image_bridge = new_image_bridge
             except Exception:
                 logger.exception(
                     "[WebChatGateway] image-bridge hot-reload failed"

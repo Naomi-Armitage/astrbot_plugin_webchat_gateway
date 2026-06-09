@@ -88,6 +88,7 @@ class _ParsedRequest:
     username: str
     message: str
     attachments: list[str]  # list of file_ids
+    size: str | None = None  # optional per-request image size/aspect
 
 
 class _ParseError(Exception):
@@ -97,6 +98,28 @@ class _ParseError(Exception):
         super().__init__(code)
         self.code = code
         self.status = status
+
+
+_SIZE_CHARS = frozenset("0123456789:xabcdefghijklmnopqrstuvwxyz")
+
+
+def _parse_size(raw: Any) -> str | None:
+    """Sanitize an optional per-request image size/aspect token.
+
+    The image bridge's ``resolve_size`` is the authoritative validator
+    (per-model allow-list, never-raise fallback); this is just a cheap
+    defensive filter so obvious garbage never reaches the wire. Accepts
+    short lowercase tokens like ``1:1`` / ``16:9`` / ``1024x1024`` /
+    ``auto``; anything else collapses to ``None`` (→ operator default).
+    """
+    if not isinstance(raw, str):
+        return None
+    cand = raw.strip().lower()
+    if not cand or len(cand) > 16:
+        return None
+    if not all(c in _SIZE_CHARS for c in cand):
+        return None
+    return cand
 
 
 def _parse_payload(payload: Any, *, max_attachments: int) -> _ParsedRequest | None:
@@ -135,12 +158,14 @@ def _parse_payload(payload: Any, *, max_attachments: int) -> _ParsedRequest | No
     ).strip() or "webchat"
     user_id = str(payload.get("userId") or payload.get("user_id") or "").strip()
     username = (str(payload.get("username") or "").strip() or "WebUser")[:64]
+    size = _parse_size(payload.get("size"))
     return _ParsedRequest(
         session_id=session_id[:128],
         user_id=user_id[:128],
         username=username,
         message=message,
         attachments=attachments,
+        size=size,
     )
 
 

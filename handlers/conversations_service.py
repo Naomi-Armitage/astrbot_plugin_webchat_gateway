@@ -42,6 +42,13 @@ from ..core.audit import AuditLogger
 from ..core.event_bus import EventBus
 from ..core.file_lifecycle import release_files_safely
 from ..core.file_store import FileStore
+from ..core.image_bridge import (
+    ImageBridge,
+    ImageBridgeError,
+    is_image_command,
+    persist_generated_image,
+    strip_image_prefix,
+)
 from ..core.llm_bridge import LlmBridge, map_llm_error
 from ..core.ratelimit import PerTokenConcurrency
 from ..storage.base import (
@@ -149,6 +156,7 @@ class ConversationService:
         file_store: FileStore,
         concurrency: PerTokenConcurrency | None = None,
         llm_bridge: LlmBridge | None = None,
+        image_bridge: ImageBridge | None = None,
     ) -> None:
         self._storage = storage
         self._audit = audit
@@ -163,6 +171,11 @@ class ConversationService:
         # allowed so tests that don't exercise regenerate can construct
         # the service without spinning up an AstrBot context.
         self._llm_bridge = llm_bridge
+        # Optional image bridge — required to regenerate /image turns
+        # (regenerate re-runs the bridge instead of feeding the slash
+        # command to the chat model as text). None is fine for
+        # deployments / tests without image gen.
+        self._image_bridge = image_bridge
 
     @staticmethod
     def _now() -> int:
@@ -1190,6 +1203,7 @@ class ConversationService:
         username: str = "WebUser",
         token_daily_quota: int,
         ip: str | None = None,
+        size: str | None = None,
     ) -> AsyncIterator[dict]:
         """Streaming variant of regenerate_assistant_message.
 
@@ -1237,6 +1251,7 @@ class ConversationService:
                 username=username,
                 token_daily_quota=token_daily_quota,
                 ip=ip,
+                size=size,
             ):
                 yield evt
 
@@ -1249,6 +1264,7 @@ class ConversationService:
         token_name: str,
         reply: str,
         now: int,
+        attachments: list[dict] | None = None,
     ) -> None:
         """Emit the chat-sync events for a regenerate that truncated the
         rendered tail and appended a fresh assistant message.
@@ -1281,14 +1297,14 @@ class ConversationService:
                     ),
                 )
             )
+        added_payload: dict[str, Any] = {"role": "assistant", "content": reply}
+        if attachments:
+            added_payload["attachments"] = list(attachments)
         deletion_events.append(
             NewEvent(
                 event_type=EVENT_MESSAGE_ADDED,
                 session_id=session_id,
-                payload=json.dumps(
-                    {"role": "assistant", "content": reply},
-                    ensure_ascii=False,
-                ),
+                payload=json.dumps(added_payload, ensure_ascii=False),
             )
         )
         await self._storage.append_updates(
@@ -1358,6 +1374,217 @@ class ConversationService:
                 image_urls.append(local_path)
         return image_urls
 
+    async def _read_reference_image(
+        self, file_id: str, *, token_name: str, session_id: str
+    ) -> tuple[bytes | None, str]:
+        """Load a reference image's raw bytes for an img2img regenerate.
+
+        Ownership-checked like every other resolve site. Returns
+        ``(bytes, mime)`` or ``(None, "image/png")`` on any miss so the
+        caller can fall back to text2img.
+        """
+        try:
+            row = await self._storage.get_file(file_id)
+        except Exception:
+            logger.exception(
+                "[WebChatGateway] regen image get_file failed file_id=%s",
+                file_id,
+            )
+            return None, "image/png"
+        if (
+            row is None
+            or row.token_name != token_name
+            or row.session_id != session_id
+        ):
+            return None, "image/png"
+        try:
+            data = await self._file_store.read(storage_key=row.storage_key)
+        except Exception:
+            logger.exception(
+                "[WebChatGateway] regen image read failed key=%s",
+                row.storage_key,
+            )
+            return None, "image/png"
+        return data, (row.mime or "image/png")
+
+    async def _build_image_assistant_entry(
+        self, attachment: dict, *, token_name: str
+    ) -> dict | None:
+        """Build a CM assistant segment carrying one generated image.
+
+        Mirrors the ImageURLPart shape `_cm_persist_pair` writes (file://
+        uri + file_id) so a regenerated image renders identically and
+        survives a cold refetch. Returns None if the file can't resolve.
+        """
+        file_id = attachment.get("file_id") if isinstance(attachment, dict) else None
+        if not isinstance(file_id, str) or not file_id:
+            return None
+        try:
+            row = await self._storage.get_file(file_id)
+        except Exception:
+            logger.exception(
+                "[WebChatGateway] regen image entry get_file failed file_id=%s",
+                file_id,
+            )
+            return None
+        if row is None or row.token_name != token_name:
+            return None
+        try:
+            local_path = await self._file_store.open_local_path(
+                storage_key=row.storage_key
+            )
+        except Exception:
+            logger.exception(
+                "[WebChatGateway] regen image entry open_local_path failed key=%s",
+                row.storage_key,
+            )
+            local_path = None
+        if not local_path:
+            return None
+        if local_path.startswith(("http://", "https://", "file://")):
+            file_url = local_path
+        else:
+            try:
+                file_url = Path(local_path).resolve().as_uri()
+            except ValueError:
+                file_url = "file:///" + local_path.replace("\\", "/").lstrip("/")
+        parts = [
+            ImageURLPart(image_url=ImageURLPart.ImageURL(url=file_url, id=file_id))
+        ]
+        return AssistantMessageSegment(content=parts).model_dump()
+
+    async def _regen_image(
+        self,
+        *,
+        token_name: str,
+        session_id: str,
+        last_user_text: str,
+        last_user_file_ids: list[str],
+        size: str | None,
+        umo: str,
+        cid: str,
+        truncated_history: list[Any],
+        raw_history: list[Any],
+        message_index: int,
+        today: date,
+        today_count: int,
+        token_daily_quota: int,
+        ip: str | None,
+    ) -> AsyncIterator[dict]:
+        """Regenerate an /image turn by re-running the image bridge in
+        place of the LLM. Mirrors the chat.py image branch (text2img vs
+        img2img keeping the reference image's aspect ratio) but appends a
+        single assistant turn to the already-truncated history instead of
+        a user/assistant pair. Yields one terminal `done` frame.
+        """
+        bridge = self._image_bridge
+        assert bridge is not None  # caller gates on enabled
+        prompt = strip_image_prefix(last_user_text)
+        if not prompt:
+            raise ServiceError("image_prompt_empty", status=400)
+        use_edit = bool(last_user_file_ids) and bridge.edit_enabled
+        try:
+            if use_edit:
+                img_bytes, mime = await self._read_reference_image(
+                    last_user_file_ids[0],
+                    token_name=token_name,
+                    session_id=session_id,
+                )
+                if img_bytes:
+                    result = await bridge.edit(prompt, img_bytes, mime, size=size)
+                else:
+                    result = await bridge.generate(prompt, size=size)
+            else:
+                result = await bridge.generate(prompt, size=size)
+        except ImageBridgeError as exc:
+            status = 504 if exc.code == "image_timeout" else (
+                503 if exc.code == "image_disabled" else 502
+            )
+            await self._audit.write(
+                "image_failed",
+                name=token_name,
+                ip=ip,
+                detail={
+                    "code": exc.code,
+                    "operation": "regenerate",
+                    "prompt_len": len(prompt),
+                },
+            )
+            raise ServiceError(exc.code, status=status) from None
+
+        attachment = await persist_generated_image(
+            storage=self._storage,
+            file_store=self._file_store,
+            token_name=token_name,
+            result=result,
+            now=self._now(),
+        )
+        entry = await self._build_image_assistant_entry(
+            attachment, token_name=token_name
+        )
+        final_history = truncated_history + ([entry] if entry else [])
+        try:
+            await self._cm.update_conversation(
+                unified_msg_origin=umo,
+                conversation_id=cid,
+                history=final_history,
+            )
+        except Exception:
+            logger.exception(
+                "[WebChatGateway] CM.update_conversation(regenerate image) failed"
+            )
+            raise ServiceError("regenerate_failed", status=500) from None
+
+        try:
+            new_count = await self._storage.increment_daily_usage(
+                token_name, day=today
+            )
+        except Exception:
+            logger.exception(
+                "[WebChatGateway] increment_daily_usage during regen image failed"
+            )
+            new_count = today_count + 1
+        remaining = max(0, token_daily_quota - new_count)
+
+        now = self._now()
+        new_rendered = _normalize_history(final_history)
+        await self._storage.upsert_session_meta(
+            token_name=token_name,
+            session_id=session_id,
+            message_count=len(new_rendered),
+            preview="",
+            now=now,
+        )
+        await self._emit_regen_truncate_events(
+            raw_history=raw_history,
+            message_index=message_index,
+            session_id=session_id,
+            token_name=token_name,
+            reply="",
+            now=now,
+            attachments=[attachment],
+        )
+        await self._audit.write(
+            "image_generated",
+            name=token_name,
+            ip=ip,
+            detail={
+                "prompt_len": len(prompt),
+                "model": bridge.model,
+                "size": result.size,
+                "file_id": attachment["file_id"],
+                "operation": "regenerate",
+            },
+        )
+        yield {
+            "type": "done",
+            "reply": "",
+            "attachments": [attachment],
+            "size": result.size,
+            "remaining": remaining,
+            "daily_quota": token_daily_quota,
+        }
+
     async def _regenerate_stream_inner(
         self,
         *,
@@ -1367,6 +1594,7 @@ class ConversationService:
         username: str,
         token_daily_quota: int,
         ip: str | None,
+        size: str | None = None,
     ) -> AsyncIterator[dict]:
         raw_history, cid, target_raw_idx, _target_entry, target_role = (
             await self._resolve_target_raw_index(
@@ -1430,6 +1658,34 @@ class ConversationService:
             token_name=token_name,
             session_id=session_id,
         )
+
+        # /image regenerate: re-run the image bridge in place of the LLM
+        # so the slash command isn't fed to the chat model as text. CM is
+        # already truncated to [0, target); _regen_image appends a single
+        # image assistant turn and emits the terminal done frame.
+        if (
+            is_image_command(last_user_text)
+            and self._image_bridge is not None
+            and self._image_bridge.enabled
+        ):
+            async for evt in self._regen_image(
+                token_name=token_name,
+                session_id=session_id,
+                last_user_text=last_user_text,
+                last_user_file_ids=last_user_file_ids,
+                size=size,
+                umo=umo,
+                cid=cid,
+                truncated_history=truncated_history,
+                raw_history=raw_history,
+                message_index=message_index,
+                today=today,
+                today_count=today_count,
+                token_daily_quota=token_daily_quota,
+                ip=ip,
+            ):
+                yield evt
+            return
 
         # Streaming LLM call. Each yielded chunk becomes an SSE frame
         # for the client to render into the streaming bubble; the

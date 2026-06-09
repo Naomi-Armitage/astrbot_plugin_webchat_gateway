@@ -16,6 +16,7 @@ from aiohttp import web
 
 from astrbot.api import logger
 
+from ..core.image_bridge import is_image_command
 from ..core.stream_registry import STREAM_ID_PATTERN
 from .chat_common import (
     ChatDeps,
@@ -235,6 +236,21 @@ def make_chat_stream_handler(deps: ChatDeps):
         allowed = prepared.allowed
         same_host = prepared.same_host
         data = prepared.data
+        # Defense in depth: /image commands must NOT stream. The client
+        # already routes them to the non-streaming /chat path (only that
+        # path runs the image bridge), but if a future client or a direct
+        # caller POSTs an image command here, the SSE driver would feed
+        # "/image ..." to the chat model as plain text and yield a bogus
+        # text reply. Reject explicitly so image routing isn't enforced
+        # only client-side.
+        if is_image_command(data.message):
+            return json_response(
+                {"error": "image_not_streamable"},
+                status=400,
+                origin=origin,
+                allowed_origins=allowed,
+                same_origin_host=same_host,
+            )
         attachment_rows = prepared.attachment_rows
         user_attachments_payload: list[dict] = (
             [{"file_id": r.file_id, "mime": r.mime} for r in attachment_rows]

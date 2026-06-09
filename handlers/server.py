@@ -298,6 +298,15 @@ def build_app(deps: ServerDeps) -> web.Application:
                 deps.chat.image_bridge is not None
                 and deps.chat.image_bridge.edit_enabled
             ),
+            # Current model's allowed output sizes (per-model allow-list,
+            # incl. ``auto`` for gpt-image). Read off the live bridge so a
+            # model change hot-reloads the ratio selector's options.
+            image_gen_sizes_provider=lambda: (
+                deps.chat.image_bridge.allowed_sizes()
+                if deps.chat.image_bridge is not None
+                and deps.chat.image_bridge.enabled
+                else []
+            ),
         )
     )
     app.router.add_get(cfg.site_info_path, site["get_site"])

@@ -530,6 +530,15 @@ def make_conversation_handlers(
             return _err(
                 request, gated.origin, ServiceError("invalid_payload", status=400)
             )
+        # Optional per-request image size/aspect for regenerating an
+        # /image turn. Coarse sanitize only — the bridge's resolve_size
+        # is the authoritative validator with a never-raise fallback.
+        raw_size = body.get("size")
+        size = (
+            raw_size
+            if isinstance(raw_size, str) and 0 < len(raw_size) <= 16
+            else None
+        )
 
         # Pre-flight: pull the first frame BEFORE preparing the SSE
         # response. The service generator acquires the per-token lock,
@@ -550,6 +559,7 @@ def make_conversation_handlers(
             message_index=raw_index,
             token_daily_quota=gated.token.daily_quota,
             ip=gated.ip,
+            size=size,
         )
         first_frame: dict | None = None
         try:
