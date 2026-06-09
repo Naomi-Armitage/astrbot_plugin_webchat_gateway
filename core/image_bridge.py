@@ -97,9 +97,15 @@ class ImageBridgeError(RuntimeError):
     audit rows verbatim.
     """
 
-    def __init__(self, code: str, message: str = "") -> None:
+    def __init__(
+        self, code: str, message: str = "", *, status: int | None = None
+    ) -> None:
         super().__init__(message or code)
         self.code = code
+        # Upstream HTTP status when the failure came from the image API
+        # (None for local / transport failures). Used to decide whether a
+        # transient 5xx is worth retrying.
+        self.status = status
 
 
 @dataclass(frozen=True)
@@ -252,6 +258,45 @@ class ImageBridge:
             cleaned = cleaned[:_DEFAULT_PROMPT_CAP]
         return cleaned
 
+    # Transient upstream 5xx — e.g. a gateway's "no available channel"
+    # when it round-robins onto a momentarily-dead channel — usually
+    # succeeds on a retry that lands on a healthy channel. Retry ONLY
+    # 5xx: 4xx (bad params), timeouts (slow; retrying compounds latency)
+    # and empty replies are not retried. A 5xx returns fast, so a couple
+    # of retries add seconds, not minutes. Failed attempts charge no
+    # quota (the chat handler only counts a successful generation).
+    _MAX_UPSTREAM_RETRIES = 2
+    _RETRY_BACKOFF_SECONDS = 0.8
+
+    async def _post_with_retry(self, attempt) -> "ImageResult":
+        """Run one upstream attempt, retrying transient 5xx failures.
+
+        ``attempt`` is a zero-arg coroutine function performing a single
+        POST + response parse that returns an ImageResult or raises
+        ImageBridgeError. Only ImageBridgeError with ``status >= 500`` is
+        retried; everything else propagates immediately.
+        """
+        last: ImageBridgeError | None = None
+        for i in range(self._MAX_UPSTREAM_RETRIES + 1):
+            try:
+                return await attempt()
+            except ImageBridgeError as exc:
+                if (
+                    exc.status is not None
+                    and exc.status >= 500
+                    and i < self._MAX_UPSTREAM_RETRIES
+                ):
+                    last = exc
+                    logger.warning(
+                        "[WebChatGateway] image upstream %s; retry %d/%d",
+                        exc.status, i + 1, self._MAX_UPSTREAM_RETRIES,
+                    )
+                    await asyncio.sleep(self._RETRY_BACKOFF_SECONDS * (i + 1))
+                    continue
+                raise
+        assert last is not None  # loop exits only via return or raise
+        raise last
+
     async def _read_image_response(
         self,
         session: aiohttp.ClientSession,
@@ -290,6 +335,7 @@ class ImageBridge:
             raise ImageBridgeError(
                 "image_call_failed",
                 f"upstream {status}: {msg or self._model}",
+                status=status,
             )
         if not isinstance(payload, dict):
             raise ImageBridgeError(
@@ -373,10 +419,16 @@ class ImageBridge:
             "Content-Type": "application/json",
         }
         timeout = aiohttp.ClientTimeout(total=self._timeout_seconds)
-        try:
+
+        async def _attempt() -> ImageResult:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(url, json=body, headers=headers) as resp:
-                    return await self._read_image_response(session, resp, cleaned, eff_size)
+                    return await self._read_image_response(
+                        session, resp, cleaned, eff_size
+                    )
+
+        try:
+            return await self._post_with_retry(_attempt)
         except asyncio.TimeoutError as exc:
             raise ImageBridgeError("image_timeout") from exc
         except aiohttp.ClientError as exc:
@@ -429,10 +481,16 @@ class ImageBridge:
         # would break the boundary and the upload would fail.
         headers = {"Authorization": f"Bearer {self._api_key}"}
         timeout = aiohttp.ClientTimeout(total=self._timeout_seconds)
-        try:
+
+        async def _attempt() -> ImageResult:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(url, data=form, headers=headers) as resp:
-                    return await self._read_image_response(session, resp, cleaned, eff_size)
+                    return await self._read_image_response(
+                        session, resp, cleaned, eff_size
+                    )
+
+        try:
+            return await self._post_with_retry(_attempt)
         except asyncio.TimeoutError as exc:
             raise ImageBridgeError("image_timeout") from exc
         except aiohttp.ClientError as exc:

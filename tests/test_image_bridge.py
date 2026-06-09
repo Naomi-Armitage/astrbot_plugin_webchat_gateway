@@ -147,6 +147,29 @@ class _StubSession:
         return self._response
 
 
+class _SeqStubSession:
+    """ClientSession stub returning a SEQUENCE of responses across
+    successive .post() calls (later calls clamp to the last entry).
+    Exercises the upstream-5xx retry path."""
+
+    def __init__(self, responses):
+        self._responses = responses
+        self.calls = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    def post(self, url, *, json=None, data=None, headers=None):
+        r = self._responses[min(self.calls, len(self._responses) - 1)]
+        self.calls += 1
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+
 @pytest.fixture
 def patch_aiohttp(monkeypatch):
     """Swap aiohttp.ClientSession for the test stub. Returns a closure
@@ -271,13 +294,52 @@ class TestImageBridgeGenerate:
             ImageBridgeError,
         )
 
-        patch_aiohttp(_StubResponse(status=503, json_body={
+        session = patch_aiohttp(_StubResponse(status=503, json_body={
             "error": {"message": "service unavailable"},
         }))
         bridge = self._make_bridge()
+        bridge._RETRY_BACKOFF_SECONDS = 0  # no real sleep in tests
         with pytest.raises(ImageBridgeError) as exc:
             await bridge.generate("a cat")
         assert exc.value.code == "image_call_failed"
+        # 5xx is retried: initial attempt + 2 retries = 3 upstream POSTs.
+        assert len(session.calls) == 3
+
+    async def test_upstream_5xx_retried_then_succeeds(self, monkeypatch):
+        from astrbot_plugin_webchat_gateway.core import image_bridge
+
+        b64 = base64.b64encode(b"\x89PNG").decode()
+        seq = _SeqStubSession([
+            _StubResponse(status=500, json_body={"error": {"message": "no available channel"}}),
+            _StubResponse(status=200, json_body={"data": [{"b64_json": b64}]}),
+        ])
+        monkeypatch.setattr(
+            image_bridge.aiohttp, "ClientSession", lambda *a, **k: seq
+        )
+        bridge = self._make_bridge()
+        bridge._RETRY_BACKOFF_SECONDS = 0
+        result = await bridge.generate("a cat")
+        assert result.content  # succeeded on the retry
+        assert seq.calls == 2  # one 500 + one 200
+
+    async def test_upstream_4xx_not_retried(self, monkeypatch):
+        from astrbot_plugin_webchat_gateway.core import image_bridge
+        from astrbot_plugin_webchat_gateway.core.image_bridge import (
+            ImageBridgeError,
+        )
+
+        seq = _SeqStubSession([
+            _StubResponse(status=400, json_body={"error": {"message": "bad params"}}),
+        ])
+        monkeypatch.setattr(
+            image_bridge.aiohttp, "ClientSession", lambda *a, **k: seq
+        )
+        bridge = self._make_bridge()
+        bridge._RETRY_BACKOFF_SECONDS = 0
+        with pytest.raises(ImageBridgeError) as exc:
+            await bridge.generate("a cat")
+        assert exc.value.code == "image_call_failed"
+        assert seq.calls == 1  # 4xx is NOT retried
 
     async def test_empty_data_array_raises_empty_reply(self, patch_aiohttp):
         from astrbot_plugin_webchat_gateway.core.image_bridge import (
