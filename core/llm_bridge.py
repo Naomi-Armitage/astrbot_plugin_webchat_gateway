@@ -1,12 +1,16 @@
-"""LLM call bridge — ported from astrbot_plugin_webchat.
+"""LLM call bridge for the WebChat pipeline.
 
-Reuses persona, conversation_manager history, and llm_generate exactly like
-the original plugin so behavior matches the simple version.
+Chat (non-streaming + streaming) feeds prior turns to the provider as
+structured `contexts` and the persona via the `system_prompt` channel,
+calling `provider.text_chat` / `text_chat_stream` directly so both paths
+behave identically. Title generation is a self-contained one-off and
+still uses `llm_generate`.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import AsyncIterator, Sequence
 
 from astrbot.api import logger
@@ -190,60 +194,103 @@ class LlmBridge:
             )
             return None, None
 
-    # Hard cap on the rendered history slice (in CHAR count, not
-    # tokens — but at typical model packing of 2-4 chars/token, 8K
-    # chars maps to 2-4K tokens of *just* history before the prompt
-    # frame and the current user message are even appended). Without
-    # this guard, a token-side runaway (verbose model that keeps
-    # generating long replies, or pathological pasted content) could
-    # let the rendered history overflow the model's context window
-    # and trigger a provider 4xx mid-turn. The history slice is
-    # already CM-windowed by `history_turns` (page_size = turns*2)
-    # but a single turn can be megabytes if the user pasted a log
-    # dump — that one giant entry would dominate the prompt and
-    # squeeze out the system prompt + the current question.
+    # Coarse cap on the history slice fed back to the model, measured
+    # in CHARS of rendered text (not tokens — a blunt guard; real
+    # token budgeting is deferred). History is already turn-windowed by
+    # `history_turns` (last turns*2 messages), but a single turn can be
+    # megabytes if the user pasted a log dump; that one giant entry
+    # would dominate the context and squeeze out the system prompt +
+    # the current question, or push the request past the provider's
+    # context window into a mid-turn 4xx. Applied per-ENTRY: keep whole
+    # messages newest-first until the budget is exhausted, then drop
+    # the remaining older entries WHOLE — never bisecting a single
+    # message (a half-message is worse context than one fewer turn).
     _MAX_HISTORY_CHARS = 8000
 
-    async def _history_text(self, unified_origin: str, conversation_id: str) -> str:
-        if self._history_turns <= 0:
-            return ""
-        lines, _ = await self._context.conversation_manager.get_human_readable_context(
-            unified_msg_origin=unified_origin,
-            conversation_id=conversation_id,
-            page=1,
-            page_size=self._history_turns * 2,
-        )
-        if not lines:
-            return ""
-        ordered = list(reversed(lines))
-        joined = "\n".join(ordered)
-        if len(joined) > self._MAX_HISTORY_CHARS:
-            # Tail-keep: a conversation that ran past the cap loses the
-            # oldest turns, not the most recent ones. Continuity with
-            # what the user is asking right now is more useful than
-            # preserving a partial early turn. The cut may bisect a
-            # line; leave it raw rather than realigning to a newline
-            # boundary — provider tokenizers treat a half-line as a
-            # complete prefix and the model handles the implicit start
-            # fine (cleaner to occasionally render one truncated line
-            # than to lose another entire turn to alignment).
-            joined = joined[-self._MAX_HISTORY_CHARS:]
-        return joined
-
     @staticmethod
-    def _build_prompt(
-        *,
-        message: str,
-        system_prompt: str | None,
-        history: str,
-    ) -> str:
-        blocks: list[str] = []
-        if system_prompt:
-            blocks.append(f"[System Prompt]\n{system_prompt}")
-        if history:
-            blocks.append(f"[Recent Conversation Context]\n{history}")
-        blocks.append(f"[Current User Message]\n{message}")
-        return "\n\n".join(blocks)
+    def _entry_text_len(content) -> int:
+        """Approximate the rendered text length of a CM message's
+        `content`. Mirrors the two shapes AstrBot stores — a bare
+        string, or a list of segment dicts where text lives under
+        `{"text": ...}` (image / other parts contribute no text). Used
+        only for the coarse history budget, so non-text parts are
+        intentionally counted as 0."""
+        if isinstance(content, str):
+            return len(content)
+        if isinstance(content, list):
+            total = 0
+            for seg in content:
+                if isinstance(seg, dict):
+                    t = seg.get("text")
+                    if isinstance(t, str):
+                        total += len(t)
+            return total
+        return 0
+
+    async def _history_contexts(
+        self, unified_origin: str, conversation_id: str
+    ) -> list[dict]:
+        """Structured conversation history to feed back as `contexts`.
+
+        Reads the RAW provider-native records straight from AstrBot CM
+        (`get_conversation().history` — the same JSON the write path
+        persists via `add_message_pair`) instead of rendering them to
+        text. Passing these as `contexts=` preserves user/assistant
+        role boundaries and any multimodal `ImageURLPart` segments, so
+        the model sees a real multi-turn conversation rather than a
+        flattened transcript.
+
+        Windowing:
+          * empty when `history_turns <= 0`;
+          * keep the last `history_turns * 2` messages (≈ N exchanges);
+          * drop a trailing user message — the current turn's user text
+            is passed separately as `prompt=`, so a trailing user entry
+            would duplicate it. Normal /chat never hits this (the
+            current user turn isn't persisted until after the reply);
+            the regenerate path does (it rewrites CM history ending at
+            the user turn before calling), so this de-dupes it;
+          * apply the coarse `_MAX_HISTORY_CHARS` budget newest-first,
+            dropping older entries whole.
+        """
+        if self._history_turns <= 0:
+            return []
+        try:
+            conv = await self._context.conversation_manager.get_conversation(
+                unified_origin, conversation_id
+            )
+        except Exception:
+            logger.exception("[WebChatGateway] CM.get_conversation failed")
+            return []
+        if not conv:
+            return []
+        history_raw = getattr(conv, "history", None)
+        if isinstance(history_raw, str):
+            try:
+                parsed = json.loads(history_raw or "[]")
+            except (TypeError, ValueError):
+                parsed = []
+        else:
+            parsed = history_raw or []
+        if not isinstance(parsed, list):
+            return []
+        entries = [e for e in parsed if isinstance(e, dict)]
+        if not entries:
+            return []
+        entries = entries[-(self._history_turns * 2):]
+        if entries and str(entries[-1].get("role") or "").strip().lower() == "user":
+            entries = entries[:-1]
+        if not entries:
+            return []
+        budget = self._MAX_HISTORY_CHARS
+        kept_reversed: list[dict] = []
+        for entry in reversed(entries):
+            cost = self._entry_text_len(entry.get("content"))
+            if kept_reversed and cost > budget:
+                break
+            budget -= cost
+            kept_reversed.append(entry)
+        kept_reversed.reverse()
+        return kept_reversed
 
     async def generate_reply(
         self,
@@ -257,7 +304,7 @@ class LlmBridge:
         # Wrap the entire flow in a single timeout. Without this, slow
         # provider lookup / persona resolution / conversation_manager calls
         # could pin the per-token concurrency lock indefinitely while only
-        # the inner llm_generate had its own deadline.
+        # the inner provider.text_chat had its own deadline.
         try:
             return await asyncio.wait_for(
                 self._generate_reply_inner(
@@ -288,6 +335,10 @@ class LlmBridge:
         if not provider_id:
             raise RuntimeError("chat_provider_not_configured")
 
+        provider = self._context.get_provider_by_id(provider_id)
+        if provider is None:
+            raise RuntimeError("chat_provider_not_configured")
+
         persona_id, system_prompt = await self._resolve_persona()
 
         cm = self._context.conversation_manager
@@ -300,61 +351,28 @@ class LlmBridge:
                 persona_id=persona_id,
             )
 
-        history = await self._history_text(unified_origin, cid)
-        prompt = self._build_prompt(
-            message=message, system_prompt=system_prompt, history=history
-        )
+        contexts = await self._history_contexts(unified_origin, cid)
 
-        # AstrBot's `llm_generate` accepts image_urls on newer builds.
-        # Older builds reject the kwarg with TypeError — in that case
-        # fall back to grabbing the provider directly and calling
-        # `provider.text_chat(image_urls=...)`, which is the surface the
-        # streaming path uses (provider.text_chat_stream). Splitting on
-        # TypeError keeps real LLM-side failures (provider config, auth
-        # errors) on the original exception path.
+        # Unified low-level call (mirrors generate_reply_stream): the
+        # CURRENT user message goes as `prompt`, prior turns as
+        # structured `contexts`, and the persona via the real
+        # `system_prompt` channel — NOT inlined into the prompt text.
+        # `image_urls` is only included when present so older provider
+        # builds without the kwarg still serve text-only chats.
+        kwargs: dict[str, object] = {"prompt": message, "contexts": contexts}
+        if system_prompt:
+            kwargs["system_prompt"] = system_prompt
+        if image_urls:
+            kwargs["image_urls"] = image_urls
         try:
-            if image_urls:
-                try:
-                    resp = await self._context.llm_generate(
-                        chat_provider_id=provider_id,
-                        prompt=prompt,
-                        persona_id=persona_id,
-                        image_urls=image_urls,
-                    )
-                except TypeError:
-                    provider = self._context.get_provider_by_id(provider_id)
-                    if provider is None:
-                        raise RuntimeError("chat_provider_not_configured")
-                    # Pass the resolved system_prompt explicitly. Without
-                    # it, AstrBot's provider.text_chat would receive the
-                    # prompt body alone — the inline `[System Prompt]\n…`
-                    # block in `prompt` is documentation for the model,
-                    # NOT a substitute for the provider's actual system
-                    # prompt channel (which some backends route through a
-                    # separate SDK field). Skipping system_prompt here
-                    # silently dropped persona context on the
-                    # image+persona path — `llm_generate` would have
-                    # resolved persona_id internally, but the fallback
-                    # had no equivalent. The variable is already in
-                    # scope from `_resolve_persona()`.
-                    resp = await provider.text_chat(
-                        prompt=prompt,
-                        image_urls=image_urls,
-                        system_prompt=system_prompt,
-                    )
-            else:
-                resp = await self._context.llm_generate(
-                    chat_provider_id=provider_id,
-                    prompt=prompt,
-                    persona_id=persona_id,
-                )
+            resp = await provider.text_chat(**kwargs)
         except EmptyModelOutputError as exc:
             raise RuntimeError("empty_reply") from exc
-        # `llm_generate` may raise EmptyModelOutputError directly (some provider
-        # paths surface it that way); the existing `if not reply` guard below
-        # catches the case where it returns a response object with empty text.
-        # Both collapse into the same code so the handler can render them
-        # uniformly.
+        # `provider.text_chat` may raise EmptyModelOutputError directly (some
+        # provider paths surface it that way); the existing `if not reply`
+        # guard below catches the case where it returns a response object with
+        # empty text. Both collapse into the same code so the handler can
+        # render them uniformly.
         reply = (resp.completion_text or "").strip()
         if not reply:
             raise RuntimeError("empty_reply")
@@ -406,17 +424,21 @@ class LlmBridge:
                     persona_id=persona_id,
                 )
 
-            history = await self._history_text(unified_origin, cid)
-            prompt = self._build_prompt(
-                message=message, system_prompt=system_prompt, history=history
-            )
+            contexts = await self._history_contexts(unified_origin, cid)
 
             collected: list[str] = []
-            # Build the streaming kwargs lazily so older AstrBot builds
-            # without `image_urls` on text_chat_stream still work for
-            # text-only messages — the kwarg is only included when
-            # there's something to send.
-            stream_kwargs: dict[str, object] = {"prompt": prompt}
+            # Same shape as the non-streaming path: current message as
+            # `prompt`, prior turns as structured `contexts`, persona via
+            # the real `system_prompt` channel. The system_prompt /
+            # image_urls kwargs are only included when set so older
+            # provider builds without them still serve text-only /
+            # persona-less chats.
+            stream_kwargs: dict[str, object] = {
+                "prompt": message,
+                "contexts": contexts,
+            }
+            if system_prompt:
+                stream_kwargs["system_prompt"] = system_prompt
             if image_urls:
                 stream_kwargs["image_urls"] = image_urls
             try:
