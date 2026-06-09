@@ -429,16 +429,19 @@ class TestImageBridgeGenerate:
             "gpt-image-pro",
             "GPT-Image-2",  # case-insensitive
             "openai/gpt-image-2",  # gateway-prefixed
+            "gpt-img2",  # shorthand some gateways expose
+            "gpt_image_2",  # underscore-separated
         ],
     )
     async def test_gpt_image_family_all_skip_response_format(
         self, patch_aiohttp, model
     ):
-        """The detection is `"gpt-image" in model.lower()`, so the
-        whole family (current gpt-image-1 / gpt-image-2 / hypothetical
-        gpt-image-pro / case variants / gateway prefixes) classifies
-        correctly. Parametrise so a future model name in the same
-        family doesn't accidentally regress."""
+        """`_is_gpt_image_model` normalises separators + case, so the
+        whole family (gpt-image-1/2, hypothetical gpt-image-pro, case
+        variants, gateway prefixes, and `gpt-img2` / `gpt_image_2`
+        shorthands) classifies correctly and skips response_format.
+        Parametrise so a future model name in the same family doesn't
+        accidentally regress."""
         png = b"\x89PNG"
         b64 = base64.b64encode(png).decode()
         session = patch_aiohttp(_StubResponse(status=200, json_body={
@@ -472,6 +475,52 @@ class TestImageBridgeGenerate:
             await bridge.generate("a cat")
         assert exc.value.code == "image_call_failed"
         assert "Unknown parameter" in str(exc.value)
+
+
+# ---------------------------------------------------------------------
+# Model-family classification (drives /site → chat-client ratio selector)
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "model,is_gpt_image",
+    [
+        ("gpt-image-1", True),
+        ("gpt-image-2", True),
+        ("gpt-img2", True),  # shorthand — the reported failure mode
+        ("gpt-img-2", True),
+        ("gpt_image_2", True),  # underscore-separated
+        ("GPT-Image", True),  # case + no numeric suffix
+        ("openai/gpt-image-2", True),  # gateway-prefixed
+        ("dall-e-3", False),
+        ("dall-e-2", False),
+        ("gemini-image", False),  # unrelated provider — must stay DALL-E family
+    ],
+)
+def test_model_family_drives_allowed_sizes(model, is_gpt_image):
+    """`allowed_sizes()` is what /site hands the chat client's ratio
+    selector, so a misclassified model offers the wrong ratios (and the
+    bridge also wrongly sends `response_format`, 400-ing upstream). The
+    canonical `"gpt-image" in name` substring misses shorthand gateway
+    names like `gpt-img2`; the normalised predicate must catch them
+    while leaving `dall-e-*` / `gemini-image` on the DALL-E family."""
+    from astrbot_plugin_webchat_gateway.core.image_bridge import ImageBridge
+
+    bridge = ImageBridge(
+        enabled=True,
+        endpoint="https://api.openai.com/v1",
+        api_key="sk-test",
+        model=model,
+        size="1024x1024",
+        timeout_seconds=30,
+    )
+    sizes = bridge.allowed_sizes()
+    if is_gpt_image:
+        # gpt-image family: `auto` + the 1536-wide / 1536-tall pair.
+        assert sizes == ["auto", "1024x1024", "1536x1024", "1024x1536"]
+    else:
+        # DALL-E family: the 1792-long-edge landscape / portrait pair.
+        assert sizes == ["1024x1024", "1792x1024", "1024x1792"]
 
 
 # ---------------------------------------------------------------------

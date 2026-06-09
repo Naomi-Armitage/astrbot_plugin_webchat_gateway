@@ -181,7 +181,15 @@ class ImageBridge:
 
     @property
     def _is_gpt_image_model(self) -> bool:
-        return "gpt-image" in (self._model or "").lower()
+        # Normalise separators + case so shorthand gateway names
+        # (`gpt-img2`, `gpt-img-2`, `gpt_image_2`, `GPT-Image`) classify
+        # with the canonical `gpt-image-1/2`. A plain `"gpt-image" in
+        # name` substring misses `gpt-img2` → the model gets treated as
+        # DALL-E, offered DALL-E-only sizes via /site, and wrongly sent
+        # `response_format` upstream (400). Stays negative for `dall-e-*`
+        # and unrelated providers such as `gemini-image`.
+        norm = re.sub(r"[^a-z0-9]", "", (self._model or "").lower())
+        return "gptimage" in norm or "gptimg" in norm
 
     def _allowed_sizes(self) -> tuple[str, ...]:
         return _GPT_IMAGE_SIZES if self._is_gpt_image_model else _DALLE_SIZES
@@ -399,12 +407,13 @@ class ImageBridge:
         # `response_format` is NOT accepted by GPT-image-* models —
         # OpenAI explicitly returns 400 "Unknown parameter" for those.
         # Only DALL-E 2/3 accept the field, and they default to URL,
-        # so we force `b64_json` only when we know it's safe. Match
-        # by case-insensitive substring so `dall-e-3`, `Dall-E 3`,
-        # `gpt-image-1`, `Gemini-Image` etc. all classify correctly.
-        # The reference plugin (Railgun19457/astrbot_plugin_image_generation)
-        # uses the same predicate; matching it keeps the cross-plugin
-        # behaviour consistent on the same operator config.
+        # so we force `b64_json` only when we know it's safe. Family
+        # detection lives in `_is_gpt_image_model`, which normalises the
+        # name so `dall-e-3`, `gpt-image-1`, shorthand `gpt-img2`, and
+        # unrelated `gemini-image` all classify correctly. It is a
+        # superset of the reference plugin's plain-substring check
+        # (Railgun19457/astrbot_plugin_image_generation), additionally
+        # tolerating the `gpt-img*` shorthands some gateways expose.
         is_gpt_image = self._is_gpt_image_model
         body: dict[str, Any] = {
             "model": self._model,
