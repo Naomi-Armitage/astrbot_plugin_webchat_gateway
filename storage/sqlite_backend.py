@@ -397,6 +397,53 @@ class SqliteStorage(AbstractStorage):
             row = await cursor.fetchone()
         return int(row["count"]) if row else 0
 
+    async def try_reserve_daily_usage(
+        self, name: str, *, day: date, quota: int
+    ) -> int | None:
+        """Atomically reserve one unit of daily quota.
+
+        Returns the new count if the reservation fit under `quota`, or None
+        if the token is already at/over quota (no increment performed). The
+        read-check-increment runs as one critical section under `_write_lock`
+        (single-process model — same invariant `record_ip_failure` relies on),
+        so concurrent sessions of the same token can never exceed `quota`.
+        This replaces the cross-request serialization the per-token
+        concurrency lock used to provide for the old check-then-increment.
+        """
+        day_key = day.isoformat()
+        async with self._write_lock:
+            async with self._db.execute(
+                "SELECT count FROM daily_usage WHERE name = ? AND day = ?",
+                (name, day_key),
+            ) as cursor:
+                row = await cursor.fetchone()
+            current = int(row["count"]) if row else 0
+            if current >= quota:
+                return None
+            await self._db.execute(
+                "INSERT INTO daily_usage(name, day, count) VALUES(?, ?, 1) "
+                "ON CONFLICT(name, day) DO UPDATE SET count = count + 1",
+                (name, day_key),
+            )
+            await self._db.commit()
+        return current + 1
+
+    async def refund_daily_usage(self, name: str, *, day: date) -> None:
+        """Return one previously-reserved unit of daily quota (floored at 0).
+
+        Paired with `try_reserve_daily_usage` for turns that reserve but
+        don't consume — cancelled generations and failures that delivered no
+        content. A refund for a row that doesn't exist or is already at 0 is
+        a no-op.
+        """
+        async with self._write_lock:
+            await self._db.execute(
+                "UPDATE daily_usage SET count = count - 1 "
+                "WHERE name = ? AND day = ? AND count > 0",
+                (name, day.isoformat()),
+            )
+            await self._db.commit()
+
     async def get_today_usage_bulk(
         self, names: list[str], *, day: date
     ) -> dict[str, int]:

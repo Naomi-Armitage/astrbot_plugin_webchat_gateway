@@ -203,6 +203,19 @@ class AbstractStorage(ABC):
         """Atomically +1 today's counter and return the new value."""
 
     @abstractmethod
+    async def try_reserve_daily_usage(
+        self, name: str, *, day: date, quota: int
+    ) -> int | None:
+        """Atomically reserve one unit of quota: +1 and return the new count
+        iff it stays under `quota`, else return None without incrementing.
+        Race-safe so concurrent sessions of one token can't exceed quota."""
+
+    @abstractmethod
+    async def refund_daily_usage(self, name: str, *, day: date) -> None:
+        """Return one previously-reserved unit (floored at 0). No-op if the
+        counter is missing or already 0."""
+
+    @abstractmethod
     async def get_today_usage(self, name: str, *, day: date) -> int: ...
 
     @abstractmethod

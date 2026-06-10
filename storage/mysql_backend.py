@@ -427,6 +427,46 @@ class MysqlStorage(AbstractStorage):
                 row = await cur.fetchone()
         return int(row[0]) if row else 0
 
+    async def try_reserve_daily_usage(
+        self, name: str, *, day: date, quota: int
+    ) -> int | None:
+        """Atomically reserve one unit of daily quota; mirror of the SQLite
+        method. Returns the new count, or None if already at/over quota.
+
+        `SELECT ... FOR UPDATE` inside the write transaction locks the row
+        (and, under InnoDB REPEATABLE READ, the gap for a not-yet-existing
+        row) so two concurrent sessions of the same token serialize on the
+        read-check-increment and can never exceed `quota`.
+        """
+        async with self._write_tx() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT count FROM daily_usage "
+                    "WHERE name = %s AND day = %s FOR UPDATE",
+                    (name, day),
+                )
+                row = await cur.fetchone()
+                current = int(row[0]) if row else 0
+                if current >= quota:
+                    return None
+                await cur.execute(
+                    "INSERT INTO daily_usage(name, day, count) VALUES(%s, %s, 1) "
+                    "ON DUPLICATE KEY UPDATE count = count + 1",
+                    (name, day),
+                )
+        return current + 1
+
+    async def refund_daily_usage(self, name: str, *, day: date) -> None:
+        """Return one previously-reserved unit of daily quota (floored at 0).
+        No-op when the row is missing or already at 0."""
+        async with self._write_tx() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE daily_usage SET count = count - 1 "
+                    "WHERE name = %s AND day = %s AND count > 0",
+                    (name, day),
+                )
+
     async def get_today_usage_bulk(
         self, names: list[str], *, day: date
     ) -> dict[str, int]:
