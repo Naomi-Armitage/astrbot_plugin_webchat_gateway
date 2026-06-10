@@ -7,6 +7,21 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 
+def session_key(token: str, session: str) -> str:
+    """Composite concurrency-lock key scoping single-flight to one
+    ``(token, session)`` pair instead of the whole token.
+
+    Different sessions of the same token then run concurrently (a 180s image
+    generation in one session no longer blocks chat in another), while two
+    turns in the SAME session still serialize — which is what keeps history
+    ordering and the optimistic-echo dedup correct. NUL-separated so the key
+    can't collide across a token/session boundary (neither value contains a
+    NUL byte). Quota stays exact via the atomic reservation in ``core.quota``,
+    no longer relying on per-token serialization.
+    """
+    return f"{token}\x00{session}"
+
+
 class PerTokenConcurrency:
     """Allow at most one in-flight request per token name.
 
