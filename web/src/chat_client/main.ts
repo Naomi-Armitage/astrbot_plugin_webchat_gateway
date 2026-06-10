@@ -76,6 +76,11 @@ let UPLOADS_ENABLED = true;
 // and records the user turn without the image) — otherwise the attachment-key
 // mismatch in consumeIfDuplicate renders the user's question a second time.
 let IMG2IMG_SUPPORTED = false;
+// Max reference images the server accepts per img2img request (from /site's
+// `image_gen.max_reference_images`, already clamped server-side to the
+// per-message attachment cap). gpt-image takes several; dall-e-2 takes 1.
+// Default 1 so a server that doesn't report it degrades to single-reference.
+let IMG2IMG_MAX_REFS = 1;
 let IMAGE_SIZES: string[] = [];  // allowed output sizes for the configured model (from /site)
 const RESIZE_TARGET_LONG_EDGE = 2048;
 const RESIZE_JPEG_QUALITY = 0.85;
@@ -3239,7 +3244,12 @@ async function loadChatSite(): Promise<void> {
         max_attachments_per_message?: number;
         allowed_mime?: string[];
       };
-      image_gen?: { enabled?: boolean; img2img?: boolean; sizes?: string[] };
+      image_gen?: {
+        enabled?: boolean;
+        img2img?: boolean;
+        sizes?: string[];
+        max_reference_images?: number;
+      };
     };
     // 生图入口的可见性按服务端配置切换。服务端的 image_gen.enabled
     // 是基于 ImageBridge.enabled 读出来的（同时要求 endpoint + api_key
@@ -3252,6 +3262,10 @@ async function loadChatSite(): Promise<void> {
     // edits path. Gates whether send() keeps an attachment on an /image
     // command (see IMG2IMG_SUPPORTED comment).
     IMG2IMG_SUPPORTED = imageEnabled && !!(data.image_gen && data.image_gen.img2img);
+    {
+      const mr = data.image_gen?.max_reference_images;
+      IMG2IMG_MAX_REFS = typeof mr === "number" && mr > 0 ? Math.floor(mr) : 1;
+    }
     IMAGE_SIZES = imageEnabled && Array.isArray(data.image_gen?.sizes)
       ? data.image_gen!.sizes!.filter((s): s is string => typeof s === "string")
       : [];
@@ -4257,16 +4271,19 @@ async function send(): Promise<void> {
   // equal keys) and the question re-renders a second time.
   //   * img2img off → server ignores input images on the /images/generations
   //     endpoint → drop them all.
-  //   * img2img on  → server edits a SINGLE reference image (uses the first,
-  //     drops the rest) → keep only the first.
+  //   * img2img on  → server edits with up to IMG2IMG_MAX_REFS reference
+  //     images (gpt-image takes several; dall-e-2 one) → keep that many.
   // Either way surface a notice so the ignored image(s) aren't silent.
   if (isImageCommand(message) && readyAttachments.length) {
     if (!IMG2IMG_SUPPORTED) {
       readyAttachments = [];
       addMessageBubble("notice", "图片生成不支持参考图，已忽略所选图片。");
-    } else if (readyAttachments.length > 1) {
-      readyAttachments = readyAttachments.slice(0, 1);
-      addMessageBubble("notice", "图生图仅使用 1 张参考图，已忽略其余。");
+    } else if (readyAttachments.length > IMG2IMG_MAX_REFS) {
+      readyAttachments = readyAttachments.slice(0, IMG2IMG_MAX_REFS);
+      addMessageBubble(
+        "notice",
+        `图生图最多使用 ${IMG2IMG_MAX_REFS} 张参考图，已忽略其余。`,
+      );
     }
   }
   inputEl.value = "";
