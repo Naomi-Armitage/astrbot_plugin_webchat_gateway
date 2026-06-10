@@ -68,6 +68,11 @@ _DALLE_ASPECT = {
     "9:16": "1024x1792", "2:3": "1024x1792", "portrait": "1024x1792",
 }
 
+# OpenAI's gpt-image /images/edits accepts an array of up to 16 input
+# images; dall-e-2 takes exactly one. `max_reference_images` exposes this
+# ceiling per model family so the client + server can cap img2img uploads.
+_GPT_IMAGE_MAX_REFS = 16
+
 
 def is_image_command(message: str) -> bool:
     """Return True if `message` opens with a recognised image-gen prefix."""
@@ -170,6 +175,17 @@ class ImageBridge:
         # turned image-gen on, wired endpoint+key, AND opted into the
         # edits path (which requires an edits-capable model).
         return self.enabled and self._img2img
+
+    @property
+    def max_reference_images(self) -> int:
+        """Upper bound on reference images per img2img request — surfaced
+        via /site so the client caps uploads. 0 when img2img is off; 1 for
+        non-gpt-image edit models (dall-e-2 /images/edits takes a single
+        image); the OpenAI gpt-image array ceiling otherwise. The server
+        and client further clamp this to the per-message attachment cap."""
+        if not self.edit_enabled:
+            return 0
+        return _GPT_IMAGE_MAX_REFS if self._is_gpt_image_model else 1
 
     @property
     def model(self) -> str:
@@ -449,29 +465,46 @@ class ImageBridge:
             ) from exc
 
     async def edit(
-        self, prompt: str, image_bytes: bytes, mime: str, size: str | None = None
+        self,
+        prompt: str,
+        images: list[tuple[bytes, str]],
+        size: str | None = None,
     ) -> ImageResult:
         """Image-to-image via POST {endpoint}/images/edits (multipart).
 
-        Mirrors ``generate`` but uploads the user's reference image as the
-        edit base. Requires an edits-capable model (gpt-image-1, dall-e-2;
-        NOT dall-e-3) — gated by ``edit_enabled`` / the ``img2img`` config.
+        Mirrors ``generate`` but uploads the user's reference image(s) as
+        the edit base. Requires an edits-capable model (gpt-image-1/2,
+        dall-e-2; NOT dall-e-3) — gated by ``edit_enabled`` / the
+        ``img2img`` config. ``images`` is a list of ``(bytes, mime)``
+        pairs: the gpt-image family accepts several (sent as repeated
+        ``image[]`` parts), while dall-e-2 takes a single image, so a
+        non-gpt-image model uses only the first.
         """
         if not self.edit_enabled:
             raise ImageBridgeError("image_disabled")
         cleaned = self._clean_prompt(prompt)
-        if not image_bytes:
+        # Drop empties defensively; the caller already filters unreadable
+        # references, but a stray empty blob would 400 upstream.
+        refs = [(b, m) for (b, m) in (images or []) if b]
+        if not refs:
             raise ImageBridgeError("image_call_failed", "empty input image")
-        # img2img: keep the reference image's proportions. Map its aspect
-        # ratio onto the closest model-supported size; fall back to the
-        # per-request / operator default only if dimensions can't be read.
-        eff_size = self.resolve_size_for_reference(image_bytes) or self.resolve_size(size)
-        url = f"{self._endpoint}/images/edits"
         is_gpt_image = self._is_gpt_image_model
-        # Multipart form: the input image rides as a file part. Give it a
-        # filename with an extension matching its mime so upstream content
+        # dall-e-2 /images/edits takes exactly one image; only the gpt-image
+        # family accepts an array. Cap non-gpt-image to the first reference
+        # so an extra attachment can't 400 the request.
+        if not is_gpt_image:
+            refs = refs[:1]
+        # img2img: keep the (first) reference image's proportions. Map its
+        # aspect ratio onto the closest model-supported size; fall back to
+        # the per-request / operator default only if dimensions can't be read.
+        eff_size = self.resolve_size_for_reference(refs[0][0]) or self.resolve_size(size)
+        url = f"{self._endpoint}/images/edits"
+        # Multipart form: each input image rides as a file part with a
+        # filename whose extension matches its mime so upstream content
         # sniffing accepts it (OpenAI rejects unknown/extensionless parts).
-        ext = _MIME_TO_EXT.get((mime or "").lower(), ".png")
+        # A single image uses the scalar `image` field (works for both
+        # families and keeps the proven path byte-identical); multiple
+        # images use repeated `image[]` parts, which only gpt-image accepts.
         form = aiohttp.FormData()
         form.add_field("model", self._model)
         form.add_field("prompt", cleaned)
@@ -479,12 +512,17 @@ class ImageBridge:
         form.add_field("size", eff_size)
         if not is_gpt_image:
             form.add_field("response_format", "b64_json")
-        form.add_field(
-            "image",
-            image_bytes,
-            filename=f"image{ext}",
-            content_type=(mime or "image/png"),
-        )
+        single = len(refs) == 1
+        field_name = "image" if single else "image[]"
+        for i, (img_bytes, img_mime) in enumerate(refs):
+            ext = _MIME_TO_EXT.get((img_mime or "").lower(), ".png")
+            filename = f"image{ext}" if single else f"image{i}{ext}"
+            form.add_field(
+                field_name,
+                img_bytes,
+                filename=filename,
+                content_type=(img_mime or "image/png"),
+            )
         # No explicit Content-Type — aiohttp.FormData sets
         # multipart/form-data with the right boundary. Setting it manually
         # would break the boundary and the upload would fail.

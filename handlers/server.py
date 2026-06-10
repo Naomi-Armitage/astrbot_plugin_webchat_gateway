@@ -307,6 +307,15 @@ def build_app(deps: ServerDeps) -> web.Application:
                 and deps.chat.image_bridge.enabled
                 else []
             ),
+            # Per-img2img-request reference-image ceiling (per model family),
+            # read off the live bridge so a model change hot-reloads the
+            # client's reference cap. /site clamps it to the per-message
+            # attachment cap.
+            image_gen_max_refs_provider=lambda: (
+                deps.chat.image_bridge.max_reference_images
+                if deps.chat.image_bridge is not None
+                else 0
+            ),
         )
     )
     app.router.add_get(cfg.site_info_path, site["get_site"])

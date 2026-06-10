@@ -556,6 +556,14 @@ class TestImageBridgeEdit:
             names.append(type_options.get("name"))
         return names
 
+    @staticmethod
+    def _field_value(form, name):
+        # First value for `name` in the multipart form (None if absent).
+        for type_options, _headers, value in form._fields:
+            if type_options.get("name") == name:
+                return value
+        return None
+
     async def test_edit_disabled_when_img2img_off(self, patch_aiohttp):
         from astrbot_plugin_webchat_gateway.core.image_bridge import (
             ImageBridgeError,
@@ -566,7 +574,7 @@ class TestImageBridgeEdit:
         assert bridge.enabled is True
         assert bridge.edit_enabled is False
         with pytest.raises(ImageBridgeError) as exc:
-            await bridge.edit("make it watercolor", b"\x89PNG...", "image/png")
+            await bridge.edit("make it watercolor", [(b"\x89PNG...", "image/png")])
         assert exc.value.code == "image_disabled"
 
     async def test_edit_request_shape(self, patch_aiohttp):
@@ -579,18 +587,73 @@ class TestImageBridgeEdit:
             _StubResponse(status=200, json_body={"data": [{"b64_json": png_b64}]})
         )
         bridge = self._make_bridge()
-        result = await bridge.edit("make it watercolor", b"rawbytes", "image/png")
+        result = await bridge.edit(
+            "make it watercolor", [(b"rawbytes", "image/png")]
+        )
         assert result.content  # decoded bytes
         call = session.calls[0]
         # Multipart, not JSON, and aimed at the edits endpoint.
         assert call["url"].endswith("/images/edits")
         assert call["json"] is None
         assert call["data"] is not None
-        # The reference image rides as the `image` form field.
-        assert "image" in self._field_names(call["data"])
+        # A single reference rides as the scalar `image` field (not `image[]`),
+        # keeping the proven single-image path byte-identical.
+        names = self._field_names(call["data"])
+        assert "image" in names
+        assert "image[]" not in names
         # Authorization carried; Content-Type left to FormData's boundary.
         assert call["headers"].get("Authorization") == "Bearer sk-test-1234"
         assert "Content-Type" not in call["headers"]
+
+    async def test_edit_multi_reference_gpt_image_uses_image_array(
+        self, patch_aiohttp
+    ):
+        """gpt-image /images/edits accepts several reference images; the
+        bridge sends them as repeated `image[]` parts (one per reference)
+        and never the scalar `image` field. Regression guard for lifting
+        the single-reference 'v1' limit."""
+        png_b64 = (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4"
+            "nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
+        )
+        session = patch_aiohttp(
+            _StubResponse(status=200, json_body={"data": [{"b64_json": png_b64}]})
+        )
+        bridge = self._make_bridge(model="gpt-image-1")
+        await bridge.edit(
+            "blend these",
+            [
+                (b"img-a", "image/png"),
+                (b"img-b", "image/jpeg"),
+                (b"img-c", "image/webp"),
+            ],
+        )
+        names = self._field_names(session.calls[0]["data"])
+        assert names.count("image[]") == 3
+        assert "image" not in names
+        # gpt-image still skips response_format.
+        assert "response_format" not in names
+
+    async def test_edit_multi_reference_size_follows_first(self, patch_aiohttp):
+        """Output size keeps the FIRST reference's proportions (the base
+        image), regardless of later references' aspect ratios."""
+        png_b64 = (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4"
+            "nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
+        )
+        session = patch_aiohttp(
+            _StubResponse(status=200, json_body={"data": [{"b64_json": png_b64}]})
+        )
+        bridge = self._make_bridge(model="gpt-image-1")
+        # First ref is landscape (→ 1536x1024); second is square (→ 1024x1024).
+        await bridge.edit(
+            "blend",
+            [
+                (_png_bytes(1600, 900), "image/png"),
+                (_png_bytes(512, 512), "image/png"),
+            ],
+        )
+        assert self._field_value(session.calls[0]["data"], "size") == "1536x1024"
 
     async def test_edit_empty_input_image_raises(self, patch_aiohttp):
         from astrbot_plugin_webchat_gateway.core.image_bridge import (
@@ -600,11 +663,26 @@ class TestImageBridgeEdit:
         patch_aiohttp(_StubResponse(status=200, json_body={"data": []}))
         bridge = self._make_bridge()
         with pytest.raises(ImageBridgeError) as exc:
-            await bridge.edit("prompt", b"", "image/png")
+            await bridge.edit("prompt", [(b"", "image/png")])
         assert exc.value.code == "image_call_failed"
 
-    async def test_edit_dalle2_sends_response_format(self, patch_aiohttp):
-        # Non-gpt-image edit-capable model (dall-e-2) keeps response_format.
+    async def test_edit_all_empty_references_raise(self, patch_aiohttp):
+        from astrbot_plugin_webchat_gateway.core.image_bridge import (
+            ImageBridgeError,
+        )
+
+        patch_aiohttp(_StubResponse(status=200, json_body={"data": []}))
+        bridge = self._make_bridge(model="gpt-image-1")
+        with pytest.raises(ImageBridgeError) as exc:
+            await bridge.edit(
+                "prompt", [(b"", "image/png"), (b"", "image/jpeg")]
+            )
+        assert exc.value.code == "image_call_failed"
+
+    async def test_edit_dalle2_caps_to_single_reference(self, patch_aiohttp):
+        """dall-e-2 /images/edits takes exactly one image: extra references
+        are dropped, the scalar `image` field is used (not `image[]`), and
+        response_format is still sent for the DALL-E family."""
         png_b64 = (
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4"
             "nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
@@ -613,8 +691,41 @@ class TestImageBridgeEdit:
             _StubResponse(status=200, json_body={"data": [{"b64_json": png_b64}]})
         )
         bridge = self._make_bridge(model="dall-e-2")
-        await bridge.edit("prompt", b"rawbytes", "image/png")
-        assert "response_format" in self._field_names(session.calls[0]["data"])
+        await bridge.edit(
+            "prompt",
+            [(b"img-a", "image/png"), (b"img-b", "image/png")],
+        )
+        names = self._field_names(session.calls[0]["data"])
+        assert names.count("image") == 1
+        assert "image[]" not in names
+        assert "response_format" in names
+
+
+@pytest.mark.parametrize(
+    "model,img2img,expected",
+    [
+        ("gpt-image-2", True, 16),  # gpt-image array ceiling
+        ("gpt-img2", True, 16),  # shorthand still classifies as gpt-image
+        ("dall-e-2", True, 1),  # dall-e-2 /images/edits takes one image
+        ("gpt-image-2", False, 0),  # img2img opt-in off → no references
+    ],
+)
+def test_max_reference_images(model, img2img, expected):
+    """`max_reference_images` drives the /site cap the client uses to limit
+    reference uploads: the gpt-image array ceiling, 1 for dall-e-2, 0 when
+    img2img is off. (The server further clamps this to the attachment cap.)"""
+    from astrbot_plugin_webchat_gateway.core.image_bridge import ImageBridge
+
+    bridge = ImageBridge(
+        enabled=True,
+        endpoint="https://api.openai.com/v1",
+        api_key="sk-test",
+        model=model,
+        size="1024x1024",
+        timeout_seconds=30,
+        img2img=img2img,
+    )
+    assert bridge.max_reference_images == expected
 
 
 # ---------------------------------------------------------------------
@@ -743,7 +854,7 @@ class TestPerRequestSize:
         bridge = _bridge_for("gpt-image-1", size="1024x1024", img2img=True)
         # Landscape reference + a square request → reference wins.
         result = await bridge.edit(
-            "make it watercolor", _png_bytes(1600, 900), "image/png", size="1:1"
+            "make it watercolor", [(_png_bytes(1600, 900), "image/png")], size="1:1"
         )
         assert result.size == "1536x1024"
 

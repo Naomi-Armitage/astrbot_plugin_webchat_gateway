@@ -174,36 +174,48 @@ def make_chat_handler(deps: ChatDeps):
                     and deps.image_bridge is not None
                     and deps.image_bridge.edit_enabled
                 )
-                edit_bytes: bytes | None = None
-                edit_mime = "image/png"
+                # Reference images for the multipart edit, as (bytes, mime)
+                # pairs, plus the rows they came from (committed on success).
+                edit_images: list[tuple[bytes, str]] = []
+                ref_rows_used: list = []
                 # User-turn attachments to record — only the committed
-                # reference image, and only on the img2img success path.
+                # reference images, and only on the img2img success path.
                 image_user_attachments: list[dict] | None = None
                 if use_img2img:
-                    base_row = attachment_rows[0]
-                    # Read the reference bytes for the multipart upload. The
-                    # row is still committed=0 here; FileStore.read works on
-                    # the stored bytes regardless of the commit flag. We
-                    # commit only AFTER a successful edit (below), so a failed
-                    # turn leaves the row committed=0 → swept by the 1h orphan
-                    # GC (no leak, no release-on-failure bookkeeping needed).
-                    try:
-                        edit_bytes = await deps.file_store.read(
-                            storage_key=base_row.storage_key
-                        )
-                    except Exception:
-                        logger.exception(
-                            "[WebChatGateway] image edit: read base image failed"
-                        )
-                        edit_bytes = None
-                    if edit_bytes:
-                        edit_mime = base_row.mime or "image/png"
-                    else:
-                        # Couldn't read the reference → fall back to text2img.
+                    # gpt-image accepts several reference images; dall-e-2 one.
+                    # The bridge's per-family cap bounds how many we read; the
+                    # rows are already bounded by the per-message attachment cap.
+                    cap = deps.image_bridge.max_reference_images
+                    candidate_rows = attachment_rows[:cap] if cap else []
+                    # Read each reference's bytes for the multipart upload. Rows
+                    # are still committed=0 here; FileStore.read works regardless
+                    # of the commit flag. We commit only AFTER a successful edit
+                    # (below), so a failed turn leaves the rows committed=0 →
+                    # swept by the 1h orphan GC (no leak, no release bookkeeping).
+                    for row in candidate_rows:
+                        try:
+                            row_bytes = await deps.file_store.read(
+                                storage_key=row.storage_key
+                            )
+                        except Exception:
+                            logger.exception(
+                                "[WebChatGateway] image edit: read reference failed"
+                            )
+                            row_bytes = None
+                        if row_bytes:
+                            edit_images.append((row_bytes, row.mime or "image/png"))
+                            ref_rows_used.append(row)
+                    if not edit_images:
+                        # Couldn't read any reference → fall back to text2img.
                         use_img2img = False
                 # Release attachments we won't use: all of them when not doing
-                # img2img, or just the extras (v1 uses a single reference).
-                drop_rows = attachment_rows if not use_img2img else attachment_rows[1:]
+                # img2img, otherwise the ones beyond the cap / that failed to read.
+                used_ids = {r.file_id for r in ref_rows_used}
+                drop_rows = (
+                    attachment_rows
+                    if not use_img2img
+                    else [r for r in attachment_rows if r.file_id not in used_ids]
+                )
                 if drop_rows:
                     try:
                         await release_files_safely(
@@ -250,7 +262,7 @@ def make_chat_handler(deps: ChatDeps):
                     if use_img2img:
                         gen_task = asyncio.create_task(
                             deps.image_bridge.edit(
-                                prompt, edit_bytes, edit_mime, size=data.size
+                                prompt, edit_images, size=data.size
                             )
                         )
                     else:
@@ -376,19 +388,19 @@ def make_chat_handler(deps: ChatDeps):
                         committed_ok = await commit_attachments_or_release(
                             storage=deps.storage,
                             file_store=deps.file_store,
-                            rows=[attachment_rows[0]],
+                            rows=ref_rows_used,
                             log_label="image_edit_commit",
                             audit=deps.audit,
                         )
                     except Exception:
                         logger.exception(
-                            "[WebChatGateway] image edit: commit base raised"
+                            "[WebChatGateway] image edit: commit references raised"
                         )
                         committed_ok = False
                     if committed_ok:
-                        _base = attachment_rows[0]
                         image_user_attachments = [
-                            {"file_id": _base.file_id, "mime": _base.mime}
+                            {"file_id": r.file_id, "mime": r.mime}
+                            for r in ref_rows_used
                         ]
                 new_count = await deps.storage.increment_daily_usage(
                     token.name, day=today

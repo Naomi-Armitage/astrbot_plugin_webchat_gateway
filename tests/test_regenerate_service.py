@@ -453,9 +453,12 @@ class _StubImageResult:
 
 
 class _StubImageBridge:
-    def __init__(self, *, enabled=True, edit_enabled=False, model="gpt-image-1"):
+    def __init__(
+        self, *, enabled=True, edit_enabled=False, model="gpt-image-1", max_refs=16
+    ):
         self._enabled = enabled
         self._edit_enabled = edit_enabled
+        self._max_refs = max_refs
         self.model = model
         self.generate_calls: list[dict[str, Any]] = []
         self.edit_calls: list[dict[str, Any]] = []
@@ -468,6 +471,10 @@ class _StubImageBridge:
     def edit_enabled(self) -> bool:
         return self._edit_enabled
 
+    @property
+    def max_reference_images(self) -> int:
+        return self._max_refs if self._edit_enabled else 0
+
     async def generate(self, prompt, size=None):
         self.generate_calls.append({"prompt": prompt, "size": size})
         return _StubImageResult(
@@ -475,8 +482,8 @@ class _StubImageBridge:
             size=size or "1024x1024",
         )
 
-    async def edit(self, prompt, image_bytes, mime, size=None):
-        self.edit_calls.append({"prompt": prompt, "size": size, "mime": mime})
+    async def edit(self, prompt, images, size=None):
+        self.edit_calls.append({"prompt": prompt, "size": size, "images": images})
         return _StubImageResult(
             content=b"PNG", mime="image/png", prompt=prompt, size="1536x1024",
         )
@@ -490,6 +497,15 @@ def _user_image_entry(text: str, file_id: str) -> dict[str, Any]:
             {"type": "image_url", "image_url": {"url": "file:///r.png", "id": file_id}},
         ],
     }
+
+
+def _user_multi_image_entry(text: str, file_ids: list[str]) -> dict[str, Any]:
+    content: list[dict[str, Any]] = [{"type": "text", "text": text}]
+    for fid in file_ids:
+        content.append(
+            {"type": "image_url", "image_url": {"url": "file:///r.png", "id": fid}}
+        )
+    return {"role": "user", "content": content}
 
 
 async def _fake_persist(**kwargs: Any) -> dict[str, str]:
@@ -573,6 +589,37 @@ class TestRegenerateImage:
         assert bridge.edit_calls[0]["prompt"] == "a dog"
         assert terminal is not None
         assert terminal["attachments"] == [{"file_id": "img-1", "mime": "image/png"}]
+
+    async def test_img2img_regenerate_passes_all_references(self, monkeypatch):
+        """A multi-reference img2img turn re-runs edit() with ALL recovered
+        reference images, not just the first."""
+        from unittest.mock import AsyncMock as _AM
+
+        conv_mod = _conv_mod()
+        history = [
+            _user_multi_image_entry("/image a dog", ["ref-1", "ref-2", "ref-3"]),
+            _bot_entry(""),
+        ]
+        bridge = _StubImageBridge(enabled=True, edit_enabled=True)
+        service, cm, storage, audit, bus, llm = _build_service(
+            history=history, image_bridge=bridge, monkeypatch=monkeypatch,
+        )
+        monkeypatch.setattr(conv_mod, "persist_generated_image", _fake_persist)
+        service._build_image_assistant_entry = _AM(return_value=_bot_entry(""))
+        # Each recovered file_id reads back the same stub bytes; the service
+        # collects one (bytes, mime) per id and hands them all to edit().
+        service._read_reference_image = _AM(return_value=(b"refbytes", "image/png"))
+
+        _chunks, terminal = await _drive(
+            service.regenerate_assistant_message_stream(
+                token_name="alice", session_id="s1", message_index=1,
+                token_daily_quota=100,
+            )
+        )
+        assert llm.calls == []
+        assert bridge.generate_calls == []
+        assert len(bridge.edit_calls) == 1
+        assert len(bridge.edit_calls[0]["images"]) == 3
 
     async def test_image_disabled_falls_back_to_llm(self, monkeypatch):
         history = [_user_entry("/image cat"), _bot_entry("OLD")]

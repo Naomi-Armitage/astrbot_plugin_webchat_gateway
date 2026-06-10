@@ -62,6 +62,11 @@ class SiteDeps:
     # resolve_size validates it again. Default [] → FE falls back to a
     # single default ratio.
     image_gen_sizes_provider: Callable[[], list[str]] = lambda: []
+    # Live read of the per-img2img-request reference-image ceiling (per
+    # model family: 0 off / 1 dall-e-2 / gpt-image array ceiling). Clamped
+    # below to the per-message attachment cap and surfaced so the client
+    # caps how many reference images it sends. Default 0 → safe degrade.
+    image_gen_max_refs_provider: Callable[[], int] = lambda: 0
 
 
 def make_site_handlers(deps: SiteDeps):
@@ -116,12 +121,24 @@ def make_site_handlers(deps: SiteDeps):
             )
         except Exception:
             image_gen_sizes = []
+        try:
+            image_gen_max_refs = (
+                min(
+                    int(deps.image_gen_max_refs_provider()),
+                    deps.uploads_max_attachments_per_message,
+                )
+                if image_gen_img2img
+                else 0
+            )
+        except Exception:
+            image_gen_max_refs = 0
         payload = {
             **static_payload,
             "image_gen": {
                 "enabled": image_gen_enabled,
                 "img2img": image_gen_img2img,
                 "sizes": image_gen_sizes,
+                "max_reference_images": image_gen_max_refs,
             },
         }
         return json_response(

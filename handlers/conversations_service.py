@@ -1407,6 +1407,22 @@ class ConversationService:
             return None, "image/png"
         return data, (row.mime or "image/png")
 
+    async def _read_reference_images(
+        self, file_ids: list[str], *, token_name: str, session_id: str
+    ) -> list[tuple[bytes, str]]:
+        """Load multiple reference images' bytes for an img2img regenerate,
+        preserving order and dropping any that miss / fail the ownership
+        check. Built on ``_read_reference_image`` so the per-file checks
+        stay identical."""
+        images: list[tuple[bytes, str]] = []
+        for fid in file_ids:
+            data, mime = await self._read_reference_image(
+                fid, token_name=token_name, session_id=session_id
+            )
+            if data:
+                images.append((data, mime))
+        return images
+
     async def _build_image_assistant_entry(
         self, attachment: dict, *, token_name: str
     ) -> dict | None:
@@ -1485,13 +1501,14 @@ class ConversationService:
         use_edit = bool(last_user_file_ids) and bridge.edit_enabled
         try:
             if use_edit:
-                img_bytes, mime = await self._read_reference_image(
-                    last_user_file_ids[0],
+                ref_ids = last_user_file_ids[: bridge.max_reference_images]
+                images = await self._read_reference_images(
+                    ref_ids,
                     token_name=token_name,
                     session_id=session_id,
                 )
-                if img_bytes:
-                    result = await bridge.edit(prompt, img_bytes, mime, size=size)
+                if images:
+                    result = await bridge.edit(prompt, images, size=size)
                 else:
                     result = await bridge.generate(prompt, size=size)
             else:
