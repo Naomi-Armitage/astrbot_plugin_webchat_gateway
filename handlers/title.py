@@ -19,6 +19,7 @@ from astrbot.api import logger
 from ..core.audit import AuditLogger
 from ..core.ip_guard import IpGuard
 from ..core.llm_bridge import LlmBridge
+from ..core.quota import QuotaReservation
 from ..storage.base import AbstractStorage
 from .common import gate_request, json_response
 
@@ -123,17 +124,21 @@ def make_title_handler(deps: TitleDeps):
 
         token = gated.token
         today = date.today()
-        today_count = await deps.storage.get_today_usage(token.name, day=today)
-        if today_count >= token.daily_quota:
+        # Atomic reserve — titles race /chat (no per-token lock here), so a
+        # plain check-then-increment could overshoot the daily quota. Reserve
+        # one unit up front; refund if title generation fails, commit on success.
+        reservation = await QuotaReservation.open(
+            deps.storage,
+            name=token.name,
+            day=today,
+            quota=token.daily_quota,
+        )
+        if reservation is None:
             await deps.audit.write(
                 "quota_exceeded",
                 name=token.name,
                 ip=gated.ip,
-                detail={
-                    "today_count": today_count,
-                    "quota": token.daily_quota,
-                    "endpoint": "title",
-                },
+                detail={"quota": token.daily_quota, "endpoint": "title"},
             )
             return err(
                 {
@@ -160,6 +165,7 @@ def make_title_handler(deps: TitleDeps):
                 ip=gated.ip,
                 detail={"error": code[:200]},
             )
+            await reservation.close()
             return err({"error": "llm_call_failed"}, 503)
         except Exception as exc:
             logger.exception("[WebChatGateway] title generation failed")
@@ -169,10 +175,12 @@ def make_title_handler(deps: TitleDeps):
                 ip=gated.ip,
                 detail={"error": str(exc)[:200]},
             )
+            await reservation.close()
             return err({"error": "llm_call_failed"}, 503)
 
-        new_count = await deps.storage.increment_daily_usage(token.name, day=today)
-        remaining = max(0, token.daily_quota - new_count)
+        # Title produced → consume the reservation.
+        reservation.commit()
+        remaining = reservation.remaining
 
         await deps.audit.write(
             "title_generated",

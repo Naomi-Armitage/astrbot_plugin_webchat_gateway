@@ -110,6 +110,18 @@ class _StubStorage:
         self.usage_increments += 1
         return self.today_usage + self.usage_increments
 
+    async def try_reserve_daily_usage(
+        self, token_name: str, *, day, quota: int
+    ) -> int | None:
+        if self.today_usage + self.usage_increments >= quota:
+            return None
+        self.usage_increments += 1
+        return self.today_usage + self.usage_increments
+
+    async def refund_daily_usage(self, token_name: str, *, day) -> None:
+        if self.usage_increments > 0:
+            self.usage_increments -= 1
+
     async def upsert_session_meta(self, **kwargs: Any) -> None:
         self.session_meta_upserts.append(dict(kwargs))
 

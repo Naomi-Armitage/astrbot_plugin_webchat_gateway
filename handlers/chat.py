@@ -33,6 +33,8 @@ from ..core.image_bridge import (
     strip_image_prefix,
 )
 from ..core.llm_bridge import map_llm_error
+from ..core.quota import QuotaReservation
+from ..core.ratelimit import session_key
 from .chat_common import (  # noqa: F401  (ChatDeps re-exported for backward compat)
     ChatDeps,
     _HEARTBEAT_INTERVAL,
@@ -117,8 +119,12 @@ def make_chat_handler(deps: ChatDeps):
             len(attachment_rows),
         )
 
-        # 5. Concurrency lock
-        async with deps.concurrency.acquire(token.name) as acquired:
+        # 5. Concurrency lock — keyed by (token, session) so different
+        # sessions of the same token run concurrently; same-session turns
+        # still serialize (history ordering + optimistic-echo dedup).
+        async with deps.concurrency.acquire(
+            session_key(token.name, data.session_id)
+        ) as acquired:
             if not acquired:
                 await deps.audit.write(
                     "concurrent_block", name=token.name, ip=ip, detail=None
@@ -131,16 +137,25 @@ def make_chat_handler(deps: ChatDeps):
                     same_origin_host=same_host,
                 )
 
-            # 6. Daily quota check (read-then-increment is racy across processes,
-            # but per-token concurrency=1 guarantees serial use of a single token).
+            # 6. Daily quota — atomic reserve. Concurrent sessions of the
+            # same token no longer serialize through the per-token lock, so
+            # the old read-then-increment would race; reserving one unit up
+            # front (rejected when already at quota) keeps it exact. The
+            # reservation is refunded on any non-consuming exit (cancel /
+            # error) and committed once a reply is produced.
             today = date.today()
-            today_count = await deps.storage.get_today_usage(token.name, day=today)
-            if today_count >= token.daily_quota:
+            reservation = await QuotaReservation.open(
+                deps.storage,
+                name=token.name,
+                day=today,
+                quota=token.daily_quota,
+            )
+            if reservation is None:
                 await deps.audit.write(
                     "quota_exceeded",
                     name=token.name,
                     ip=ip,
-                    detail={"today_count": today_count, "quota": token.daily_quota},
+                    detail={"quota": token.daily_quota},
                 )
                 return json_response(
                     {
@@ -242,6 +257,7 @@ def make_chat_handler(deps: ChatDeps):
                             "prompt_len": len(data.message),
                         },
                     )
+                    await reservation.close()
                     return json_response(
                         {"error": "image_disabled"},
                         status=503,
@@ -251,6 +267,7 @@ def make_chat_handler(deps: ChatDeps):
                     )
                 prompt = strip_image_prefix(data.message)
                 if not prompt:
+                    await reservation.close()
                     return json_response(
                         {"error": "image_prompt_empty"},
                         status=400,
@@ -285,6 +302,7 @@ def make_chat_handler(deps: ChatDeps):
                             ip=ip,
                             detail={"prompt_len": len(prompt)},
                         )
+                        await reservation.close()
                         return web.Response(status=499)
                 except ImageBridgeError as exc:
                     status_code = 504 if exc.code == "image_timeout" else 502
@@ -317,6 +335,7 @@ def make_chat_handler(deps: ChatDeps):
                         # can show a one-line "失败: <upstream msg>"
                         # instead of an opaque error code.
                         error_body["detail"] = detail_str[:200]
+                    await reservation.close()
                     return json_response(
                         error_body,
                         status=status_code,
@@ -338,6 +357,7 @@ def make_chat_handler(deps: ChatDeps):
                             "prompt_len": len(prompt),
                         },
                     )
+                    await reservation.close()
                     return json_response(
                         {"error": "image_call_failed"},
                         status=502,
@@ -369,6 +389,7 @@ def make_chat_handler(deps: ChatDeps):
                             "prompt_len": len(prompt),
                         },
                     )
+                    await reservation.close()
                     return json_response(
                         {"error": "image_call_failed"},
                         status=500,
@@ -402,10 +423,9 @@ def make_chat_handler(deps: ChatDeps):
                             {"file_id": r.file_id, "mime": r.mime}
                             for r in ref_rows_used
                         ]
-                new_count = await deps.storage.increment_daily_usage(
-                    token.name, day=today
-                )
-                remaining = max(0, token.daily_quota - new_count)
+                # Image reply produced → the reservation is consumed.
+                reservation.commit()
+                remaining = reservation.remaining
                 # Empty assistant text — the image IS the reply. A
                 # placeholder string like "[已生成 1 张图片]" reads
                 # as awkward filler in the chat bubble, and the
@@ -479,6 +499,7 @@ def make_chat_handler(deps: ChatDeps):
                     # Commit failed AND the release attempt completed.
                     # 500 the request so the user retries; CM stays
                     # clean (no half-attached message_added).
+                    await reservation.close()
                     return json_response(
                         {"error": "internal_error"},
                         status=500,
@@ -534,6 +555,7 @@ def make_chat_handler(deps: ChatDeps):
                             else {"msg_len": len(data.message)}
                         ),
                     )
+                    await reservation.close()
                     return json_response(
                         {"error": code},
                         status=status,
@@ -563,9 +585,9 @@ def make_chat_handler(deps: ChatDeps):
                             "[WebChatGateway] release on llm-fail raised"
                         )
 
-            # 8. Increment usage (atomic)
-            new_count = await deps.storage.increment_daily_usage(token.name, day=today)
-            remaining = max(0, token.daily_quota - new_count)
+            # 8. Consume the reservation (atomic reserve happened up front).
+            reservation.commit()
+            remaining = reservation.remaining
 
             # Record the user/assistant pair into the chat-sync event log so
             # peer devices on the same token long-poll their way to the new

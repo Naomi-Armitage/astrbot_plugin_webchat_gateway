@@ -50,7 +50,8 @@ from ..core.image_bridge import (
     strip_image_prefix,
 )
 from ..core.llm_bridge import LlmBridge, map_llm_error
-from ..core.ratelimit import PerTokenConcurrency
+from ..core.quota import QuotaReservation
+from ..core.ratelimit import PerTokenConcurrency, session_key
 from ..storage.base import (
     UNSET,
     AbstractStorage,
@@ -203,7 +204,9 @@ class ConversationService:
         if self._concurrency is None:
             yield
             return
-        async with self._concurrency.acquire(token_name) as acquired:
+        async with self._concurrency.acquire(
+            session_key(token_name, session_id)
+        ) as acquired:
             if not acquired:
                 await self._audit.write(
                     "concurrent_block",
@@ -1244,16 +1247,28 @@ class ConversationService:
             session_id=session_id,
             ip=ip,
         ):
-            async for evt in self._regenerate_stream_inner(
+            # Reserve quota up front (atomic) and refund on any non-consuming
+            # exit — incl. the consumer closing the generator mid-stream. The
+            # inner generator commits once a reply is persisted.
+            reservation = await self._regen_reserve_quota(
                 token_name=token_name,
-                session_id=session_id,
-                message_index=message_index,
-                username=username,
-                token_daily_quota=token_daily_quota,
                 ip=ip,
-                size=size,
-            ):
-                yield evt
+                token_daily_quota=token_daily_quota,
+            )
+            try:
+                async for evt in self._regenerate_stream_inner(
+                    token_name=token_name,
+                    session_id=session_id,
+                    message_index=message_index,
+                    username=username,
+                    token_daily_quota=token_daily_quota,
+                    ip=ip,
+                    size=size,
+                    reservation=reservation,
+                ):
+                    yield evt
+            finally:
+                await reservation.close()
 
     async def _emit_regen_truncate_events(
         self,
@@ -1482,8 +1497,7 @@ class ConversationService:
         truncated_history: list[Any],
         raw_history: list[Any],
         message_index: int,
-        today: date,
-        today_count: int,
+        reservation: QuotaReservation,
         token_daily_quota: int,
         ip: str | None,
     ) -> AsyncIterator[dict]:
@@ -1552,16 +1566,9 @@ class ConversationService:
             )
             raise ServiceError("regenerate_failed", status=500) from None
 
-        try:
-            new_count = await self._storage.increment_daily_usage(
-                token_name, day=today
-            )
-        except Exception:
-            logger.exception(
-                "[WebChatGateway] increment_daily_usage during regen image failed"
-            )
-            new_count = today_count + 1
-        remaining = max(0, token_daily_quota - new_count)
+        # Image persisted → consume the reservation.
+        reservation.commit()
+        remaining = reservation.remaining
 
         now = self._now()
         new_rendered = _normalize_history(final_history)
@@ -1612,6 +1619,7 @@ class ConversationService:
         token_daily_quota: int,
         ip: str | None,
         size: str | None = None,
+        reservation: QuotaReservation,
     ) -> AsyncIterator[dict]:
         raw_history, cid, target_raw_idx, _target_entry, target_role = (
             await self._resolve_target_raw_index(
@@ -1648,12 +1656,8 @@ class ConversationService:
         if not last_user_text and not last_user_file_ids:
             raise ServiceError("message_not_found", status=404)
 
-        today, today_count = await self._regen_check_daily_quota(
-            token_name=token_name,
-            ip=ip,
-            token_daily_quota=token_daily_quota,
-        )
-
+        # Quota was reserved by the caller (regenerate_assistant_message_stream)
+        # before this generator ran, so the work below is already gated.
         # Resolve attachments to provider-visible local paths so the
         # regenerate sees the same multimodal context the original /chat
         # call did. Done AFTER the quota gate so a quota-blocked
@@ -1696,8 +1700,7 @@ class ConversationService:
                 truncated_history=truncated_history,
                 raw_history=raw_history,
                 message_index=message_index,
-                today=today,
-                today_count=today_count,
+                reservation=reservation,
                 token_daily_quota=token_daily_quota,
                 ip=ip,
             ):
@@ -1760,8 +1763,7 @@ class ConversationService:
             truncated_history=truncated_history,
             raw_history=raw_history,
             message_index=message_index,
-            today=today,
-            today_count=today_count,
+            reservation=reservation,
             token_daily_quota=token_daily_quota,
             ip=ip,
         )
@@ -1820,44 +1822,36 @@ class ConversationService:
         )
         return truncated_history, umo
 
-    async def _regen_check_daily_quota(
+    async def _regen_reserve_quota(
         self,
         *,
         token_name: str,
         ip: str | None,
         token_daily_quota: int,
-    ) -> tuple[date, int]:
-        """Daily quota gate for `_regenerate_stream_inner`.
-
-        Runs BEFORE any side effect — a 429 here must not leave CM
-        truncated, attachments released, or events emitted. Ordering
-        matches /chat. Returns `(today, today_count)` on pass; raises
-        `ServiceError("quota_exceeded", status=429)` on block (after
-        writing the matching audit event).
+    ) -> QuotaReservation:
+        """Atomically reserve one quota unit for a regenerate, BEFORE any
+        side effect — a 429 here must not leave CM truncated, attachments
+        released, or events emitted. Concurrent sessions of the same token no
+        longer serialize through the per-token lock, so the reservation
+        (rejected when already at quota) is what keeps the count exact. The
+        caller refunds on any non-consuming exit; the inner generator commits
+        on success. Raises ``ServiceError("quota_exceeded", 429)`` when full.
         """
-        today = date.today()
-        try:
-            today_count = await self._storage.get_today_usage(
-                token_name, day=today
-            )
-        except Exception:
-            logger.exception(
-                "[WebChatGateway] get_today_usage during regenerate failed"
-            )
-            today_count = 0
-        if today_count >= token_daily_quota:
+        reservation = await QuotaReservation.open(
+            self._storage,
+            name=token_name,
+            day=date.today(),
+            quota=token_daily_quota,
+        )
+        if reservation is None:
             await self._audit.write(
                 "quota_exceeded",
                 name=token_name,
                 ip=ip,
-                detail={
-                    "today_count": today_count,
-                    "quota": token_daily_quota,
-                    "operation": "regenerate",
-                },
+                detail={"quota": token_daily_quota, "operation": "regenerate"},
             )
             raise ServiceError("quota_exceeded", status=429)
-        return today, today_count
+        return reservation
 
     async def _regen_finalize_assistant(
         self,
@@ -1870,8 +1864,7 @@ class ConversationService:
         truncated_history: list[Any],
         raw_history: list[Any],
         message_index: int,
-        today: date,
-        today_count: int,
+        reservation: QuotaReservation,
         token_daily_quota: int,
         ip: str | None,
     ) -> int:
@@ -1911,17 +1904,9 @@ class ConversationService:
             )
             raise ServiceError("regenerate_failed", status=500) from None
 
-        # Increment quota AFTER the CM write succeeds.
-        try:
-            new_count = await self._storage.increment_daily_usage(
-                token_name, day=today
-            )
-        except Exception:
-            logger.exception(
-                "[WebChatGateway] increment_daily_usage during regenerate failed"
-            )
-            new_count = today_count + 1
-        remaining = max(0, token_daily_quota - new_count)
+        # Consume the reservation AFTER the CM write succeeds.
+        reservation.commit()
+        remaining = reservation.remaining
 
         # Update session meta — net message count is unchanged (delete 1,
         # add 1) but updated_at + preview need to refresh. The new
