@@ -43,7 +43,7 @@ from astrbot.api import logger
 
 from .audit import AuditLogger
 from .file_lifecycle import release_files_safely
-from .ratelimit import PerTokenConcurrency
+from .ratelimit import PerTokenConcurrency, session_key
 from .stream_buffer import BufferFullError, StreamBuffer, StreamBufferEntry
 
 if TYPE_CHECKING:
@@ -111,6 +111,11 @@ class StreamHandle:
     # 90-day cascade prune runs, which is a quota leak we accept in
     # exchange for not breaking already-rendered peer UI.
     user_message_emitted: bool = False
+    # The atomic daily-quota reservation made when the stream opened. The
+    # HTTP handler commits it on a content-delivering terminal (close_ok /
+    # close_incomplete); close_failed refunds it. None until reserved — and
+    # for the quota_exceeded close_failed, which fires before any reserve.
+    reservation: Any = None
     _used: bool = field(default=False, repr=False)
 
 
@@ -317,8 +322,11 @@ class StreamRegistry:
                 stream_id,
             )
             return None
+        # Lock keyed by (token, session) so different sessions of the same
+        # token stream concurrently; same-session stays single-flight.
+        lock_key = session_key(token_name, session_id)
         acquired = await self._concurrency.acquire_with_id(
-            token_name, stream_id
+            lock_key, stream_id
         )
         if not acquired:
             return None
@@ -344,7 +352,7 @@ class StreamRegistry:
             )
             try:
                 await asyncio.shield(
-                    self._concurrency.release(token_name, stream_id)
+                    self._concurrency.release(lock_key, stream_id)
                 )
             except Exception:
                 logger.exception(
@@ -363,7 +371,7 @@ class StreamRegistry:
             # idempotent — a no-op if the holder doesn't match.
             try:
                 await asyncio.shield(
-                    self._concurrency.release(token_name, stream_id)
+                    self._concurrency.release(lock_key, stream_id)
                 )
             except Exception:
                 logger.exception(
@@ -524,6 +532,11 @@ class StreamRegistry:
         consumption) since this path doesn't persist the user message
         to CM.
         """
+        # Refund the quota reservation (if any) — a no-content terminal
+        # consumed nothing. Idempotent and a no-op once a content-delivering
+        # close committed it, so defensive double-closes stay correct.
+        if handle.reservation is not None:
+            await handle.reservation.close()
         await self._release_attached_files(handle)
         await self._close(
             handle,
@@ -679,7 +692,8 @@ class StreamRegistry:
             try:
                 await asyncio.shield(
                     self._concurrency.release(
-                        handle.token_name, handle.stream_id
+                        session_key(handle.token_name, handle.session_id),
+                        handle.stream_id,
                     )
                 )
             except Exception:

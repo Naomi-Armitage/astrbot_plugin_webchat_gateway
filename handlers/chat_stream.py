@@ -17,6 +17,7 @@ from aiohttp import web
 from astrbot.api import logger
 
 from ..core.image_bridge import is_image_command
+from ..core.quota import QuotaReservation
 from ..core.stream_registry import STREAM_ID_PATTERN
 from .chat_common import (
     ChatDeps,
@@ -64,35 +65,36 @@ async def _open_stream_or_429(
     return handle_obj
 
 
-async def _check_daily_quota_or_429(
+async def _reserve_daily_quota_or_429(
     deps: ChatDeps,
     handle_obj,
     prepared,
     today,
 ):
-    """Check the per-token daily quota under the registry lock, before
-    any SSE byte hits the wire. Returns the current `today_count` on
-    success, or a JSON 429 Response when the quota is already exhausted
-    (the handle is `close_failed("quota_exceeded")` first so the lock
-    releases and any peer subscriber sees the terminal frame).
+    """Atomically reserve one quota unit under the registry lock, before any
+    SSE byte hits the wire. Concurrent sessions of the same token no longer
+    serialize through the per-token lock, so a plain check-then-increment
+    would race; reserving up front keeps the daily count exact.
+
+    On success, attaches the reservation to the handle (committed by the HTTP
+    handler on a content-delivering close, refunded by `close_failed`) and
+    returns it. When already at quota, `close_failed("quota_exceeded")` first
+    (releases the lock + lets any peer subscriber see the terminal frame) and
+    returns a JSON 429 Response.
     """
-    try:
-        today_count = await deps.storage.get_today_usage(
-            prepared.token.name, day=today
-        )
-    except Exception:
-        logger.exception("[WebChatGateway] get_today_usage failed")
-        today_count = 0
-    if today_count >= prepared.token.daily_quota:
+    reservation = await QuotaReservation.open(
+        deps.storage,
+        name=prepared.token.name,
+        day=today,
+        quota=prepared.token.daily_quota,
+    )
+    if reservation is None:
         await deps.registry.close_failed(handle_obj, error_code="quota_exceeded")
         await deps.audit.write(
             "quota_exceeded",
             name=prepared.token.name,
             ip=prepared.ip,
-            detail={
-                "today_count": today_count,
-                "quota": prepared.token.daily_quota,
-            },
+            detail={"quota": prepared.token.daily_quota},
         )
         return json_response(
             {
@@ -105,7 +107,8 @@ async def _check_daily_quota_or_429(
             allowed_origins=prepared.allowed,
             same_origin_host=prepared.same_host,
         )
-    return today_count
+    handle_obj.reservation = reservation
+    return reservation
 
 
 async def _resolve_attachment_image_urls(file_store, attachment_rows) -> list[str]:
@@ -287,15 +290,15 @@ def make_chat_stream_handler(deps: ChatDeps):
                 task=driver_task,
             )
 
-        # Step 6: quota check — under the registry lock, before any SSE
-        # bytes hit the wire so we can still return a JSON 429.
+        # Step 6: quota — atomic reserve under the registry lock, before any
+        # SSE bytes hit the wire so we can still return a JSON 429. Committed
+        # on a content-delivering close, refunded by close_failed.
         today = date.today()
-        quota_check = await _check_daily_quota_or_429(
+        reservation = await _reserve_daily_quota_or_429(
             deps, handle_obj, prepared, today
         )
-        if isinstance(quota_check, web.Response):
-            return quota_check
-        today_count = quota_check
+        if isinstance(reservation, web.Response):
+            return reservation
 
         # Step 7: open SSE response. (Driver registration moved up to
         # immediately after open() — see the block above.)
@@ -563,10 +566,8 @@ def make_chat_stream_handler(deps: ChatDeps):
                 if code == "llm_timeout":
                     if collected:
                         # Aborted with content — persist as incomplete.
-                        new_count = await deps.storage.increment_daily_usage(
-                            token.name, day=today
-                        )
-                        remaining = max(0, token.daily_quota - new_count)
+                        reservation.commit()
+                        remaining = reservation.remaining
                         await deps.registry.close_incomplete(
                             handle_obj,
                             user_text=data.message,
@@ -640,10 +641,8 @@ def make_chat_stream_handler(deps: ChatDeps):
                         return response
                     logger.exception("[WebChatGateway] LLM stream failed")
                     if collected:
-                        new_count = await deps.storage.increment_daily_usage(
-                            token.name, day=today
-                        )
-                        remaining = max(0, token.daily_quota - new_count)
+                        reservation.commit()
+                        remaining = reservation.remaining
                         await deps.registry.close_incomplete(
                             handle_obj,
                             user_text=data.message,
@@ -705,13 +704,8 @@ def make_chat_stream_handler(deps: ChatDeps):
                 if not terminal_emitted:
                     if collected:
                         # Best-effort partial persist on shutdown.
-                        try:
-                            new_count = await deps.storage.increment_daily_usage(
-                                token.name, day=today
-                            )
-                            remaining = max(0, token.daily_quota - new_count)
-                        except Exception:
-                            remaining = 0
+                        reservation.commit()
+                        remaining = reservation.remaining
                         await deps.registry.close_incomplete(
                             handle_obj,
                             user_text=data.message,
@@ -731,10 +725,8 @@ def make_chat_stream_handler(deps: ChatDeps):
                 logger.exception("[WebChatGateway] LLM stream failed")
                 last_seq = max(handle_obj.next_seq, last_appended_seq + 1)
                 if collected:
-                    new_count = await deps.storage.increment_daily_usage(
-                        token.name, day=today
-                    )
-                    remaining = max(0, token.daily_quota - new_count)
+                    reservation.commit()
+                    remaining = reservation.remaining
                     await deps.registry.close_incomplete(
                         handle_obj,
                         user_text=data.message,
@@ -814,16 +806,9 @@ def make_chat_stream_handler(deps: ChatDeps):
                     )
                 return response
 
-            try:
-                new_count = await deps.storage.increment_daily_usage(
-                    token.name, day=today
-                )
-            except Exception:
-                logger.exception(
-                    "[WebChatGateway] increment_daily_usage failed; persisting anyway"
-                )
-                new_count = today_count + 1
-            remaining = max(0, token.daily_quota - new_count)
+            # Full reply delivered → consume the reservation.
+            reservation.commit()
+            remaining = reservation.remaining
             await deps.registry.close_ok(
                 handle_obj,
                 user_text=data.message,
