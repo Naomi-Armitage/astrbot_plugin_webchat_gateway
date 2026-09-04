@@ -2913,6 +2913,17 @@ async function probeLongPoll(): Promise<void> {
 function onVisibilityChange(): void {
   if (document.hidden) {
     abortInflightLongPoll();
+    // Also abort any active SSE stream. When the page is backgrounded,
+    // browsers may throttle network connections, causing SSE to drop.
+    // Explicitly aborting here ensures the drop is recognized as a
+    // user-initiated cancel (isAbort = true in attachStreamingBubble's
+    // catch block) rather than a network error, preventing false-positive
+    // "请求失败: internal_error" bubbles. The PendingStream is preserved
+    // (if streamId was seen) and will resume when the page returns to
+    // foreground via the attemptResumeOnLoad path below.
+    if (sync.streamAbort) {
+      sync.streamAbort.abort();
+    }
   } else if (!sync.stopped) {
     if (sync.transport === "live") void runLongPoll();
     else if (sync.transport === "polling") void shortPollOnce();
