@@ -28,6 +28,22 @@ EVENT_HISTORY_CLEARED = "history_cleared"
 EVENT_STREAM_STARTED = "stream_started"
 EVENT_STREAM_ENDED = "stream_ended"
 
+# Drop (multi-device self-to-self transfer, no LLM) — separate event
+# family so the chat client's applyEvent can ignore them wholesale and
+# the Drop panel consumes only these. `session_id` on every Drop event
+# is the reserved literal "drop" (see handlers/drop.py DROP_SESSION_ID).
+# Payload of drop_message_added is the same wire dict the /drop/messages
+# list returns for one row — one schema, three consumers (POST response,
+# list endpoint, long-poll).
+EVENT_DROP_MESSAGE_ADDED = "drop_message_added"
+EVENT_DROP_MESSAGE_DELETED = "drop_message_deleted"
+EVENT_DROP_HISTORY_CLEARED = "drop_history_cleared"
+
+# The reserved Drop pseudo-session. Regular chat endpoints reject this
+# session_id (reserved_session) so ordinary conversations can't collide
+# with the Drop file namespace (webchat_files.session_id = 'drop').
+DROP_SESSION_ID = "drop"
+
 
 def _extract_text(content: Any) -> str:
     """Pull human-readable text out of a CM message record.
@@ -167,6 +183,10 @@ __all__ = [
     "EVENT_HISTORY_CLEARED",
     "EVENT_STREAM_STARTED",
     "EVENT_STREAM_ENDED",
+    "EVENT_DROP_MESSAGE_ADDED",
+    "EVENT_DROP_MESSAGE_DELETED",
+    "EVENT_DROP_HISTORY_CLEARED",
+    "DROP_SESSION_ID",
     "_extract_text",
     "_extract_attachment_file_ids",
     "_renderable_entry",

@@ -39,6 +39,7 @@ plugin's `_start`/`_stop`. Each sweep:
 from __future__ import annotations
 
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -47,10 +48,11 @@ from astrbot.api import logger
 from .file_lifecycle import release_files_safely
 
 if TYPE_CHECKING:
-    from ..storage.base import AbstractStorage
+    from ..storage.base import AbstractStorage, FileRow
     from .cookie_logout import CookieLogoutTracker
     from .event_bus import EventBus
     from .file_store import FileStore
+    from .ratelimit import PerTokenUploadGate
 
 
 class _CMLike(Protocol):
@@ -81,6 +83,11 @@ class PruneRetentionConfig:
     upload_orphan_retention_seconds: int = 3600
     ip_failures_retention_seconds: int = 24 * 3600
     audit_retention_seconds: int = 7 * 86400
+    # Drop soft-deleted messages are hard-deleted (and their files
+    # released) after this many days. 0 disables the sweep entirely —
+    # soft-deleted rows stay until the user clears the history
+    # themselves (memo semantics, the default).
+    drop_deleted_retention_seconds: int = 0
 
 
 class PruneOrchestrator:
@@ -95,6 +102,7 @@ class PruneOrchestrator:
         config: PruneRetentionConfig,
         cookie_logout_tracker: CookieLogoutTracker | None = None,
         event_bus: EventBus | None = None,
+        upload_gate: PerTokenUploadGate | None = None,
     ) -> None:
         self._storage = storage
         self._file_store = file_store
@@ -102,6 +110,20 @@ class PruneOrchestrator:
         self._cfg = config
         self._cookie_logout_tracker = cookie_logout_tracker
         self._event_bus = event_bus
+        self._upload_gate = upload_gate
+
+    @asynccontextmanager
+    async def _drop_mutation_gate(self, token_name: str):
+        """Serialize Drop retention with upload/send/clear mutations.
+
+        The gate is optional for isolated/legacy test harnesses. Production
+        wiring passes the same per-token gate used by the HTTP handlers.
+        """
+        if self._upload_gate is None:
+            yield
+            return
+        async with self._upload_gate.acquire(token_name):
+            yield
 
     async def run_iteration(self) -> None:
         """Single sweep. Public for testability.
@@ -207,10 +229,35 @@ class PruneOrchestrator:
             deleted_meta_before_ts=now - self._cfg.deleted_meta_retention_seconds,
             exclude_sessions=cm_failed or None,
         )
-        if events_pruned or meta_pruned or files_to_delete or sessions_purged or cm_failed:
+
+        # Step 6b: Drop retention sweep. Soft-deleted Drop messages past
+        # the configured window are hard-deleted and their files released.
+        # Files first (storage-first/DB-second is enforced inside
+        # release_files_safely), rows second — a release failure keeps the
+        # message row visible to the next sweep for retry. retention=0
+        # (memo semantics) skips the whole pass — soft-deleted rows stay
+        # until an explicit clear_drop_history.
+        drop_removed = 0
+        drop_files_deleted = 0
+        if self._cfg.drop_deleted_retention_seconds > 0:
+            try:
+                drop_removed, drop_files_deleted = await self._run_drop_retention(
+                    now=now
+                )
+                # The reference-aware helper above owns this pass.
+            except Exception:
+                logger.exception(
+                    "[WebChatGateway] drop retention sweep failed"
+                )
+
+        if (
+            events_pruned or meta_pruned or files_to_delete or sessions_purged
+            or cm_failed or drop_removed or drop_files_deleted
+        ):
             logger.info(
                 "[WebChatGateway] chat-sync prune: events=%d meta=%d "
-                "files=%d/%d cm_cleared=%d cm_failed=%d files_protected=%d",
+                "files=%d/%d cm_cleared=%d cm_failed=%d files_protected=%d "
+                "drop_msgs=%d drop_files=%d",
                 events_pruned,
                 meta_pruned,
                 files_deleted,
@@ -218,7 +265,108 @@ class PruneOrchestrator:
                 sessions_purged,
                 len(cm_failed),
                 files_protected,
+                drop_removed,
+                drop_files_deleted,
             )
+
+    async def _drop_reference_count(self, row: Any) -> int | None:
+        """Return the current Drop reference count for one file.
+
+        The count method is intentionally optional: older third-party
+        backends may not implement it. In that case a file-bearing message
+        is left in place rather than guessing that the file is safe to
+        release. Text-only rows can still be purged normally.
+        """
+        counter = getattr(self._storage, "count_drop_file_references", None)
+        if not callable(counter):
+            return None
+        try:
+            return int(
+                await counter(token_name=row.token_name, file_id=row.file_id)
+            )
+        except Exception:
+            logger.exception(
+                "[WebChatGateway] drop retention reference count failed file=%s",
+                row.file_id,
+            )
+            return None
+
+    async def _run_drop_retention(self, *, now: int) -> tuple[int, int]:
+        """Purge aged Drop rows without releasing a multiply-referenced file.
+
+        A file_id may be attached to several messages (including messages
+        that are not old enough for this pass). We process rows one by one:
+        when more than one reference remains, only the current message is
+        hard-deleted; when it is the last reference, the storage object is
+        released first and the message follows. Unknown counts are skipped
+        for file rows so a compatibility backend cannot cause data loss.
+        """
+        drop_rows = await self._storage.list_drop_messages_to_purge(
+            before_ts=now - self._cfg.drop_deleted_retention_seconds,
+        )
+        removed = 0
+        files_deleted = 0
+        for row in drop_rows:
+            async with self._drop_mutation_gate(row.token_name):
+                if row.file_id:
+                    ref_count = await self._drop_reference_count(row)
+                    if ref_count is None:
+                        continue
+                    # A stale listing can race a manual delete. If no row points
+                    # at the file now, remove only the message and leave any
+                    # unreferenced file for the normal orphan tooling.
+                    if ref_count > 1 or ref_count <= 0:
+                        try:
+                            if await self._storage.hard_delete_drop_message(
+                                token_name=row.token_name, message_id=row.id
+                            ):
+                                removed += 1
+                        except Exception:
+                            logger.exception(
+                                "[WebChatGateway] drop retention row delete failed id=%s",
+                                row.id,
+                            )
+                        continue
+                    frow = await self._storage.get_file(row.file_id)
+                    if frow is None:
+                        try:
+                            if await self._storage.hard_delete_drop_message(
+                                token_name=row.token_name, message_id=row.id
+                            ):
+                                removed += 1
+                        except Exception:
+                            logger.exception(
+                                "[WebChatGateway] drop retention row delete failed id=%s",
+                                row.id,
+                            )
+                        continue
+                    try:
+                        released = await release_files_safely(
+                            storage=self._storage,
+                            file_store=self._file_store,
+                            rows=[frow],
+                            log_label="drop_retention",
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[WebChatGateway] drop retention file release failed id=%s",
+                            row.id,
+                        )
+                        continue
+                    if released != 1:
+                        continue
+                    files_deleted += 1
+                try:
+                    if await self._storage.hard_delete_drop_message(
+                        token_name=row.token_name, message_id=row.id
+                    ):
+                        removed += 1
+                except Exception:
+                    logger.exception(
+                        "[WebChatGateway] drop retention row delete failed id=%s",
+                        row.id,
+                    )
+        return removed, files_deleted
 
     async def _run_housekeeping(self, now: int) -> None:
         """Step 7 — bounded-cache housekeeping.

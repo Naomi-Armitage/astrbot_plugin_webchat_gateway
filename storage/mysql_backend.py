@@ -15,6 +15,7 @@ from .base import (
     AUDIT_DETAIL_MAX,
     AbstractStorage,
     AuditRow,
+    DropMessageRow,
     FileRow,
     NewEvent,
     SessionMetaRow,
@@ -24,6 +25,7 @@ from .base import (
     _Sentinel,
 )
 from .ddl import (
+    ALTER_FILES_ADD_FILENAME_MYSQL,
     ALTER_META_ADD_COUNT_MYSQL,
     ALTER_META_ADD_PREVIEW_MYSQL,
     ALTER_TOKENS_ADD_EXPIRES_AT_MYSQL,
@@ -32,6 +34,7 @@ from .ddl import (
     SCHEMA_MYSQL,
     V2_TO_V3_MYSQL,
     V4_TO_V5_MYSQL,
+    V5_TO_V6_MYSQL,
 )
 
 
@@ -152,6 +155,20 @@ class MysqlStorage(AbstractStorage):
                         for stmt in V4_TO_V5_MYSQL:
                             await cur.execute(stmt)
                         stored = "5"
+                    if stored == "5":
+                        # v5 → v6: Drop. webchat_files.filename for
+                        # Content-Disposition on non-image downloads +
+                        # webchat_drop_messages table. ALTER guarded by
+                        # error 1060 (duplicate column); CREATE TABLE IF
+                        # NOT EXISTS is idempotent on its own.
+                        try:
+                            await cur.execute(ALTER_FILES_ADD_FILENAME_MYSQL)
+                        except aiomysql.OperationalError as exc:
+                            if not exc.args or exc.args[0] != _ERR_DUP_COLUMN:
+                                raise
+                        for stmt in V5_TO_V6_MYSQL:
+                            await cur.execute(stmt)
+                        stored = "6"
                     # Persist the marker only when the ladder
                     # actually advanced (`stored != stored_pre`). A
                     # boot whose stored value already matches CURRENT
@@ -1084,7 +1101,8 @@ class MysqlStorage(AbstractStorage):
                 await cur.execute(
                     "SELECT f.file_id, f.token_name, f.session_id, "
                     "       f.mime, f.size_bytes, f.storage_key, "
-                    "       f.committed, f.uploaded_at, f.committed_at "
+                    "       f.committed, f.uploaded_at, f.committed_at, "
+                    "       f.filename "
                     "FROM webchat_files AS f "
                     "INNER JOIN webchat_session_meta AS m "
                     "  ON m.token_name = f.token_name "
@@ -1137,6 +1155,9 @@ class MysqlStorage(AbstractStorage):
             committed_at=(
                 int(row["committed_at"]) if row["committed_at"] is not None else None
             ),
+            # v6 column; DictCursor omits it only if the migration
+            # somehow didn't run (defensive str() for None).
+            filename=str(row["filename"] or "") if "filename" in row else "",
         )
 
     async def insert_file(
@@ -1149,14 +1170,15 @@ class MysqlStorage(AbstractStorage):
         size_bytes: int,
         storage_key: str,
         now: int,
+        filename: str = "",
     ) -> None:
         async with self._write_tx() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     "INSERT INTO webchat_files("
                     "file_id, token_name, session_id, mime, size_bytes, "
-                    "storage_key, committed, uploaded_at, committed_at) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, 0, %s, NULL)",
+                    "storage_key, committed, uploaded_at, committed_at, filename) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, 0, %s, NULL, %s)",
                     (
                         file_id,
                         token_name,
@@ -1165,6 +1187,7 @@ class MysqlStorage(AbstractStorage):
                         size_bytes,
                         storage_key,
                         now,
+                        filename or "",
                     ),
                 )
 
@@ -1174,7 +1197,7 @@ class MysqlStorage(AbstractStorage):
                 await cur.execute(
                     "SELECT file_id, token_name, session_id, mime, "
                     "       size_bytes, storage_key, committed, "
-                    "       uploaded_at, committed_at "
+                    "       uploaded_at, committed_at, filename "
                     "FROM webchat_files WHERE file_id = %s",
                     (file_id,),
                 )
@@ -1257,7 +1280,7 @@ class MysqlStorage(AbstractStorage):
                 await cur.execute(
                     "SELECT file_id, token_name, session_id, mime, "
                     "       size_bytes, storage_key, committed, "
-                    "       uploaded_at, committed_at "
+                    "       uploaded_at, committed_at, filename "
                     "FROM webchat_files "
                     "WHERE committed = 0 AND uploaded_at < %s "
                     "ORDER BY uploaded_at ASC LIMIT %s",
@@ -1275,7 +1298,8 @@ class MysqlStorage(AbstractStorage):
                 await cur.execute(
                     "SELECT f.file_id, f.token_name, f.session_id, "
                     "       f.mime, f.size_bytes, f.storage_key, "
-                    "       f.committed, f.uploaded_at, f.committed_at "
+                    "       f.committed, f.uploaded_at, f.committed_at, "
+                    "       f.filename "
                     "FROM webchat_files AS f "
                     "INNER JOIN webchat_session_meta AS m "
                     "  ON m.token_name = f.token_name "
@@ -1299,3 +1323,199 @@ class MysqlStorage(AbstractStorage):
                 )
                 affected = cur.rowcount or 0
         return affected
+
+    # ----- Drop (multi-device self-to-self transfer, v6) -----
+
+    @staticmethod
+    def _row_to_drop_message(row: dict) -> DropMessageRow:
+        return DropMessageRow(
+            id=int(row["id"]),
+            token_name=row["token_name"],
+            device_id=row["device_id"],
+            device_name=str(row["device_name"] or ""),
+            kind=row["kind"],
+            text=str(row["text"] or ""),
+            file_id=(row["file_id"] if row["file_id"] is not None else None),
+            filename=str(row["filename"] or ""),
+            mime=str(row["mime"] or ""),
+            size_bytes=int(row["size_bytes"] or 0),
+            created_at=int(row["created_at"]),
+            deleted_at=(
+                int(row["deleted_at"]) if row["deleted_at"] is not None else None
+            ),
+        )
+
+    async def append_drop_message(
+        self,
+        *,
+        token_name: str,
+        device_id: str,
+        device_name: str,
+        kind: str,
+        text: str,
+        file_id: str | None,
+        filename: str,
+        mime: str,
+        size_bytes: int,
+        now: int,
+    ) -> int:
+        async with self._write_tx() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "INSERT INTO webchat_drop_messages("
+                    "token_name, device_id, device_name, kind, text, "
+                    "file_id, filename, mime, size_bytes, created_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        token_name,
+                        device_id,
+                        device_name,
+                        kind,
+                        text,
+                        file_id,
+                        filename,
+                        mime,
+                        size_bytes,
+                        now,
+                    ),
+                )
+                # lastrowid on the same cursor is the AUTO_INCREMENT value
+                # assigned to THIS insert — standard aiomysql pattern.
+                return int(cur.lastrowid or 0)
+
+    async def list_drop_messages(
+        self,
+        *,
+        token_name: str,
+        limit: int,
+        before_id: int | None,
+        include_deleted: bool,
+    ) -> list[DropMessageRow]:
+        clauses = ["token_name = %s"]
+        params: list = [token_name]
+        if not include_deleted:
+            clauses.append("deleted_at IS NULL")
+        if before_id is not None:
+            clauses.append("id < %s")
+            params.append(before_id)
+        params.append(limit)
+        sql = (
+            "SELECT id, token_name, device_id, device_name, kind, text, "
+            "file_id, filename, mime, size_bytes, created_at, deleted_at "
+            "FROM webchat_drop_messages "
+            f"WHERE {' AND '.join(clauses)} "
+            "ORDER BY id DESC LIMIT %s"
+        )
+        async with self._read_tx() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(sql, tuple(params))
+                rows = await cur.fetchall()
+        return [self._row_to_drop_message(r) for r in rows]
+
+    async def get_drop_message(
+        self, *, token_name: str, message_id: int
+    ) -> DropMessageRow | None:
+        async with self._read_tx() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT id, token_name, device_id, device_name, kind, "
+                    "text, file_id, filename, mime, size_bytes, "
+                    "created_at, deleted_at "
+                    "FROM webchat_drop_messages "
+                    "WHERE token_name = %s AND id = %s",
+                    (token_name, message_id),
+                )
+                row = await cur.fetchone()
+        return self._row_to_drop_message(row) if row else None
+
+    async def soft_delete_drop_message(
+        self, *, token_name: str, message_id: int, now: int
+    ) -> bool:
+        async with self._write_tx() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE webchat_drop_messages "
+                    "SET deleted_at = %s "
+                    "WHERE token_name = %s AND id = %s AND deleted_at IS NULL",
+                    (now, token_name, message_id),
+                )
+                affected = cur.rowcount or 0
+        return affected > 0
+
+    async def hard_delete_drop_message(
+        self, *, token_name: str, message_id: int
+    ) -> bool:
+        async with self._write_tx() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "DELETE FROM webchat_drop_messages "
+                    "WHERE token_name = %s AND id = %s",
+                    (token_name, message_id),
+                )
+                affected = cur.rowcount or 0
+        return affected > 0
+
+    async def clear_drop_history(
+        self, *, token_name: str, now: int
+    ) -> int:
+        del now  # parity with the sqlite backend; see its docstring
+        async with self._write_tx() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "DELETE FROM webchat_drop_messages WHERE token_name = %s",
+                    (token_name,),
+                )
+                affected = cur.rowcount or 0
+        return affected
+
+    async def list_drop_messages_to_purge(
+        self, *, before_ts: int, limit: int = 500
+    ) -> list[DropMessageRow]:
+        async with self._read_tx() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT id, token_name, device_id, device_name, kind, "
+                    "text, file_id, filename, mime, size_bytes, "
+                    "created_at, deleted_at "
+                    "FROM webchat_drop_messages "
+                    "WHERE deleted_at IS NOT NULL AND deleted_at < %s "
+                    "ORDER BY deleted_at ASC LIMIT %s",
+                    (before_ts, limit),
+                )
+                rows = await cur.fetchall()
+        return [self._row_to_drop_message(r) for r in rows]
+
+    async def list_drop_files(
+        self, *, token_name: str
+    ) -> list[FileRow]:
+        async with self._read_tx() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT file_id, token_name, session_id, mime, "
+                    "       size_bytes, storage_key, committed, "
+                    "       uploaded_at, committed_at, filename "
+                    "FROM webchat_files "
+                    "WHERE token_name = %s AND session_id = %s",
+                    (token_name, "drop"),
+                )
+                rows = await cur.fetchall()
+        return [self._row_to_file(r) for r in rows]
+
+    async def count_drop_file_references(
+        self, *, token_name: str, file_id: str
+    ) -> int:
+        """Return the number of Drop rows that still point at file_id.
+
+        Soft-deleted rows count until they are physically purged; deleting a
+        file while one of those rows remains would turn a later history
+        replay into a broken attachment.
+        """
+        async with self._read_tx() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT COUNT(*) AS n FROM webchat_drop_messages "
+                    "WHERE token_name = %s AND file_id = %s",
+                    (token_name, file_id),
+                )
+                row = await cur.fetchone()
+        return int(row["n"]) if row else 0

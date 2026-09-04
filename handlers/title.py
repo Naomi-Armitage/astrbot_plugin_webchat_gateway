@@ -22,6 +22,7 @@ from ..core.llm_bridge import LlmBridge
 from ..core.quota import QuotaReservation
 from ..storage.base import AbstractStorage
 from .common import gate_request, json_response
+from .conversations_overlay import DROP_SESSION_ID
 
 
 @dataclass
@@ -47,6 +48,10 @@ def _parse_payload(
         payload.get("session_id") or payload.get("sessionId") or ""
     ).strip()
     if not session_id:
+        return None
+    if session_id[:128] == DROP_SESSION_ID:
+        # Reserved for the Drop feature; a title call under it would
+        # create a session_meta row the Drop panel never reads.
         return None
     raw_conv = payload.get("conversation")
     if not isinstance(raw_conv, list) or not raw_conv:

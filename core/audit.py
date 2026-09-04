@@ -56,6 +56,20 @@ Chat path (per request):
                       disconnected (user hit stop / closed tab) before
                       completion; detail: {prompt_len}. No quota charged,
                       no CM turn written.
+    Drop (multi-device self-to-self transfer, no LLM):
+    drop_sent       — a Drop send (text note and/or file attach) landed;
+                      detail: {text_len, files, device_id}
+    drop_upload_ok  — a Drop file upload stored; detail:
+                      {file_id, size, mime, has_filename}
+    drop_upload_rejected — Drop upload refused; detail:
+                      {reason: blocked_extension|blocked_mime|storage_quota_exceeded, size}
+    drop_message_deleted — one Drop message soft-deleted; detail:
+                      {message_id, kind}
+    drop_cleared    — the whole Drop history hard-cleared; detail:
+                      {removed, files}
+    drop_serve_blocked — cross-token Drop file probe (uniform 404 to the
+                      client); detail: {file_id, reason: cross_token}
+
     file_release_failed — `commit_attachments_or_release` hit the double-
                       failure path: mark_files_committed raised AND the
                       compensating release also raised. Detail:

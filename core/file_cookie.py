@@ -30,8 +30,8 @@ Cookie attributes set on emission (Set-Cookie):
     - `SameSite=Lax`: blocks cross-site cookie sends except for top-
       level GETs; `<img>` requests from a 3rd-party site won't carry it
     - `Secure`: required when the request was over HTTPS
-    - `Path=/api/webchat/files`: only sent on file-serve requests, not
-      bleed-back into /chat or /admin
+    - `Path=/api/webchat`: sent on both ordinary and Drop file-serve
+      requests, but not on unrelated paths such as /admin
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ import hashlib
 import secrets
 import time
 
-# Cookie name. Path-scoped to /api/webchat/files in the Set-Cookie
+# Cookie name. Path-scoped to the configured API prefix in Set-Cookie
 # attributes — see `build_set_cookie` below.
 FILE_AUTH_COOKIE_NAME = "wcg_file"
 
@@ -147,7 +147,7 @@ def build_set_cookie_value(
     token_hash: str,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
     secure: bool = True,
-    cookie_path: str = "/api/webchat/files",
+    cookie_path: str = "/api/webchat",
 ) -> tuple[str, str]:
     """Return `(cookie_name, set_cookie_directive_value)` ready for
     `Response.headers["Set-Cookie"]` (or `.add` for multi-cookie).
@@ -182,7 +182,7 @@ def build_set_cookie_value(
 
 
 def build_clear_cookie_value(
-    cookie_path: str = "/api/webchat/files",
+    cookie_path: str = "/api/webchat",
 ) -> str:
     """Return a Set-Cookie value that expires the file-auth cookie.
     Used on logout-equivalent paths (revoke / cookie rotation).

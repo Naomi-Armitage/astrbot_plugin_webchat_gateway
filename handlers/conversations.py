@@ -44,6 +44,7 @@ from .common import (
 # result types moved to conversations_service. External
 # `from .conversations import X` keeps working.
 from .conversations_overlay import (  # noqa: F401
+    DROP_SESSION_ID,
     EVENT_HISTORY_CLEARED,
     EVENT_MESSAGE_ADDED,
     EVENT_MESSAGE_DELETED,
@@ -303,6 +304,14 @@ def make_conversation_handlers(
             return _err(
                 request, gated.origin, ServiceError("invalid_json", status=400)
             )
+        if session_id == DROP_SESSION_ID:
+            # The Drop session has no session_meta row and no chat
+            # history — its lifecycle lives in handlers/drop.py. A
+            # PATCH here would lazy-create a meta row the Drop panel
+            # never reads.
+            return _err(
+                request, gated.origin, ServiceError("reserved_session", status=400)
+            )
         try:
             fields = _validate_patch_body(body)
             row = await service.update_metadata(
@@ -336,6 +345,13 @@ def make_conversation_handlers(
         if not session_id:
             return _err(
                 request, gated.origin, ServiceError("invalid_payload", status=400)
+            )
+        if session_id == DROP_SESSION_ID:
+            # Drop history is cleared via POST /drop/clear, which also
+            # releases the attached files — the CM-based clear path
+            # would neither see nor release them.
+            return _err(
+                request, gated.origin, ServiceError("reserved_session", status=400)
             )
         try:
             row = await service.clear_history(

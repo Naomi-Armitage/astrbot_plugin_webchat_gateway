@@ -109,7 +109,7 @@ def make_me_handler(deps: ChatDeps):
         # of leaking the bearer into URLs (which would land in browser
         # history + access logs + monitoring). Secret rotates on plugin
         # restart, invalidating old cookies. SameSite=Lax + HttpOnly +
-        # Path-scoped to /api/webchat/files.
+        # Path-scoped to the common API prefix so Drop file URLs receive it.
         if deps.file_cookie_secret:
             scheme = (
                 request.headers.get("X-Forwarded-Proto")
@@ -299,4 +299,3 @@ def make_logout_handler(deps: ChatDeps):
         return web.Response(status=204, headers=headers)
 
     return handle
-

@@ -196,6 +196,26 @@ class ImageGenConfig:
 
 
 @dataclass(frozen=True)
+class DropConfig:
+    """Drop — multi-device self-to-self file/note transfer (no LLM).
+
+    `enabled=False` keeps the routes installed but the handlers reject
+    with `drop_disabled` (403), mirroring uploads.enabled semantics so
+    the frontend can hide the Drop session without probing. Files
+    share the per-token storage budget with image uploads (same
+    `per_token_storage_mb`), so enabling Drop never doubles a user's
+    storage footprint.
+    """
+
+    enabled: bool
+    max_file_size_mb: int
+    # Soft-deleted Drop messages are hard-deleted (and their files
+    # released) after this many days by the prune sweep. 0 = keep until
+    # the user clears the history themselves (memo semantics, default).
+    retention_days: int
+
+
+@dataclass(frozen=True)
 class ConfigView:
     host: str
     port: int
@@ -228,6 +248,7 @@ class ConfigView:
     streaming: StreamingConfig
     uploads: UploadsConfig
     image_gen: ImageGenConfig
+    drop: DropConfig
 
     @property
     def chat_path(self) -> str:
@@ -345,6 +366,30 @@ class ConfigView:
         return f"{self.endpoint_prefix}/upload"
 
     @property
+    def drop_send_path(self) -> str:
+        return f"{self.endpoint_prefix}/drop/send"
+
+    @property
+    def drop_upload_path(self) -> str:
+        return f"{self.endpoint_prefix}/drop/upload"
+
+    @property
+    def drop_messages_path(self) -> str:
+        return f"{self.endpoint_prefix}/drop/messages"
+
+    @property
+    def drop_message_item_path(self) -> str:
+        return f"{self.endpoint_prefix}/drop/messages/{{message_id}}"
+
+    @property
+    def drop_clear_path(self) -> str:
+        return f"{self.endpoint_prefix}/drop/clear"
+
+    @property
+    def drop_files_serve_path(self) -> str:
+        return f"{self.endpoint_prefix}/drop/files/{{file_id}}"
+
+    @property
     def files_serve_path(self) -> str:
         return f"{self.endpoint_prefix}/files/{{file_id}}"
 
@@ -357,7 +402,7 @@ class ConfigView:
         off `endpoint_prefix` so a custom prefix doesn't silently break
         cookie delivery — the browser scopes by exact path prefix.
         """
-        return f"{self.endpoint_prefix}/files"
+        return self.endpoint_prefix
 
     @property
     def logout_path(self) -> str:
@@ -591,6 +636,15 @@ class ConfigView:
         image_gen_img2img = _parse_bool(
             _get(raw_image_gen, "img2img"), default=False
         )
+
+        raw_drop = _get(cfg, "drop", {}) or {}
+        drop_enabled = _parse_bool(_get(raw_drop, "enabled"), default=True)
+        drop_max_file_size_mb = _clamp_int(
+            _get(raw_drop, "max_file_size_mb"), default=100, lo=1, hi=2048
+        )
+        drop_retention_days = _clamp_int(
+            _get(raw_drop, "retention_days"), default=0, lo=0, hi=365
+        )
         view = cls(
             host=host,
             port=port,
@@ -656,6 +710,11 @@ class ConfigView:
                 size=image_gen_size,
                 timeout_seconds=image_gen_timeout,
                 img2img=image_gen_img2img,
+            ),
+            drop=DropConfig(
+                enabled=drop_enabled,
+                max_file_size_mb=drop_max_file_size_mb,
+                retention_days=drop_retention_days,
             ),
         )
         view._emit_warnings()

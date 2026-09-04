@@ -141,8 +141,10 @@ class PerTokenUploadGate:
     Two concurrent uploads to DIFFERENT tokens still run in parallel
     (different lock objects). Idle locks evict on release.
 
-    Outside the gate, the file_store.save() (disk/R2 I/O) runs without
-    holding the lock — keeps the critical section short.
+    The lock covers the quota check, DB reservation, and object write for
+    one token. Keeping save inside the gate prevents Drop send/clear or
+    another upload from observing a row whose object is not ready.
+    Different tokens still run in parallel; idle locks evict on release.
     """
 
     def __init__(self) -> None:

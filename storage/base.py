@@ -124,6 +124,46 @@ class FileRow:
     committed: bool
     uploaded_at: int
     committed_at: int | None
+    # Original upload filename, captured client-side. Empty for legacy
+    # v5 uploads (backfilled by the v5 → v6 migration's DEFAULT '' clause).
+    # Used by the Drop serve endpoint to set a real Content-Disposition
+    # for non-image files; the chat-client image path still uses the
+    # opaque file_id URL and doesn't need it.
+    filename: str = ""
+
+
+@dataclass(frozen=True)
+class DropMessageRow:
+    """One row in `webchat_drop_messages`.
+
+    The Drop session is multi-device self-to-self transfer; the LLM never
+    sees these. `kind` distinguishes text-only notes (`text`, `file_id=None`)
+    from file attachments (`file`, `file_id=<uploaded file_id>`).
+
+    `id` is server-assigned monotonic per token (NOT a UUID) so peer devices
+    can dedup by id (the long-poll delivers drop_message_added with an id;
+    the originating device already has it from the POST response) and so
+    history pagination is `WHERE id < cursor ORDER BY id DESC LIMIT n`.
+
+    `deleted_at` is set instead of hard-deleting so a peer's deletion
+    shows up in real time AND the prune loop can hard-delete after the
+    retention window. `device_id` + `device_name` identify the origin;
+    on the originating device these match localStorage, on peer devices
+    they show as "<device>'s bubble" in the sidebar.
+    """
+
+    id: int
+    token_name: str
+    device_id: str
+    device_name: str
+    kind: str  # 'text' | 'file'
+    text: str
+    file_id: str | None
+    filename: str
+    mime: str
+    size_bytes: int
+    created_at: int
+    deleted_at: int | None
 
 
 class AbstractStorage(ABC):
@@ -544,12 +584,18 @@ class AbstractStorage(ABC):
         size_bytes: int,
         storage_key: str,
         now: int,
+        filename: str = "",
     ) -> None:
         """Insert a `webchat_files` row with `committed=0` and
         `uploaded_at=now`. Caller has already validated all fields and
         generated `file_id`; this is a straight INSERT — duplicate
         `file_id` raises (which would indicate a token_urlsafe
         collision, vanishingly unlikely given 96 bits of entropy).
+
+        `filename` is the upload's original name (captured client-side)
+        — empty string for image uploads where the existing
+        inline-render path doesn't need it. Default `""` keeps older
+        callers (and tests) source-compatible.
         """
 
     @abstractmethod
@@ -642,3 +688,100 @@ class AbstractStorage(ABC):
         use is from the prune path, where the rows are already past
         retention.
         """
+
+    # ----- Drop (multi-device self-to-self transfer, no LLM, v6) -----
+
+    @abstractmethod
+    async def append_drop_message(
+        self,
+        *,
+        token_name: str,
+        device_id: str,
+        device_name: str,
+        kind: str,           # 'text' | 'file'
+        text: str,
+        file_id: str | None,
+        filename: str,
+        mime: str,
+        size_bytes: int,
+        now: int,
+    ) -> int:
+        """Insert one row into `webchat_drop_messages` and return its id.
+
+        `id` is server-assigned monotonic per token. `kind='file'` requires
+        `file_id != None`; `kind='text'` requires it to be None. The
+        caller is expected to have already validated the kind/file_id
+        pairing and (for files) the file's token/session ownership.
+        """
+
+    @abstractmethod
+    async def list_drop_messages(
+        self,
+        *,
+        token_name: str,
+        limit: int,
+        before_id: int | None,
+        include_deleted: bool,
+    ) -> list[DropMessageRow]:
+        """Return up to `limit` rows ordered by id DESC (newest first).
+
+        `before_id` is a pagination cursor — pass the smallest id from
+        the previous page to fetch the next page. `None` starts at the
+        head. `include_deleted=False` hides soft-deleted rows (used by
+        the chat client); `True` exposes them (used by the prune sweep).
+        """
+
+    @abstractmethod
+    async def get_drop_message(
+        self, *, token_name: str, message_id: int
+    ) -> DropMessageRow | None:
+        """Look up one row by id. Returns None if missing or
+        soft-deleted; the chat-sync event layer distinguishes those."""
+
+    @abstractmethod
+    async def soft_delete_drop_message(
+        self, *, token_name: str, message_id: int, now: int
+    ) -> bool:
+        """Set `deleted_at = now`. Idempotent — soft-deleting an already
+        soft-deleted row returns False (not an error). Returns True on
+        the first delete. The chat-sync event layer also emits a
+        `drop_message_deleted` event for peer devices to drop the
+        bubble in real time."""
+
+    @abstractmethod
+    async def hard_delete_drop_message(
+        self, *, token_name: str, message_id: int
+    ) -> bool:
+        """Physically DELETE one Drop row. Returns True when a row was
+        removed. Used by the retention sweep AFTER the row's file (if
+        any) has been released — see `PruneOrchestrator._run_data_prune`.
+        Idempotent: deleting an absent row returns False."""
+
+    @abstractmethod
+    async def clear_drop_history(
+        self, *, token_name: str, now: int
+    ) -> int:
+        """Hard DELETE every row for `token_name`. Returns row count.
+
+        Called by the chat client's `clearDrop` action. Cascades to
+        the file-store via the chat-sync handler so all attached files
+        are released too — without that, hard-deleted message rows
+        would leave orphaned committed=1 file rows with no path to
+        cleanup. See `core.drop_service.DropService.clear_all`.
+        """
+
+    @abstractmethod
+    async def list_drop_messages_to_purge(
+        self, *, before_ts: int, limit: int = 500
+    ) -> list[DropMessageRow]:
+        """Rows whose `deleted_at < before_ts` — ready for hard DELETE
+        by the prune sweep. Distinct from clear_drop_history (operator-
+        driven) and from retention-by-age (future use)."""
+
+    @abstractmethod
+    async def list_drop_files(
+        self, *, token_name: str
+    ) -> list[FileRow]:
+        """All `webchat_files` rows where `session_id = 'drop'` for the
+        given token. Used by clear_drop_history's cascade so the file-
+        store release hits every attached file. Order is unspecified."""

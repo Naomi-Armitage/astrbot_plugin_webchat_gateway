@@ -1731,3 +1731,150 @@ body.lightbox-open { overflow: hidden; }
     animation-duration: 0.001ms !important;
   }
 }
+
+/* ----- Drop (multi-device self-to-self transfer) ----------------------
+ *
+ * Visually mirrors the chat panel: right-aligned "user" bubbles for
+ * the local device, left-aligned "bot" bubbles for peers with a
+ * device-name header. The .drop-bubble class is a marker so a Drop
+ * bubble keeps the existing chat bubble shape but gets two Drop-
+ * specific affordances (the device header + the file-link treatment).
+ *
+ * Reusing .msg-row.user-row / .msg-row.bot-row is intentional: the
+ * existing right/left alignment + hover-action chrome already work
+ * for both surfaces. The new rules below only add Drop-specific shape.
+ */
+
+.drop-device-head {
+  font-size: 12px;
+  color: var(--ink-soft);
+  padding: 0 12px 4px;
+  letter-spacing: 0.02em;
+  max-width: 78%;
+}
+
+.msg-row.bot-row.drop-msg .drop-device-head {
+  align-self: flex-start;
+}
+
+.msg-row.user-row.drop-msg .drop-device-head {
+  display: none;  /* local device identity is already in the sidebar */
+}
+
+/* Drop bubbles — no markdown, no streaming. Same shape as chat bubbles
+ * (padding/border-radius) so the visual rhythm matches. */
+.msg.drop-bubble {
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+/* Drop is a peer-to-peer space, not another assistant thread. Keep the
+ * left-hand peer bubble neutral instead of inheriting the bot tail and
+ * assistant-like contrast from the chat surface. */
+.msg-row.bot-row.drop-msg .drop-bubble {
+  background: var(--card);
+  color: var(--ink);
+  border-color: var(--rule);
+  border-radius: 14px;
+  box-shadow: 0 1px 2px var(--shadow);
+}
+
+.drop-image-preview {
+  appearance: none;
+  display: block;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: zoom-in;
+  line-height: 0;
+  border-radius: 8px;
+}
+.drop-image-preview:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.drop-bubble img.msg-image {
+  display: block;
+  max-width: 240px;
+  max-height: 240px;
+  border-radius: 8px;
+  margin: 4px 0 6px;
+  cursor: zoom-in;
+}
+
+.drop-file-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: var(--paper-deep);
+  color: var(--ink);
+  text-decoration: none;
+  font-size: 13px;
+  word-break: break-all;
+}
+
+.drop-file-link:hover {
+  background: color-mix(in oklab, var(--paper-deep) 82%, var(--ink));
+  filter: brightness(1.05);
+}
+.drop-file-icon {
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 32px;
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--rule);
+  border-radius: 7px;
+  color: var(--accent-strong);
+  background: var(--card);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .02em;
+}
+.drop-file-details {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 1px;
+}
+.drop-file-name {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.drop-file-meta {
+  color: var(--ink-soft);
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+.drop-empty .empty-hint {
+  max-width: 260px;
+}
+
+/* Sidebar Drop entry — fixed virtual session. Sits above the chat
+ * list, never editable, never deleted. The .drop-pick-wrap keeps the
+ * two-line label aligned to the time slot on the right. */
+.drop-session-item .session-pick {
+  align-items: center;
+}
+
+.drop-pick-wrap {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+}
+
+.drop-pick-sub {
+  font-size: 11px;
+  color: var(--ink-soft);
+  letter-spacing: 0.03em;
+  margin-top: 2px;
+}

@@ -19,7 +19,7 @@ is safe. Cross-version upgrades happen inside each backend's `initialize()`.
 
 from __future__ import annotations
 
-CURRENT_SCHEMA_VERSION = "5"
+CURRENT_SCHEMA_VERSION = "6"
 
 SCHEMA_SQLITE: tuple[str, ...] = (
     """
@@ -107,15 +107,49 @@ SCHEMA_SQLITE: tuple[str, ...] = (
         storage_key  TEXT NOT NULL,
         committed    INTEGER NOT NULL DEFAULT 0,
         uploaded_at  INTEGER NOT NULL,
-        committed_at INTEGER
+        committed_at INTEGER,
+        filename     TEXT NOT NULL DEFAULT ''
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_webchat_files_token_session "
     "ON webchat_files (token_name, session_id)",
     "CREATE INDEX IF NOT EXISTS idx_webchat_files_uncommitted "
     "ON webchat_files (committed, uploaded_at)",
+    # Drop (multi-device self-to-self file/note transfer, no LLM). Lives in
+    # its own table because reusing webchat_session_meta / webchat_updates
+    # would either pollute AstrBot's CM history (TECH_DEBT §1 calls this out
+    # for the user/assistant pair semantic) or force every reader to branch
+    # on event_type. The `id` is a server-assigned monotonic counter per
+    # token (NOT a UUID) so peer devices can dedup by id and so history
+    # pagination is a simple `WHERE id < ?` range scan.
+    """
+    CREATE TABLE IF NOT EXISTS webchat_drop_messages (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        token_name  TEXT    NOT NULL,
+        device_id   TEXT    NOT NULL,
+        device_name TEXT    NOT NULL DEFAULT '',
+        kind        TEXT    NOT NULL,         -- 'text' | 'file'
+        text        TEXT    NOT NULL DEFAULT '',
+        file_id     TEXT    NULL,             -- nullable: text-only messages
+        filename    TEXT    NOT NULL DEFAULT '',
+        mime        TEXT    NOT NULL DEFAULT '',
+        size_bytes  INTEGER NOT NULL DEFAULT 0,
+        created_at  INTEGER NOT NULL,
+        deleted_at  INTEGER NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_drop_messages_token_created "
+    "ON webchat_drop_messages (token_name, id DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_drop_messages_token_deleted "
+    "ON webchat_drop_messages (token_name, deleted_at)",
+    # FK with ON DELETE SET NULL: when a webchat_files row is hard-deleted
+    # (commit-failure release, orphan GC, or clear), the message keeps its
+    # text content but the file link goes NULL so the client renders a
+    # tombstone ("文件已删除") instead of a broken thumbnail. CASCADE would
+    # be silent data loss for any text-only co-message sharing the file.
+    "CREATE INDEX IF NOT EXISTS idx_drop_messages_file "
+    "ON webchat_drop_messages (file_id)",
 )
-
 
 # v2 → v3 (additive only). Both backends apply these on upgrade. Idempotent
 # via IF NOT EXISTS so no error guards needed; a fresh install runs these
@@ -262,9 +296,29 @@ SCHEMA_MYSQL: tuple[str, ...] = (
         committed    TINYINT(1)   NOT NULL DEFAULT 0,
         uploaded_at  BIGINT NOT NULL,
         committed_at BIGINT NULL,
+        filename     VARCHAR(255) NOT NULL DEFAULT '',
         PRIMARY KEY (file_id),
         INDEX idx_webchat_files_token_session (token_name, session_id),
         INDEX idx_webchat_files_uncommitted (committed, uploaded_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS webchat_drop_messages (
+        id          BIGINT PRIMARY KEY AUTO_INCREMENT,
+        token_name  VARCHAR(128) NOT NULL,
+        device_id   VARCHAR(64)  NOT NULL,
+        device_name VARCHAR(128) NOT NULL DEFAULT '',
+        kind        VARCHAR(16)  NOT NULL,
+        text        TEXT         NOT NULL,
+        file_id     VARCHAR(32)  NULL,
+        filename    VARCHAR(255) NOT NULL DEFAULT '',
+        mime        VARCHAR(64)  NOT NULL DEFAULT '',
+        size_bytes  BIGINT NOT NULL DEFAULT 0,
+        created_at  BIGINT NOT NULL,
+        deleted_at  BIGINT NULL,
+        INDEX idx_drop_messages_token_id (token_name, id),
+        INDEX idx_drop_messages_token_deleted (token_name, deleted_at),
+        INDEX idx_drop_messages_file (file_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
 )
@@ -350,6 +404,77 @@ V4_TO_V5_MYSQL: tuple[str, ...] = (
         PRIMARY KEY (file_id),
         INDEX idx_webchat_files_token_session (token_name, session_id),
         INDEX idx_webchat_files_uncommitted (committed, uploaded_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+)
+
+
+# v5 → v6: Drop (multi-device self-to-self file/note transfer). Additive.
+# Two changes:
+#   1. webchat_files.filename — preserves the upload's original name so the
+#      serve endpoint can serve non-image files with a real filename
+#      (Content-Disposition: attachment; filename="...") and the client
+#      can render it without re-deriving. Idempotent via the duplicate-
+#      column guard both backends apply.
+#   2. webchat_drop_messages — see SCHEMA_*_SQLITE for rationale; same
+#      CREATE TABLE / CREATE INDEX idempotency as the v4 → v5 webchat_files
+#      migration. The DROP_SESSION_ID column is omitted (Drop uses the
+#      literal "drop" session; this lives on webchat_files.session_id).
+ALTER_FILES_ADD_FILENAME_SQLITE = (
+    "ALTER TABLE webchat_files ADD COLUMN filename TEXT NOT NULL DEFAULT ''"
+)
+ALTER_FILES_ADD_FILENAME_MYSQL = (
+    "ALTER TABLE webchat_files ADD COLUMN filename VARCHAR(255) NOT NULL DEFAULT ''"
+)
+
+V5_TO_V6_SQLITE: tuple[str, ...] = (
+    # NOTE: the webchat_files.filename ALTER is NOT in this tuple — it
+    # runs separately, guarded by the duplicate-column catch (the tuple
+    # statements are only IF NOT EXISTS-idempotent, which ALTER is not).
+    """
+    CREATE TABLE IF NOT EXISTS webchat_drop_messages (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        token_name  TEXT    NOT NULL,
+        device_id   TEXT    NOT NULL,
+        device_name TEXT    NOT NULL DEFAULT '',
+        kind        TEXT    NOT NULL,
+        text        TEXT    NOT NULL DEFAULT '',
+        file_id     TEXT    NULL,
+        filename    TEXT    NOT NULL DEFAULT '',
+        mime        TEXT    NOT NULL DEFAULT '',
+        size_bytes  INTEGER NOT NULL DEFAULT 0,
+        created_at  INTEGER NOT NULL,
+        deleted_at  INTEGER NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_drop_messages_token_created "
+    "ON webchat_drop_messages (token_name, id DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_drop_messages_token_deleted "
+    "ON webchat_drop_messages (token_name, deleted_at)",
+    "CREATE INDEX IF NOT EXISTS idx_drop_messages_file "
+    "ON webchat_drop_messages (file_id)",
+)
+
+V5_TO_V6_MYSQL: tuple[str, ...] = (
+    # Same split as the sqlite variant: the ALTER lives outside this
+    # tuple, guarded by error 1060.
+    """
+    CREATE TABLE IF NOT EXISTS webchat_drop_messages (
+        id          BIGINT PRIMARY KEY AUTO_INCREMENT,
+        token_name  VARCHAR(128) NOT NULL,
+        device_id   VARCHAR(64)  NOT NULL,
+        device_name VARCHAR(128) NOT NULL DEFAULT '',
+        kind        VARCHAR(16)  NOT NULL,
+        text        TEXT         NOT NULL,
+        file_id     VARCHAR(32)  NULL,
+        filename    VARCHAR(255) NOT NULL DEFAULT '',
+        mime        VARCHAR(64)  NOT NULL DEFAULT '',
+        size_bytes  BIGINT NOT NULL DEFAULT 0,
+        created_at  BIGINT NOT NULL,
+        deleted_at  BIGINT NULL,
+        INDEX idx_drop_messages_token_id (token_name, id),
+        INDEX idx_drop_messages_token_deleted (token_name, deleted_at),
+        INDEX idx_drop_messages_file (file_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
 )

@@ -82,7 +82,7 @@ class FileStore(Protocol):
         self, *, storage_key: str, ttl_seconds: int
     ) -> str | None: ...
 
-    async def delete(self, *, storage_key: str) -> None: ...
+    async def delete(self, *, storage_key: str) -> bool | None: ...
 
 
 # ----------------------------------------------------------------------
@@ -186,22 +186,24 @@ class LocalFileStore:
         # proxies bytes for local mode.
         return None
 
-    async def delete(self, *, storage_key: str) -> None:
+    async def delete(self, *, storage_key: str) -> bool:
         target = self._safe_resolve(storage_key)
         if target is None:
-            return
+            return False
         try:
             await asyncio.to_thread(_unlink_sync, str(target))
         except FileNotFoundError:
             # Idempotent: a re-run of cascade cleanup must not raise on
             # already-deleted files.
-            pass
+            return True
         except OSError as exc:
             logger.exception(
                 "[WebChatGateway] LocalFileStore.delete failed key=%s err=%s",
                 storage_key,
                 exc,
             )
+            return False
+        return True
 
 
 def _write_bytes_sync(path: str, content: bytes) -> None:
@@ -558,7 +560,8 @@ class R2FileStore:
             )
             return None
 
-    async def delete(self, *, storage_key: str) -> None:
+    async def delete(self, *, storage_key: str) -> bool:
+        ok = True
         # Remove from R2 first, then from local cache. If R2 errors, we
         # still drop the cache entry — keeps cache consistent with
         # "this key is gone".
@@ -569,6 +572,7 @@ class R2FileStore:
                 )
         except Exception as exc:
             if not _is_no_such_key(exc):
+                ok = False
                 logger.exception(
                     "[WebChatGateway] R2FileStore.delete (R2) failed key=%s",
                     storage_key,
@@ -583,10 +587,12 @@ class R2FileStore:
         except FileNotFoundError:
             pass
         except Exception:
+            ok = False
             logger.exception(
                 "[WebChatGateway] R2FileStore.delete (cache) failed key=%s",
                 storage_key,
             )
+        return ok
 
 
 def _trim_cache_dir_sync(

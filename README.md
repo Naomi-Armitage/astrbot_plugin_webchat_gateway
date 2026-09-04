@@ -39,6 +39,7 @@
 | 管理 | 独立管理 API + 示例 HTML 面板；同时保留 AstrBot 内置 `/webchat` 指令组 |
 | 审计 | 所有签发/撤销/聊天/配额耗尽/封禁事件都写入 `audit_log` |
 | 兼容 | 复用 AstrBot 现有的 LLM / persona / conversation 管线 |
+| Drop | 跨设备文件/备忘录自传（同 token 多端，无 LLM；侧栏固定会话；图片/任意文件均可） |
 
 ---
 
@@ -192,6 +193,11 @@ curl -X POST http://127.0.0.1:6186/api/webchat/chat \
 | `uploads.max_attachments_per_message` | `4` | 单条消息最多附件数（1-16） |
 | `uploads.allowed_mime` | `image/jpeg,image/png,image/webp,image/gif` | 允许的 MIME 类型（逗号分隔） |
 | `uploads.r2.*` | `""` | R2 配置（`account_id` / `access_key_id` / `secret_access_key` / `bucket` / `endpoint` / `serving_mode=proxy|direct` / `direct_link_ttl_seconds` / `cache_size_mb`）；仅 `storage_driver=r2` 时需要，需要额外 `pip install aiobotocore>=2.13` |
+| `drop.enabled` | `true` | 关闭后侧栏不显示 Drop 会话，写端点 403 `drop_disabled`；已有消息保留在库里 |
+| `drop.max_file_size_mb` | `100` | Drop 单文件上限（1-2048 MB），与 `uploads.max_file_size_mb` 独立 |
+| `drop.retention_days` | `0` | 软删除消息保留天数（0 = 永久，备忘录语义）；到期由 prune 物理删除并释放文件 |
+
+>  Drop 文件与图片上传共用 `uploads.per_token_storage_mb` 配额，所以启用 Drop 不会让某用户存储翻倍。
 
 ---
 
@@ -291,6 +297,19 @@ MIME 通过 Pillow `verify()` 检测（不信任客户端 Content-Type），允�
 | DELETE | `{prefix}/conversations/{sid}/messages/{idx}` | 删单条消息（`idx` 是渲染索引，0-based）。**永久删除，无 undo。** 释放该条附件中未被其他消息引用的文件。返回 `{ok:true, ...meta}`。 |
 | POST | `{prefix}/conversations/{sid}/regenerate` | body `{message_index}`：重新生成指定 assistant 回复。**会把 `message_index` 之后的所有 turn 一并清掉**（对端设备同样收到逐条 `message_deleted` 事件），然后追加新 assistant。响应 `{ok, reply, remaining, daily_quota}`。 |
 | GET | `{prefix}/events?since=N&timeout=25` | 多设备同步长轮询。返回 `{events:[{event_type, payload, pts, ts, session_id}], last_pts, has_more, tooFar?}`。事件类型：`session_created` / `session_meta_updated` / `message_added` / `message_deleted` / `history_cleared` / `stream_started` / `stream_ended`。`tooFar=true` 表示 `since` 已被 `_pruned_marker` 越过，客户端应整体 cold-refetch。 |
+
+### Drop 端点（多设备自传，无 LLM）
+
+Drop 是聊天页左侧固定的虚拟会话（session_id 留字面量 `drop`）。同一 token 的多端可互传文字与任意文件 ——LLM 不参与，不扣每日配额，文件与图片上传共用 `uploads.per_token_storage_mb`。所有写端点 `drop.enabled=false` 时返回 `403 drop_disabled`；服务路由始终存活以便旧链接仍可下载。所有端点 bearer 鉴权（Cookie 路径同 `/files/{id}`），事件复用 `{prefix}/events` 长轮询（事件类型 `drop_message_added` / `drop_message_deleted` / `drop_history_cleared`）。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `{prefix}/drop/send` | body `{text?, attachments?, device_id, device_name}`：文字 + 文件附件（file_id 必须是本 token 已上传到 `/drop/upload` 的）。返回 `{messages:[{id, device_id, device_name, kind: "text"|"file", text, file_id?, filename?, mime?, size?, created_at}, ...]}`。`device_id` 服务端不存，仅按 `^[A-Za-z0-9_\-.:]{8,64}$` 校验；`device_name` 走 UA 推导 + 客户端 localStorage 覆盖。失败码：`invalid_payload` / `invalid_device_id` / `invalid_attachment` / `text_too_long` / `storage_quota_exceeded` / `drop_disabled`。 |
+| POST | `{prefix}/drop/upload` | multipart `file` + 可选 `filename` 字段。任意文件类型；图片走 PIL sniff 与现有 `uploads.allowed_mime` 一致，其他类型信任声明 MIME 但服务端强制拒绝 `image/svg+xml` / `text/html` / `application/xhtml+xml` 与 `.html` / `.svg` / `.xhtml` 等可执行扩展名（stored-XSS 与 XHTML 执行上下文防御）。返回 `{file_id, mime, size, filename}`。失败码：`unsupported_type` (415) / `storage_quota_exceeded` (429) / `payload_too_large` (413)。 |
+| GET  | `{prefix}/drop/messages?limit=50&before={id}` | newest-first 分页（`before_id` 游标）。返回 `{messages:[...], has_more}`。`has_more` 用 peek+1 判定（边界页与全满页可区分）。 |
+| DELETE | `{prefix}/drop/messages/{message_id}` | 软删除一条。返回 `{ok, id}`；已删除的 id 统一返回 `404 not_found`（幂等）。peer 设备在事件长轮询里收到 `drop_message_deleted`，按 id 移除本地气泡。 |
+| POST | `{prefix}/drop/clear` | 硬清空整个 Drop 历史 + 释放所有附件。前端 confirm 后调；返回 `{ok, removed}`。peer 设备收到 `drop_history_cleared`。 |
+| GET  | `{prefix}/drop/files/{file_id}` | 服务 Drop 文件。**图片 MIME 走 `inline` 缩略图渲染，非图片 MIME 强制 `attachment` 附件下载（防止 stored-XSS / XHTML 误渲染）。** 文件名取自 `webchat_files.filename`（utf-8 时走 RFC 5987 `filename*=`）。与 `/files/{id}` 同样的双认证（bearer + `wcg_file` cookie）；跨 token 一律 404 不区分（防枚举）。 |
 
 ### 管理端点
 
@@ -591,6 +610,15 @@ Token 生命周期（管理路径）：
 - `llm_timeout` — provider 调用超出 `llm_timeout_seconds`；`detail = {msg_len}`
 - `chat_error` — provider 调用失败（非超时）；`detail = {error: <截断>}`
 - `chat_ok` — 聊天成功；`detail = {msg_len, reply_len, remaining}`
+
+Drop（多设备自传，写端点）：
+
+- `drop_sent` — `/drop/send` 落地；`detail = {text_len, files, device_id}`
+- `drop_upload_ok` — `/drop/upload` 落库；`detail = {file_id, size, mime, has_filename}`
+- `drop_upload_rejected` — 上传被拒（`reason: blocked_extension|blocked_mime|storage_quota_exceeded`）；`detail = {reason, size, ...}`
+- `drop_message_deleted` — `/drop/messages/{id}` 软删除；`detail = {message_id, kind}`
+- `drop_cleared` — `/drop/clear` 硬清空；`detail = {removed, files}`
+- `drop_serve_blocked` — 跨 token `/drop/files/{id}` 探测（统一 404，不向客户端区分）；`detail = {file_id, reason: 'cross_token'}`
 
 可通过 `GET /api/webchat/admin/audit?limit=...` 查询；按 `ts DESC, id DESC` 排序，所以同秒并发写入也会有稳定顺序。
 

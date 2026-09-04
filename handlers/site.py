@@ -42,6 +42,11 @@ class SiteDeps:
     uploads_max_file_size_mb: int
     uploads_max_attachments_per_message: int
     uploads_allowed_mime: tuple[str, ...]
+    # Drop feature surface. enabled drives the fixed sidebar session's
+    # visibility; max_file_size_mb lets the Drop composer enforce the
+    # same cap as the server before uploading.
+    drop_enabled: bool = True
+    drop_max_file_size_mb: int = 100
     # Live read of `image_gen.enabled`. Resolved on every /site
     # request rather than snapshotted at construct time because the
     # image_gen.* fields hot-reload (admin panel save → no restart)
@@ -90,6 +95,10 @@ def make_site_handlers(deps: SiteDeps):
             "max_file_size_mb": deps.uploads_max_file_size_mb,
             "max_attachments_per_message": deps.uploads_max_attachments_per_message,
             "allowed_mime": list(deps.uploads_allowed_mime),
+        },
+        "drop": {
+            "enabled": deps.drop_enabled,
+            "max_file_size_mb": deps.drop_max_file_size_mb,
         },
     }
 

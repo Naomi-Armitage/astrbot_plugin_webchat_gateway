@@ -36,6 +36,12 @@ from .conversations import (
     ConversationService,
     make_conversation_handlers,
 )
+from .drop import (
+    DropDeps,
+    make_drop_files_preflight,
+    make_drop_handlers,
+    make_drop_serve_handler,
+)
 from .files import (
     UploadDeps,
     make_files_preflight,
@@ -57,6 +63,7 @@ class ServerDeps:
     conv: ConversationDeps
     conv_service: ConversationService
     upload: UploadDeps
+    drop: DropDeps
 
 
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
@@ -117,6 +124,12 @@ def build_app(deps: ServerDeps) -> web.Application:
     upload_cap_bytes = 0
     if cfg.uploads.enabled:
         upload_cap_bytes = cfg.uploads.max_file_size_mb * 1024 * 1024 + 256 * 1024
+    # Drop uploads draw from the same client_max_size ceiling — raise it
+    # when either surface could receive a large multipart body.
+    if cfg.drop.enabled:
+        upload_cap_bytes = max(
+            upload_cap_bytes, cfg.drop.max_file_size_mb * 1024 * 1024 + 256 * 1024
+        )
     body_cap = max(64 * 1024, cfg.max_message_length * 4, upload_cap_bytes)
     app = web.Application(client_max_size=body_cap)
 
@@ -187,6 +200,29 @@ def build_app(deps: ServerDeps) -> web.Application:
     title_handler = make_title_handler(deps.title)
     app.router.add_post(cfg.title_path, title_handler)
     app.router.add_options(cfg.title_path, chat_preflight)
+
+    # Drop (multi-device self-to-self transfer, no LLM). All routes are
+    # ALWAYS registered — `drop.enabled=False` is enforced inside the
+    # write handlers (403 drop_disabled) so the frontend can hide the
+    # session on /site and stale tabs get a clean error code instead of
+    # a 404. The serve route stays live when disabled: files already in
+    # Drop history remain downloadable (mirrors the /files/{id} route
+    # being independent of uploads.enabled).
+    drop = make_drop_handlers(deps.drop)
+    drop_serve = make_drop_serve_handler(deps.drop)
+    drop_preflight = make_drop_files_preflight(deps.drop)
+    app.router.add_post(cfg.drop_send_path, drop["send"])
+    app.router.add_options(cfg.drop_send_path, drop_preflight)
+    app.router.add_post(cfg.drop_upload_path, drop["upload"])
+    app.router.add_options(cfg.drop_upload_path, drop_preflight)
+    app.router.add_get(cfg.drop_messages_path, drop["list"])
+    app.router.add_options(cfg.drop_messages_path, drop_preflight)
+    app.router.add_delete(cfg.drop_message_item_path, drop["delete"])
+    app.router.add_options(cfg.drop_message_item_path, drop_preflight)
+    app.router.add_post(cfg.drop_clear_path, drop["clear"])
+    app.router.add_options(cfg.drop_clear_path, drop_preflight)
+    app.router.add_get(cfg.drop_files_serve_path, drop_serve)
+    app.router.add_options(cfg.drop_files_serve_path, drop_preflight)
 
     conv = make_conversation_handlers(deps.conv, deps.conv_service)
     app.router.add_get(cfg.conversations_path, conv["list"])
@@ -282,6 +318,8 @@ def build_app(deps: ServerDeps) -> web.Application:
             uploads_max_file_size_mb=cfg.uploads.max_file_size_mb,
             uploads_max_attachments_per_message=cfg.uploads.max_attachments_per_message,
             uploads_allowed_mime=tuple(cfg.uploads.allowed_mime),
+            drop_enabled=cfg.drop.enabled,
+            drop_max_file_size_mb=cfg.drop.max_file_size_mb,
             # `image_gen.enabled` hot-reloads via ChatDeps.image_bridge,
             # so we resolve liveness off the bridge itself rather than
             # the boot-time cfg snapshot. The bridge's `.enabled`

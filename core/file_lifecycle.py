@@ -131,6 +131,7 @@ async def release_files_safely(
     file_store: FileStore | None,
     rows: Iterable[FileRow],
     log_label: str = "release_files_safely",
+    delete_db: bool = True,
 ) -> int:
     """Delete each row's storage object FIRST, then the DB rows of those
     whose storage delete succeeded. Returns the count of rows fully
@@ -148,7 +149,17 @@ async def release_files_safely(
     prune). The caller should not retry on its own; the next prune
     iteration will re-discover any leftover rows.
     """
-    rows_list = [r for r in rows if r is not None]
+    # A file can be present in more than one message (Drop permits a
+    # user to re-attach the same uploaded file). Deleting the object twice
+    # is harmless for Local/R2, but passing duplicate ids to the DB layer
+    # makes the returned count lie and can obscure a partial failure.
+    rows_list: list[FileRow] = []
+    seen_ids: set[str] = set()
+    for row in rows:
+        if row is None or row.file_id in seen_ids:
+            continue
+        seen_ids.add(row.file_id)
+        rows_list.append(row)
     if not rows_list:
         return 0
     if file_store is None:
@@ -166,7 +177,18 @@ async def release_files_safely(
     storage_deleted_ids: list[str] = []
     for row in rows_list:
         try:
-            await file_store.delete(storage_key=row.storage_key)
+            deleted = await file_store.delete(storage_key=row.storage_key)
+            # Older third-party FileStore implementations returned None;
+            # preserve that runtime contract while allowing current stores
+            # to report a real delete failure without silently removing the
+            # DB pointer.
+            if deleted is False:
+                logger.warning(
+                    "[WebChatGateway] %s: file_store.delete reported failure key=%s",
+                    log_label,
+                    row.storage_key,
+                )
+                continue
         except Exception:
             logger.exception(
                 "[WebChatGateway] %s: file_store.delete failed key=%s",
@@ -175,9 +197,9 @@ async def release_files_safely(
             )
             continue
         storage_deleted_ids.append(row.file_id)
-    if storage_deleted_ids:
+    if storage_deleted_ids and delete_db:
         try:
-            await storage.delete_files_by_ids(storage_deleted_ids)
+            deleted_count = await storage.delete_files_by_ids(storage_deleted_ids)
         except Exception:
             logger.exception(
                 "[WebChatGateway] %s: delete_files_by_ids failed ids=%d",
@@ -185,6 +207,15 @@ async def release_files_safely(
                 len(storage_deleted_ids),
             )
             return 0
+        # Current backends return the affected-row count. A legacy backend
+        # may return None; in that case retain the historical optimistic
+        # count for compatibility. The per-row retention path uses a
+        # single id, so a partial count cannot be misattributed.
+        if deleted_count is not None:
+            try:
+                return max(0, min(len(storage_deleted_ids), int(deleted_count)))
+            except (TypeError, ValueError):
+                pass
     return len(storage_deleted_ids)
 
 

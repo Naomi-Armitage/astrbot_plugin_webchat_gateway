@@ -5,6 +5,24 @@
 
 ## Unreleased
 
+### Added — Drop 多端自传
+- 侧栏固定一个 Drop 会话：同一 token 的多端可互传文字与任意文件，**LLM 不参与、不扣每日配额、不污染 CM 历史**。原本 Drop-like 行为依赖 MS Edge；本插件提供等价功能（多端跨设备笔记/小文件传输）且符合 WebChat Gateway 的存算约束。
+- 新表 `webchat_drop_messages`（v5 → v6 迁移）：每行 `{id, token_name, device_id, device_name, kind: text|file, text, file_id?, filename, mime, size_bytes, created_at, deleted_at}`。LLM 上下文（AstrBot CM）完全不接触这些行——TECH_DEBT §1 警告的 user/assistant 配对语义污染不会发生。
+- 新事件类型走现有 `webchat_updates` 长轮询通道：`drop_message_added` / `drop_message_deleted` / `drop_history_cleared`。peer 设备通过现有 `{prefix}/events?since=N` 接收，零额外连接。
+- 5 个新 HTTP 端点 + 1 个 serve 端点，详见 README"Drop 端点"章节：
+  - `POST {prefix}/drop/send` — 文字 + 已上传 file_id 引用，含设备标识（`device_id` + `device_name`）。校验文件 ownership（必须属于本 token 且 `session_id='drop'`），否则 `400 invalid_attachment`。
+  - `POST {prefix}/drop/upload` — multipart 任意文件；图片走 PIL sniff（与现有图片上传一致），其他类型信任声明 MIME 但服务端拒绝 `image/svg+xml` / `text/html` / `application/xhtml+xml` 与 `.html`/`.svg`/`.xhtml`/`.xht`/`.shtml` 扩展名（stored-XSS 防御）。`X-Content-Type-Options: nosniff` + serve 时强制 `attachment` 下载是兜底。
+  - `GET {prefix}/drop/messages` — `peek+1` 分页（边界页与全满页可区分），`limit` 1-200。
+  - `DELETE {prefix}/drop/messages/{id}` — 软删除，幂等 404。
+  - `POST {prefix}/drop/clear` — 硬清空 + 释放所有附件；前端 `confirm` 提示。
+  - `GET {prefix}/drop/files/{id}` — 与 `/files/{id}` 同样的双认证（bearer + `wcg_file` cookie）。图片 `inline`，其他 MIME `attachment`。跨 token 统一 404 不区分。
+- 端点与 Chat 路径隔离：`/chat` 入口拒绝 `session_id='drop'`（400 `reserved_session`），`/title` / `/conversations/{drop}` PATCH/CLEAR 同样 400 `reserved_session` —— 普通会话不会撞库占位。
+- 前端：侧栏顶部固定 "Drop" 标签，**本机设备的消息靠右，他机靠左带设备名 header**（复用现有 `.msg-row.user-row` / `.msg-row.bot-row` 的右/左对齐 CSS）。`device_id` 持久于 `localStorage`，UUID 风格；`device_name` 从 UA 派生 + localStorage 覆盖。composer 在 Drop 模式接受任意文件类型 + 应用 `drop.max_file_size_mb` 上限；聊天上传仍只接受 image/*。
+- 配置项：`drop.enabled`（默认 true，关闭后 sidebar 不显示 Drop、写端点 403 `drop_disabled`，旧链接仍可下载）、`drop.max_file_size_mb`（默认 100，独立于 `uploads.max_file_size_mb`）、`drop.retention_days`（默认 0 = 永久；>0 时后台 prune 物理删除软删消息并释放对应文件，机制与 `audit_retention_days` 一致）。Drop 文件**与图片上传共用 `uploads.per_token_storage_mb`**——启用 Drop 不会让某用户存储翻倍。
+- 新审计事件：`drop_sent` / `drop_upload_ok` / `drop_upload_rejected` / `drop_message_deleted` / `drop_cleared` / `drop_serve_blocked`（跨 token 探测），详情见 README "审计事件类型"。
+- `webchat_files.filename`（v6 列）：保留上传原名供 Drop serve 端点返回 `Content-Disposition`；老的 v5 上传 backfill 为 `''`，图片路径（`<img src>`）不受影响。
+- `core/audit.py` 模块 docstring 同步登记新事件（README 审计节也已过时，下次清洁文档时一起补齐）。
+
 ### ⚠️ Breaking
 - **`master_admin_key` 硬下限从 16 字符上调到 24 字符**。本来认为 16 字符够（在 IP-guard + 常量时间比较的保护下），但**一旦日志泄漏，sub-24 字符的 key 是离线可破解时间数量级（数小时～数天）**，远低于密钥轮换周期。升级到本版本后：
   - 长度 ≥ 24 字符：照常工作。

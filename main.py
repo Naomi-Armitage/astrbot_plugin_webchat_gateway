@@ -34,6 +34,7 @@ from .handlers.admin_stats import AdminDeps
 from .handlers.admin_tokens import ServiceError, TokenService
 from .handlers.chat import ChatDeps
 from .handlers.conversations import ConversationDeps, ConversationService
+from .handlers.drop import DropDeps
 from .handlers.files import UploadDeps
 from .handlers.server import ServerDeps, ServerLifecycle, build_app
 from .handlers.title import TitleDeps
@@ -86,6 +87,7 @@ class WebChatGatewayPlugin(Star):
         self._registry: StreamRegistry | None = None
         self._cookie_logout_tracker: CookieLogoutTracker | None = None
         self._event_bus: EventBus | None = None
+        self._upload_gate: PerTokenUploadGate | None = None
         # Held so _reload_cfg can swap a fresh ImageBridge in after an
         # admin settings save — without this the live ChatDeps would
         # still point at the pre-edit bridge and /image would keep
@@ -179,6 +181,7 @@ class WebChatGatewayPlugin(Star):
             )
             concurrency = PerTokenConcurrency()
             upload_gate = PerTokenUploadGate()
+            self._upload_gate = upload_gate
             llm_bridge = LlmBridge(
                 self.context,
                 history_turns=cfg.history_turns,
@@ -423,6 +426,23 @@ class WebChatGatewayPlugin(Star):
                 trust_referer_as_origin=cfg.trust_referer_as_origin,
                 allow_missing_origin=cfg.allow_missing_origin,
             )
+            drop_deps = DropDeps(
+                storage=storage,
+                audit=audit,
+                event_bus=event_bus,
+                file_store=file_store,
+                upload_gate=upload_gate,
+                ip_guard=ip_guard,
+                allowed_origins=cfg.allowed_origins,
+                enabled=cfg.drop.enabled,
+                per_token_storage_mb=cfg.uploads.per_token_storage_mb,
+                max_file_size_mb=cfg.drop.max_file_size_mb,
+                trust_forwarded_for=cfg.trust_forwarded_for,
+                file_cookie_secret=file_cookie_secret,
+                cookie_logout_tracker=cookie_logout_tracker,
+                trust_referer_as_origin=cfg.trust_referer_as_origin,
+                allow_missing_origin=cfg.allow_missing_origin,
+            )
             server_deps = ServerDeps(
                 config=cfg,
                 chat=chat_deps,
@@ -433,6 +453,7 @@ class WebChatGatewayPlugin(Star):
                 conv=conv_deps,
                 conv_service=conv_service,
                 upload=upload_deps,
+                drop=drop_deps,
             )
             app = build_app(server_deps)
 
@@ -578,9 +599,14 @@ class WebChatGatewayPlugin(Star):
                             (self._cfg.audit_retention_days if self._cfg else 7)
                             * 86400
                         ),
+                        drop_deleted_retention_seconds=(
+                            (self._cfg.drop.retention_days if self._cfg else 0)
+                            * 86400
+                        ),
                     ),
                     cookie_logout_tracker=self._cookie_logout_tracker,
                     event_bus=self._event_bus,
+                    upload_gate=self._upload_gate,
                 )
                 try:
                     await orchestrator.run_iteration()
@@ -655,6 +681,7 @@ class WebChatGatewayPlugin(Star):
         self._registry = None
         self._cookie_logout_tracker = None
         self._event_bus = None
+        self._upload_gate = None
         self._chat_deps = None
         if self._log_handler is not None:
             try:

@@ -26,6 +26,7 @@ from ..core.ratelimit import PerTokenConcurrency
 from ..core.stream_registry import StreamRegistry
 from ..storage.base import AbstractStorage, FileRow, TokenRow
 from .common import gate_request, json_response
+from .conversations_overlay import DROP_SESSION_ID
 
 if TYPE_CHECKING:
     from .conversations import ConversationService
@@ -66,11 +67,10 @@ class ChatDeps:
     # default factory keeps a bare ChatDeps test-construct usable.
     file_cookie_secret: bytes = b""
     file_cookie_ttl_seconds: int = 86400
-    # Path attribute on the Set-Cookie. MUST match the actual /files
-    # route prefix (`endpoint_prefix + "/files"`) so the browser scopes
-    # the cookie correctly. Hardcoding would break operators who change
-    # `endpoint_prefix` from the default.
-    file_cookie_path: str = "/api/webchat/files"
+    # Path attribute on the Set-Cookie. It must be the common API prefix
+    # (not just `/files`) so the browser sends the cookie to both ordinary
+    # and Drop file routes. main.py derives it from `endpoint_prefix`.
+    file_cookie_path: str = "/api/webchat"
     # In-memory tracker for server-side cookie invalidation on logout.
     # `make_logout_handler` records into this; `make_serve_handler` (in
     # handlers/files.py via UploadDeps) reads from a separate copy of
@@ -156,6 +156,15 @@ def _parse_payload(payload: Any, *, max_attachments: int) -> _ParsedRequest | No
     session_id = str(
         payload.get("sessionId") or payload.get("session_id") or "webchat"
     ).strip() or "webchat"
+    if session_id == DROP_SESSION_ID:
+        # Reserved for the Drop (multi-device self-to-self) feature — a
+        # chat turn under this id would write CM history that the Drop
+        # panel never reads, and a chat attachment under this id would
+        # park a committed file in the Drop file namespace where
+        # drop_clear would release it out from under the conversation.
+        # Reject at the parse layer so both /chat and /chat/stream
+        # short-circuit before any lock/quota work.
+        raise _ParseError("reserved_session")
     user_id = str(payload.get("userId") or payload.get("user_id") or "").strip()
     username = (str(payload.get("username") or "").strip() or "WebUser")[:64]
     size = _parse_size(payload.get("size"))

@@ -15,6 +15,7 @@ from .base import (
     AUDIT_DETAIL_MAX,
     AbstractStorage,
     AuditRow,
+    DropMessageRow,
     FileRow,
     NewEvent,
     SessionMetaRow,
@@ -24,6 +25,7 @@ from .base import (
     _Sentinel,
 )
 from .ddl import (
+    ALTER_FILES_ADD_FILENAME_SQLITE,
     ALTER_META_ADD_COUNT_SQLITE,
     ALTER_META_ADD_PREVIEW_SQLITE,
     ALTER_TOKENS_ADD_EXPIRES_AT_SQLITE,
@@ -32,6 +34,7 @@ from .ddl import (
     SCHEMA_SQLITE,
     V2_TO_V3_SQLITE,
     V4_TO_V5_SQLITE,
+    V5_TO_V6_SQLITE,
 )
 
 
@@ -146,6 +149,21 @@ class SqliteStorage(AbstractStorage):
                 for stmt in V4_TO_V5_SQLITE:
                     await self._conn.execute(stmt)
                 stored = "5"
+            if stored == "5":
+                # v5 → v6: Drop (multi-device self-to-self transfer). Two
+                # additive changes — webchat_files.filename (for Content-
+                # Disposition on non-image downloads) + webchat_drop_messages
+                # table. The CREATE TABLE / CREATE INDEX are idempotent via
+                # IF NOT EXISTS; the ALTER is guarded by the duplicate-
+                # column check (same pattern as v3 → v4).
+                try:
+                    await self._conn.execute(ALTER_FILES_ADD_FILENAME_SQLITE)
+                except aiosqlite.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
+                for stmt in V5_TO_V6_SQLITE:
+                    await self._conn.execute(stmt)
+                stored = "6"
             # Persist the marker only when the ladder actually
             # advanced (`stored != stored_pre`). A boot whose stored
             # value already matches CURRENT skips the dead UPDATE.
@@ -1031,7 +1049,7 @@ class SqliteStorage(AbstractStorage):
         # Orphan source: uploaded-but-never-committed (tab close).
         async with self._db.execute(
             "SELECT file_id, token_name, session_id, mime, size_bytes, "
-            "       storage_key, committed, uploaded_at, committed_at "
+            "       storage_key, committed, uploaded_at, committed_at, filename "
             "FROM webchat_files "
             "WHERE committed = 0 AND uploaded_at < ? "
             "ORDER BY uploaded_at ASC LIMIT ?",
@@ -1047,7 +1065,7 @@ class SqliteStorage(AbstractStorage):
         async with self._db.execute(
             "SELECT f.file_id, f.token_name, f.session_id, f.mime, "
             "       f.size_bytes, f.storage_key, f.committed, "
-            "       f.uploaded_at, f.committed_at "
+            "       f.uploaded_at, f.committed_at, f.filename "
             "FROM webchat_files AS f "
             "INNER JOIN webchat_session_meta AS m "
             "  ON m.token_name = f.token_name "
@@ -1100,6 +1118,9 @@ class SqliteStorage(AbstractStorage):
             committed_at=(
                 int(row["committed_at"]) if row["committed_at"] is not None else None
             ),
+            # filename is NULL-tolerant in case a custom test fixture
+            # inserts a row without the v5 → v6 default.
+            filename=str(row["filename"] or "") if "filename" in row.keys() else "",
         )
 
     async def insert_file(
@@ -1112,21 +1133,22 @@ class SqliteStorage(AbstractStorage):
         size_bytes: int,
         storage_key: str,
         now: int,
+        filename: str = "",
     ) -> None:
         async with self._write_lock:
             await self._db.execute(
                 "INSERT INTO webchat_files("
                 "file_id, token_name, session_id, mime, size_bytes, "
-                "storage_key, committed, uploaded_at, committed_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, 0, ?, NULL)",
-                (file_id, token_name, session_id, mime, size_bytes, storage_key, now),
+                "storage_key, committed, uploaded_at, committed_at, filename) "
+                "VALUES (?, ?, ?, ?, ?, ?, 0, ?, NULL, ?)",
+                (file_id, token_name, session_id, mime, size_bytes, storage_key, now, filename or ""),
             )
             await self._db.commit()
 
     async def get_file(self, file_id: str) -> FileRow | None:
         async with self._db.execute(
             "SELECT file_id, token_name, session_id, mime, size_bytes, "
-            "       storage_key, committed, uploaded_at, committed_at "
+            "       storage_key, committed, uploaded_at, committed_at, filename "
             "FROM webchat_files WHERE file_id = ?",
             (file_id,),
         ) as cursor:
@@ -1184,7 +1206,7 @@ class SqliteStorage(AbstractStorage):
     ) -> list[FileRow]:
         async with self._db.execute(
             "SELECT file_id, token_name, session_id, mime, size_bytes, "
-            "       storage_key, committed, uploaded_at, committed_at "
+            "       storage_key, committed, uploaded_at, committed_at, filename "
             "FROM webchat_files "
             "WHERE token_name = ? AND session_id = ? "
             "ORDER BY uploaded_at ASC",
@@ -1199,7 +1221,7 @@ class SqliteStorage(AbstractStorage):
         limit = max(1, min(limit, 1000))
         async with self._db.execute(
             "SELECT file_id, token_name, session_id, mime, size_bytes, "
-            "       storage_key, committed, uploaded_at, committed_at "
+            "       storage_key, committed, uploaded_at, committed_at, filename "
             "FROM webchat_files "
             "WHERE committed = 0 AND uploaded_at < ? "
             "ORDER BY uploaded_at ASC LIMIT ?",
@@ -1215,7 +1237,7 @@ class SqliteStorage(AbstractStorage):
         async with self._db.execute(
             "SELECT f.file_id, f.token_name, f.session_id, f.mime, "
             "       f.size_bytes, f.storage_key, f.committed, "
-            "       f.uploaded_at, f.committed_at "
+            "       f.uploaded_at, f.committed_at, f.filename "
             "FROM webchat_files AS f "
             "INNER JOIN webchat_session_meta AS m "
             "  ON m.token_name = f.token_name "
@@ -1239,3 +1261,195 @@ class SqliteStorage(AbstractStorage):
             affected = cur.rowcount or 0
             await self._db.commit()
         return affected
+
+    # ----- Drop (multi-device self-to-self transfer, v6) -----
+
+    @staticmethod
+    def _row_to_drop_message(row: aiosqlite.Row) -> DropMessageRow:
+        return DropMessageRow(
+            id=int(row["id"]),
+            token_name=row["token_name"],
+            device_id=row["device_id"],
+            device_name=str(row["device_name"] or ""),
+            kind=row["kind"],
+            text=str(row["text"] or ""),
+            file_id=(row["file_id"] if row["file_id"] is not None else None),
+            filename=str(row["filename"] or ""),
+            mime=str(row["mime"] or ""),
+            size_bytes=int(row["size_bytes"] or 0),
+            created_at=int(row["created_at"]),
+            deleted_at=(
+                int(row["deleted_at"]) if row["deleted_at"] is not None else None
+            ),
+        )
+
+    async def append_drop_message(
+        self,
+        *,
+        token_name: str,
+        device_id: str,
+        device_name: str,
+        kind: str,
+        text: str,
+        file_id: str | None,
+        filename: str,
+        mime: str,
+        size_bytes: int,
+        now: int,
+    ) -> int:
+        # The id is autoincrement-assigned by SQLite. `cursor.lastrowid`
+        # is reliable inside the same connection (single-writer model).
+        async with self._write_lock:
+            cur = await self._db.execute(
+                "INSERT INTO webchat_drop_messages("
+                "token_name, device_id, device_name, kind, text, file_id, "
+                "filename, mime, size_bytes, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    token_name,
+                    device_id,
+                    device_name,
+                    kind,
+                    text,
+                    file_id,
+                    filename,
+                    mime,
+                    size_bytes,
+                    now,
+                ),
+            )
+            await self._db.commit()
+        new_id = int(cur.lastrowid or 0)
+        return new_id
+
+    async def list_drop_messages(
+        self,
+        *,
+        token_name: str,
+        limit: int,
+        before_id: int | None,
+        include_deleted: bool,
+    ) -> list[DropMessageRow]:
+        # Single SELECT for both branches — `deleted_at IS NULL` filter is
+        # a no-op when include_deleted=True. Build the WHERE clause portably
+        # rather than branching two queries (keeps the index hit identical
+        # to the more common path).
+        clauses = ["token_name = ?"]
+        params: list = [token_name]
+        if not include_deleted:
+            clauses.append("deleted_at IS NULL")
+        if before_id is not None:
+            clauses.append("id < ?")
+            params.append(before_id)
+        params.append(limit)
+        sql = (
+            "SELECT id, token_name, device_id, device_name, kind, text, "
+            "file_id, filename, mime, size_bytes, created_at, deleted_at "
+            "FROM webchat_drop_messages "
+            f"WHERE {' AND '.join(clauses)} "
+            "ORDER BY id DESC LIMIT ?"
+        )
+        async with self._db.execute(sql, tuple(params)) as cursor:
+            rows = await cursor.fetchall()
+        return [self._row_to_drop_message(r) for r in rows]
+
+    async def get_drop_message(
+        self, *, token_name: str, message_id: int
+    ) -> DropMessageRow | None:
+        async with self._db.execute(
+            "SELECT id, token_name, device_id, device_name, kind, text, "
+            "file_id, filename, mime, size_bytes, created_at, deleted_at "
+            "FROM webchat_drop_messages "
+            "WHERE token_name = ? AND id = ?",
+            (token_name, message_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return self._row_to_drop_message(row) if row else None
+
+    async def soft_delete_drop_message(
+        self, *, token_name: str, message_id: int, now: int
+    ) -> bool:
+        async with self._write_lock:
+            cur = await self._db.execute(
+                "UPDATE webchat_drop_messages "
+                "SET deleted_at = ? "
+                "WHERE token_name = ? AND id = ? AND deleted_at IS NULL",
+                (now, token_name, message_id),
+            )
+            await self._db.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def hard_delete_drop_message(
+        self, *, token_name: str, message_id: int
+    ) -> bool:
+        async with self._write_lock:
+            cur = await self._db.execute(
+                "DELETE FROM webchat_drop_messages "
+                "WHERE token_name = ? AND id = ?",
+                (token_name, message_id),
+            )
+            await self._db.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def clear_drop_history(
+        self, *, token_name: str, now: int
+    ) -> int:
+        # Hard delete is fine here — clear is operator-initiated and
+        # emits its own drop_history_cleared event so peer devices can
+        # nuke their local cache of the same id range. We soft-delete
+        # first (so a concurrent reader sees a consistent state), then
+        # hard-delete in the same transaction; `now` is accepted for
+        # parity with soft_delete_drop_message and future "soft-then-
+        # prune" consolidation.
+        del now
+        async with self._write_lock:
+            cur = await self._db.execute(
+                "DELETE FROM webchat_drop_messages WHERE token_name = ?",
+                (token_name,),
+            )
+            await self._db.commit()
+        return int(cur.rowcount or 0)
+
+    async def list_drop_messages_to_purge(
+        self, *, before_ts: int, limit: int = 500
+    ) -> list[DropMessageRow]:
+        async with self._db.execute(
+            "SELECT id, token_name, device_id, device_name, kind, text, "
+            "file_id, filename, mime, size_bytes, created_at, deleted_at "
+            "FROM webchat_drop_messages "
+            "WHERE deleted_at IS NOT NULL AND deleted_at < ? "
+            "ORDER BY deleted_at ASC LIMIT ?",
+            (before_ts, limit),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [self._row_to_drop_message(r) for r in rows]
+
+    async def list_drop_files(
+        self, *, token_name: str
+    ) -> list[FileRow]:
+        async with self._db.execute(
+            "SELECT file_id, token_name, session_id, mime, size_bytes, "
+            "       storage_key, committed, uploaded_at, committed_at, filename "
+            "FROM webchat_files "
+            "WHERE token_name = ? AND session_id = 'drop'",
+            (token_name,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [self._row_to_file(r) for r in rows]
+
+    async def count_drop_file_references(
+        self, *, token_name: str, file_id: str
+    ) -> int:
+        """Return the number of Drop rows that still point at file_id.
+
+        Soft-deleted rows count until they are physically purged; deleting a
+        file while one of those rows remains would turn a later history
+        replay into a broken attachment.
+        """
+        async with self._db.execute(
+            "SELECT COUNT(*) AS n FROM webchat_drop_messages "
+            "WHERE token_name = ? AND file_id = ?",
+            (token_name, file_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return int(row["n"]) if row else 0
