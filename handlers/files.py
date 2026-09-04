@@ -308,18 +308,9 @@ def make_upload_handler(deps: UploadDeps):
         ext = ext_for_mime(mime) or ALLOWED_MIME_TO_EXT.get(mime, "")
         storage_key = f"{token.name}/{file_id}{ext}"
 
-        # Quota check + reservation are wrapped in a per-token gate so
-        # concurrent uploads on the same token can't all pass the same
-        # check-then-act and collectively write past the cap. The lock
-        # is BLOCKING (uploads queue, they don't 429) and ONLY scopes
-        # the DB-side critical section; file_store.save() runs outside.
-        #
-        # We compute the audit metrics + insert the file row with
-        # committed=0 inside the lock — that "reserves" the quota slot
-        # by making total_size_for_token return the new total on the
-        # next concurrent caller. If the subsequent disk write fails
-        # we roll back the row, restoring the quota.
-        committed_total = 0
+        # Quota reservation and the object write share one blocking
+        # per-token gate. This prevents concurrent Drop mutations from
+        # observing a partially saved file while preserving quota safety.
         async with deps.upload_gate.acquire(token.name):
             try:
                 committed_total = await deps.storage.total_committed_size_for_token(
@@ -329,15 +320,16 @@ def make_upload_handler(deps: UploadDeps):
                 logger.exception(
                     "[WebChatGateway] total_committed_size_for_token failed"
                 )
-                committed_total = 0
-            try:
-                stored_total = await deps.storage.total_size_for_token(token.name)
-            except Exception:
-                logger.exception(
-                    "[WebChatGateway] total_size_for_token failed"
+                return json_response(
+                    {"error": "storage_unavailable"}, status=503,
+                    origin=origin, allowed_origins=allowed_origins,
+                    same_origin_host=same_host,
+                    extra_headers={"Retry-After": "5"},
                 )
-                stored_total = committed_total
-            if stored_total + len(file_content) > per_token_quota_bytes:
+            # Check quota against committed files only. Uncommitted temporary
+            # files are cleaned by orphan GC; counting them would incorrectly
+            # reject uploads when the user has orphaned temporaries.
+            if committed_total + len(file_content) > per_token_quota_bytes:
                 await deps.audit.write(
                     "upload_rejected",
                     name=token.name,
@@ -378,31 +370,29 @@ def make_upload_handler(deps: UploadDeps):
                     same_origin_host=same_host,
                 )
 
-        # Disk write OUTSIDE the per-token lock — bytes flow doesn't
-        # need serialization, and keeping the critical section short
-        # means concurrent uploads on the same token only queue on the
-        # tiny DB step. If save fails after the row was already inserted,
-        # we roll back the row so the quota is restored.
-        try:
-            await deps.file_store.save(
-                storage_key=storage_key, content=file_content, mime=mime
-            )
-        except Exception:
-            logger.exception("[WebChatGateway] file_store.save failed")
             try:
-                await deps.storage.delete_files_by_ids([file_id])
-            except Exception:
-                logger.exception(
-                    "[WebChatGateway] insert_file rollback (delete row) failed"
+                await deps.file_store.save(
+                    storage_key=storage_key, content=file_content, mime=mime
                 )
-            return json_response(
-                {"error": "internal_error"},
-                status=500,
-                origin=origin,
-                allowed_origins=allowed,
-                same_origin_host=same_host,
-            )
+            except Exception:
+                logger.exception("[WebChatGateway] file_store.save failed")
+                try:
+                    await deps.storage.delete_files_by_ids([file_id])
+                except Exception:
+                    logger.exception(
+                        "[WebChatGateway] insert_file rollback (delete row) failed"
+                    )
+                return json_response(
+                    {"error": "internal_error"},
+                    status=500,
+                    origin=origin,
+                    allowed_origins=allowed,
+                    same_origin_host=same_host,
+                )
 
+
+        # Reservation and object write are complete before releasing
+        # the gate, so other mutations cannot observe a partial upload.
         await deps.audit.write(
             "upload_ok",
             name=token.name,
@@ -452,7 +442,7 @@ def make_serve_handler(deps: UploadDeps):
     2. `Cookie: wcg_file=<token_name>.<exp>.<sig>` — used by `<img src>`
        which cannot set custom headers. The cookie is HMAC-signed
        (see `core/file_cookie.py`), HttpOnly + SameSite=Lax + path-
-       scoped to /api/webchat/files. /me issues + refreshes it.
+       scoped to the common API prefix. /me issues + refreshes it.
 
     The previous `?t=<bearer>` query-string fallback has been removed
     — leaking the bearer into browser history / access logs / Referer
@@ -645,14 +635,24 @@ def make_serve_handler(deps: UploadDeps):
         # Uniform 404 on missing + wrong-owner. No 403 branch — that
         # would let an attacker distinguish "exists, not yours" from
         # "doesn't exist".
-        if row is None or row.token_name != token.name:
+        # Drop files have a separate serve policy (non-images must be
+        # downloaded, and the namespace is intentionally isolated). Do not
+        # let a caller bypass that policy by swapping /drop/files/ for the
+        # ordinary /files/ route.
+        if (
+            row is None
+            or row.token_name != token.name
+            or row.session_id == "drop"
+        ):
             # Best-effort forensic audit: log cross-token probes (row
             # exists but belongs to a different token) distinctly from
             # genuine misses. The client still sees a uniform 404 (no
             # timing/content leak), but operators get a signal for
             # probing patterns. Bare miss is silent to avoid flooding
             # the audit log with normal 404s from stale URLs.
-            if row is not None and row.token_name != token.name:
+            if row is not None and (
+                row.token_name != token.name or row.session_id == "drop"
+            ):
                 try:
                     await deps.audit.write(
                         "file_serve_blocked",
