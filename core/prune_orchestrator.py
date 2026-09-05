@@ -48,7 +48,7 @@ from astrbot.api import logger
 from .file_lifecycle import release_files_safely
 
 if TYPE_CHECKING:
-    from ..storage.base import AbstractStorage, FileRow
+    from ..storage.base import AbstractStorage
     from .cookie_logout import CookieLogoutTracker
     from .event_bus import EventBus
     from .file_store import FileStore

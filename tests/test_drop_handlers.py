@@ -17,7 +17,6 @@ from pathlib import Path
 from aiohttp import FormData
 
 import pytest
-import pytest_asyncio
 from aiohttp.test_utils import TestClient, TestServer
 
 

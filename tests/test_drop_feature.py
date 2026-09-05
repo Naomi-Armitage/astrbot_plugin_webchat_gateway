@@ -249,7 +249,7 @@ class TestDropMessages:
         ) is None
 
     async def test_purge_listing_scopes_by_deleted_ts(self, storage):
-        keep = await storage.append_drop_message(
+        await storage.append_drop_message(
             token_name="alice", device_id="d", device_name="",
             kind="text", text="keep", file_id=None, filename="", mime="",
             size_bytes=0, now=100,
@@ -279,7 +279,7 @@ class TestDropMessages:
             kind="text", text="a", file_id=None, filename="", mime="",
             size_bytes=0, now=100,
         )
-        b = await storage.append_drop_message(
+        await storage.append_drop_message(
             token_name="alice", device_id="d", device_name="",
             kind="text", text="b", file_id=None, filename="", mime="",
             size_bytes=0, now=101,

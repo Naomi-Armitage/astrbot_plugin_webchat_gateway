@@ -322,7 +322,7 @@ def make_upload_handler(deps: UploadDeps):
                 )
                 return json_response(
                     {"error": "storage_unavailable"}, status=503,
-                    origin=origin, allowed_origins=allowed_origins,
+                    origin=origin, allowed_origins=allowed,
                     same_origin_host=same_host,
                     extra_headers={"Retry-After": "5"},
                 )
@@ -337,7 +337,6 @@ def make_upload_handler(deps: UploadDeps):
                     detail={
                         "reason": "storage_quota_exceeded",
                         "committed": committed_total,
-                        "uncommitted": max(0, stored_total - committed_total),
                         "size": len(file_content),
                     },
                 )
