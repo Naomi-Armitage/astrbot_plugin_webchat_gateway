@@ -21,6 +21,7 @@
             </svg>
             <span>新会话</span>
           </button>
+          <button id="dropEntry" class="sidebar-new drop-entry" type="button" hidden>↗ 设备 Drop</button>
         </div>
         <ul id="sessionList" class="session-list" role="list"></ul>
       </aside>
@@ -60,7 +61,15 @@
           </div>
         </header>
 
+        <section id="dropPanel" class="drop-panel" hidden aria-label="设备 Drop">
+          <div class="drop-panel-head"><div><h2>设备 Drop</h2><p>在已登录设备之间传递文字和文件</p></div>
+            <div class="drop-panel-actions"><button id="dropRefresh" type="button">刷新</button><button id="dropClear" type="button">清空</button><button id="dropClose" type="button">关闭</button></div></div>
+          <div id="dropMessages" class="drop-messages" role="log" aria-live="polite"></div>
+          <form id="dropComposer" class="drop-composer"><input id="dropFileInput" type="file" multiple hidden /><button id="dropAttach" type="button">添加文件</button><input id="dropTextInput" type="text" placeholder="写点什么…" /><button id="dropSend" type="submit">发送</button></form>
+          <div id="dropStatus" class="drop-status" role="status"></div>
+        </section>
         <div id="messages">
+
           <div id="emptyState" class="empty-state">
             <span class="empty-icon" aria-hidden="true">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"

@@ -52,6 +52,12 @@ const CONV_URL = `${API}/conversations`;
 const EVENTS_URL = `${API}/events`;
 const UPLOAD_URL = `${API}/upload`;
 const FILES_URL = `${API}/files`;
+const DROP_SEND_URL = API + "/drop/send";
+const DROP_UPLOAD_URL = API + "/drop/upload";
+const DROP_MESSAGES_URL = API + "/drop/messages";
+const DROP_CLEAR_URL = API + "/drop/clear";
+const DROP_FILE_URL = (id: string): string => API + "/drop/files/" + encodeURIComponent(id);
+const LS_DROP_DEVICE = "wcg.drop.device_id";
 // Per-message action endpoints. `sid` and `index` are URL-segments — the
 // server's path layout matches cfg.conversations_message_path and
 // cfg.conversations_regenerate_path.
@@ -301,6 +307,18 @@ const imgRatioBar = $<HTMLDivElement>("imgRatioBar");
 const composerAttachmentsEl = $("composer-attachments");
 const dropOverlayEl = $("dropOverlay");
 const footerEl = document.querySelector("footer") as HTMLElement;
+const dropEntry = $<HTMLButtonElement>("dropEntry");
+const dropPanel = $<HTMLElement>("dropPanel");
+const dropMessagesEl = $<HTMLDivElement>("dropMessages");
+const dropComposer = $<HTMLFormElement>("dropComposer");
+const dropTextInput = $<HTMLInputElement>("dropTextInput");
+const dropFileInput = $<HTMLInputElement>("dropFileInput");
+const dropAttach = $<HTMLButtonElement>("dropAttach");
+const dropClose = $<HTMLButtonElement>("dropClose");
+const dropRefresh = $<HTMLButtonElement>("dropRefresh");
+const dropClear = $<HTMLButtonElement>("dropClear");
+const dropSend = $<HTMLButtonElement>("dropSend");
+const dropStatus = $<HTMLDivElement>("dropStatus");
 
 const username = (localStorage.getItem(LS_USERNAME) || "Friend").trim() || "Friend";
 const strong = document.createElement("strong");
@@ -3203,6 +3221,73 @@ async function clearActiveHistory(): Promise<void> {
   }
 }
 
+interface DropMessage {
+  id: number; device_id: string; device_name: string; kind: "text" | "file";
+  text: string; created_at: number; file_id?: string; filename?: string;
+  mime?: string; size?: number;
+}
+let dropOpen = false;
+let dropTimer: ReturnType<typeof setInterval> | null = null;
+let dropMessages: DropMessage[] = [];
+let dropMaxFileBytes = 100 * 1024 * 1024;
+const dropDeviceId = (() => {
+  const old = localStorage.getItem(LS_DROP_DEVICE);
+  if (old && /^[A-Za-z0-9_\-.:]{8,64}$/.test(old)) return old;
+  const value = newId(); localStorage.setItem(LS_DROP_DEVICE, value); return value;
+})();
+function dropStatusText(text: string, bad = false): void {
+  dropStatus.textContent = text; dropStatus.dataset.state = bad ? "bad" : "";
+}
+function renderDropMessages(): void {
+  dropMessagesEl.replaceChildren();
+  if (!dropMessages.length) { const e = document.createElement("p"); e.className = "drop-empty"; e.textContent = "还没有 Drop 内容。"; dropMessagesEl.append(e); return; }
+  for (const item of [...dropMessages].reverse()) {
+    const row = document.createElement("article"); row.className = "drop-item" + (item.device_id === dropDeviceId ? " mine" : "");
+    const head = document.createElement("div"); head.className = "drop-item-head"; head.textContent = (item.device_name || "设备") + " · " + relativeTime(item.created_at * 1000); row.append(head);
+    if (item.kind === "file" && item.file_id) {
+      const link = document.createElement("a"); link.className = "drop-file-link"; link.href = DROP_FILE_URL(item.file_id); link.target = "_blank"; link.rel = "noopener"; link.textContent = item.filename || "下载文件"; row.append(link);
+    } else { const text = document.createElement("div"); text.className = "drop-item-text"; text.textContent = item.text; row.append(text); }
+    const del = document.createElement("button"); del.type = "button"; del.className = "drop-item-delete"; del.textContent = "删除"; del.onclick = () => { void deleteDropMessage(item.id); }; row.append(del); dropMessagesEl.append(row);
+  }
+}
+async function loadDropMessages(): Promise<void> {
+  try {
+    const resp = await fetchWithTimeout(DROP_MESSAGES_URL, { headers: bearer(), credentials: "same-origin" }, FETCH_TIMEOUT_FAST_MS);
+    if (resp.status === 401) { handle401(); return; }
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const data = await resp.json() as { messages?: DropMessage[] };
+    dropMessages = Array.isArray(data.messages) ? data.messages : []; renderDropMessages(); dropStatusText("");
+  } catch (e) { dropStatusText("加载失败：" + (e as Error).message, true); }
+}
+async function deleteDropMessage(id: number): Promise<void> {
+  try {
+    const resp = await fetchWithTimeout(DROP_MESSAGES_URL + "/" + id, { method: "DELETE", headers: bearer(), credentials: "same-origin" }, FETCH_TIMEOUT_FAST_MS);
+    if (!resp.ok && resp.status !== 404) throw new Error("HTTP " + resp.status);
+    dropMessages = dropMessages.filter((m) => m.id !== id); renderDropMessages();
+  } catch (e) { dropStatusText("删除失败：" + (e as Error).message, true); }
+}
+async function uploadDropFile(file: File): Promise<string> {
+  if (file.size > dropMaxFileBytes) throw new Error(file.name + " 超过大小限制");
+  const form = new FormData(); form.append("file", file, file.name); form.append("filename", file.name);
+  const resp = await fetchWithTimeout(DROP_UPLOAD_URL, { method: "POST", headers: bearer(), credentials: "same-origin", body: form }, FETCH_TIMEOUT_CHAT_MS);
+  const data = await resp.json().catch(() => ({})) as Record<string, unknown>;
+  if (!resp.ok || typeof data.file_id !== "string") throw new Error(typeof data.error === "string" ? data.error : "上传失败");
+  return data.file_id;
+}
+async function sendDrop(): Promise<void> {
+  const text = dropTextInput.value.trim(); const files = [...(dropFileInput.files || [])];
+  if (!text && !files.length) return; dropSend.disabled = true;
+  try {
+    const refs: Array<{ file_id: string }> = [];
+    for (const file of files) { dropStatusText("正在上传 " + file.name + "…"); refs.push({ file_id: await uploadDropFile(file) }); }
+    const resp = await fetchWithTimeout(DROP_SEND_URL, { method: "POST", headers: { ...bearer(), "Content-Type": "application/json" }, credentials: "same-origin", body: JSON.stringify({ text, attachments: refs, device_id: dropDeviceId, device_name: navigator.userAgent.slice(0, 40) }) }, FETCH_TIMEOUT_CHAT_MS);
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    dropTextInput.value = ""; dropFileInput.value = ""; await loadDropMessages();
+  } catch (e) { dropStatusText("发送失败：" + (e as Error).message, true); } finally { dropSend.disabled = false; }
+}
+function closeDrop(): void { dropOpen = false; if (dropTimer) clearInterval(dropTimer); dropTimer = null; dropPanel.hidden = true; msgs.hidden = false; footerEl.hidden = false; dropEntry.focus(); }
+function openDrop(): void { dropOpen = true; dropPanel.hidden = false; msgs.hidden = true; footerEl.hidden = true; void loadDropMessages(); if (dropTimer) clearInterval(dropTimer); dropTimer = setInterval(() => { if (dropOpen) void loadDropMessages(); }, 15000); dropTextInput.focus(); }
+
 function newSession(): void {
   cancelInflightSend();
   const fresh = blankSession();
@@ -3255,6 +3340,10 @@ async function loadChatSite(): Promise<void> {
         max_attachments_per_message?: number;
         allowed_mime?: string[];
       };
+      drop?: {
+        enabled?: boolean;
+        max_file_size_mb?: number;
+      };
       image_gen?: {
         enabled?: boolean;
         img2img?: boolean;
@@ -3267,6 +3356,9 @@ async function loadChatSite(): Promise<void> {
     // 都非空），所以这里的可见性与 /chat 实际行为一致。关闭后顺手
     // 抹掉 composer 里可能残留的 /image 前缀，避免用户停留在 image
     // 模式但入口不见了。
+    const dropConfig = data.drop as { enabled?: boolean; max_file_size_mb?: number } | undefined;
+    dropEntry.hidden = !(dropConfig && dropConfig.enabled !== false);
+    if (dropConfig && typeof dropConfig.max_file_size_mb === "number" && dropConfig.max_file_size_mb > 0) dropMaxFileBytes = dropConfig.max_file_size_mb * 1024 * 1024;
     const imageEnabled = !!(data.image_gen && data.image_gen.enabled);
     // img2img (reference-image edit) capability. Only true when the server
     // both has image-gen on AND the configured model/endpoint supports the
@@ -5286,6 +5378,16 @@ sidebarToggleBtn.addEventListener("click", () => {
   else openMobileSidebar();
 });
 sidebarBackdrop.addEventListener("click", closeMobileSidebar);
+dropEntry.addEventListener("click", () => { closeMobileSidebar(); openDrop(); });
+dropClose.addEventListener("click", closeDrop);
+dropRefresh.addEventListener("click", () => { void loadDropMessages(); });
+dropAttach.addEventListener("click", () => { dropFileInput.value = ""; dropFileInput.click(); });
+dropComposer.addEventListener("submit", (e) => { e.preventDefault(); void sendDrop(); });
+dropClear.addEventListener("click", async () => {
+  if (!window.confirm("清空所有 Drop 内容？")) return;
+  try { const r = await fetchWithTimeout(DROP_CLEAR_URL, { method: "POST", headers: bearer(), credentials: "same-origin" }, FETCH_TIMEOUT_FAST_MS); if (!r.ok) throw new Error("HTTP " + r.status); dropMessages = []; renderDropMessages(); } catch (e) { dropStatusText("清空失败：" + (e as Error).message, true); }
+});
+
 // Escape-to-close is owned by the sidebar's focus trap (installed in
 // openMobileSidebar). No global listener here — it would race with the
 // trap's onEscape and double-fire closeMobileSidebar.
