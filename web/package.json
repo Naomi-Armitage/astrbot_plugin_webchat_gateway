@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Frontend source for astrbot_plugin_webchat_gateway. Builds into ../examples/<page>/index.html.",
   "scripts": {
-    "dev": "vite",
+    "dev": "vite src/landing",
     "build": "node ./scripts/build.mjs",
     "build:landing": "vite build --config vite.config.ts --mode landing",
     "typecheck": "tsc --noEmit"

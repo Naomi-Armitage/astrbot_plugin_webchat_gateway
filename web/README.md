@@ -49,10 +49,11 @@ npm run build
 npm run dev
 ```
 
-默认进 `web/` 根；切到具体页面时直接指定 root：
+默认启动 landing 页面。切到其他页面时直接指定 root：
 
 ```sh
-npx vite src/landing
+npx vite src/chat_client
+npx vite src/login
 ```
 
 ## 类型检查
