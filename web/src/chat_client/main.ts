@@ -2550,23 +2550,33 @@ function applyEvent(ev: ServerEvent): void {
     case "drop_message_added": {
       // Peer device added a Drop message — prepend to local list and re-render.
       const msg = payload as Partial<DropMessage>;
-      if (!msg.id || typeof msg.text !== "string") break;
+      if (typeof msg.id !== "number" || !Number.isInteger(msg.id)) break;
+      if (typeof msg.text !== "string" || (msg.kind !== "text" && msg.kind !== "file")) break;
       const full: DropMessage = {
-        id: msg.id as string,
+        id: msg.id,
         text: msg.text,
-        device_id: msg.device_id as string || "",
-        device_name: msg.device_name as string || "设备",
-        created_at: msg.created_at as number || ev.ts,
-        attachments: Array.isArray(msg.attachments) ? msg.attachments as DropAttachment[] : [],
+        device_id: typeof msg.device_id === "string" ? msg.device_id : "",
+        device_name: typeof msg.device_name === "string" ? msg.device_name : "设备",
+        kind: msg.kind,
+        created_at: typeof msg.created_at === "number" ? msg.created_at : ev.ts,
+        file_id: typeof msg.file_id === "string" ? msg.file_id : undefined,
+        filename: typeof msg.filename === "string" ? msg.filename : undefined,
+        mime: typeof msg.mime === "string" ? msg.mime : undefined,
+        size: typeof msg.size === "number" ? msg.size : undefined,
       };
       // Prepend (newest first)
+      dropLoadSeq += 1;
+      const existing = dropMessages.findIndex((item) => item.id === full.id);
+      if (existing >= 0) dropMessages.splice(existing, 1);
       dropMessages.unshift(full);
+      dropMessages.sort((a, b) => b.id - a.id);
       if (dropOpen) renderDropMessages();
       break;
     }
     case "drop_message_deleted": {
       const msgId = payload["id"];
-      if (typeof msgId !== "string") break;
+      if (typeof msgId !== "number" || !Number.isInteger(msgId)) break;
+      dropLoadSeq += 1;
       const idx = dropMessages.findIndex((m) => m.id === msgId);
       if (idx >= 0) {
         dropMessages.splice(idx, 1);
@@ -2576,6 +2586,7 @@ function applyEvent(ev: ServerEvent): void {
     }
     case "drop_history_cleared": {
       // Peer device cleared Drop history — mirror locally.
+      dropLoadSeq += 1;
       dropMessages.length = 0;
       if (dropOpen) renderDropMessages();
       break;
@@ -2826,6 +2837,10 @@ function handle401(): void {
 
 function handleEventsResponse(data: ServerEventsResponse): { needsImmediateRefetch: boolean } {
   if (data.tooFar) {
+    // Event history no longer covers the requested cursor.  Refresh the open
+    // Drop panel as well as chat history so it cannot remain stale after a
+    // reconnect or long offline period.
+    if (dropOpen) void loadDropMessages();
     return { needsImmediateRefetch: true };
   }
   applyEvents(data.events ?? []);
@@ -2979,6 +2994,7 @@ function onVisibilityChange(): void {
       sync.streamAbort.abort();
     }
   } else if (!sync.stopped) {
+    if (dropOpen) void loadDropMessages();
     if (sync.transport === "live") void runLongPoll();
     else if (sync.transport === "polling") void shortPollOnce();
     // Back to foreground: if the active session has a PendingStream — e.g.
@@ -3265,6 +3281,8 @@ interface DropMessage {
 let dropOpen = false;
 let dropTimer: ReturnType<typeof setInterval> | null = null;
 let dropMessages: DropMessage[] = [];
+// New requests, events and successful mutations invalidate older list responses.
+let dropLoadSeq = 0;
 let dropMaxFileBytes = 100 * 1024 * 1024;
 const dropDeviceId = (() => {
   const old = localStorage.getItem(LS_DROP_DEVICE);
@@ -3287,19 +3305,26 @@ function renderDropMessages(): void {
   }
 }
 async function loadDropMessages(): Promise<void> {
+  const requestSeq = ++dropLoadSeq;
   try {
     const resp = await fetchWithTimeout(DROP_MESSAGES_URL, { headers: bearer(), credentials: "same-origin" }, FETCH_TIMEOUT_FAST_MS);
     if (resp.status === 401) { handle401(); return; }
     if (!resp.ok) throw new Error("HTTP " + resp.status);
     const data = await resp.json() as { messages?: DropMessage[] };
+    if (requestSeq !== dropLoadSeq) return;
     dropMessages = Array.isArray(data.messages) ? data.messages : []; renderDropMessages(); dropStatusText("");
-  } catch (e) { dropStatusText("加载失败：" + (e as Error).message, true); }
+  } catch (e) {
+    if (requestSeq === dropLoadSeq) dropStatusText("加载失败：" + (e as Error).message, true);
+  }
 }
 async function deleteDropMessage(id: number): Promise<void> {
+  dropLoadSeq += 1;
   try {
     const resp = await fetchWithTimeout(DROP_MESSAGES_URL + "/" + id, { method: "DELETE", headers: bearer(), credentials: "same-origin" }, FETCH_TIMEOUT_FAST_MS);
     if (!resp.ok && resp.status !== 404) throw new Error("HTTP " + resp.status);
-    // 删除成功后等待 SSE drop_message_deleted 事件推送，不主动操作本地数组
+    dropLoadSeq += 1;
+    dropMessages = dropMessages.filter((m) => m.id !== id);
+    if (dropOpen) renderDropMessages();
   } catch (e) { dropStatusText("删除失败：" + (e as Error).message, true); }
 }
 async function uploadDropFile(file: File): Promise<string> {
@@ -3325,12 +3350,12 @@ async function sendDrop(): Promise<void> {
     const resp = await fetchWithTimeout(DROP_SEND_URL, { method: "POST", headers: { ...bearer(), "Content-Type": "application/json" }, credentials: "same-origin", body: JSON.stringify({ text, attachments: refs, device_id: dropDeviceId, device_name: navigator.userAgent.slice(0, 40) }) }, FETCH_TIMEOUT_CHAT_MS);
     if (!resp.ok) throw new Error("HTTP " + resp.status);
     dropTextInput.value = ""; dropFileInput.value = "";
-    // 发送成功后等待 SSE 事件推送，不主动刷新列表
-    dropStatusText("");
+    dropLoadSeq += 1;
+    await loadDropMessages();
   } catch (e) { dropStatusText("发送失败：" + (e as Error).message, true); } finally { dropSend.disabled = false; }
 }
 function closeDrop(): void { dropOpen = false; if (dropTimer) clearInterval(dropTimer); dropTimer = null; dropPanel.hidden = true; msgs.hidden = false; footerEl.hidden = false; dropEntry.focus(); }
-function openDrop(): void { dropOpen = true; dropPanel.hidden = false; msgs.hidden = true; footerEl.hidden = true; void loadDropMessages(); dropTextInput.focus(); }
+function openDrop(): void { dropOpen = true; dropPanel.hidden = false; msgs.hidden = true; footerEl.hidden = true; void loadDropMessages(); if (dropTimer) clearInterval(dropTimer); dropTimer = setInterval(() => { if (dropOpen && !document.hidden) void loadDropMessages(); }, 15000); dropTextInput.focus(); }
 
 function newSession(): void {
   cancelInflightSend();
@@ -5429,7 +5454,14 @@ dropAttach.addEventListener("click", () => { dropFileInput.value = ""; dropFileI
 dropComposer.addEventListener("submit", (e) => { e.preventDefault(); void sendDrop(); });
 dropClear.addEventListener("click", async () => {
   if (!window.confirm("清空所有 Drop 内容？")) return;
-  try { const r = await fetchWithTimeout(DROP_CLEAR_URL, { method: "POST", headers: bearer(), credentials: "same-origin" }, FETCH_TIMEOUT_FAST_MS); if (!r.ok) throw new Error("HTTP " + r.status); /* 等待 SSE drop_history_cleared 事件推送 */ } catch (e) { dropStatusText("清空失败：" + (e as Error).message, true); }
+  dropLoadSeq += 1;
+  try {
+    const r = await fetchWithTimeout(DROP_CLEAR_URL, { method: "POST", headers: bearer(), credentials: "same-origin" }, FETCH_TIMEOUT_FAST_MS);
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    // Refetch so a peer addition after the clear is preserved even if its event
+    // arrived before this HTTP response.
+    await loadDropMessages();
+  } catch (e) { dropStatusText("清空失败：" + (e as Error).message, true); }
 });
 
 // Escape-to-close is owned by the sidebar's focus trap (installed in
