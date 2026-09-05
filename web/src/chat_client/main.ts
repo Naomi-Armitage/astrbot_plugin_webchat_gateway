@@ -273,7 +273,10 @@ type EventType =
   | "message_added"
   | "message_deleted"
   | "stream_started"
-  | "stream_ended";
+  | "stream_ended"
+  | "drop_message_added"
+  | "drop_message_deleted"
+  | "drop_history_cleared";
 interface ServerEvent {
   pts: number;
   ts: number;
@@ -2544,6 +2547,39 @@ function applyEvent(ev: ServerEvent): void {
       sync.sidebarTypingFor.delete(sid);
       break;
     }
+    case "drop_message_added": {
+      // Peer device added a Drop message — prepend to local list and re-render.
+      const msg = payload as Partial<DropMessage>;
+      if (!msg.id || typeof msg.text !== "string") break;
+      const full: DropMessage = {
+        id: msg.id as string,
+        text: msg.text,
+        device_id: msg.device_id as string || "",
+        device_name: msg.device_name as string || "设备",
+        created_at: msg.created_at as number || ev.ts,
+        attachments: Array.isArray(msg.attachments) ? msg.attachments as DropAttachment[] : [],
+      };
+      // Prepend (newest first)
+      dropMessages.unshift(full);
+      if (dropOpen) renderDropMessages();
+      break;
+    }
+    case "drop_message_deleted": {
+      const msgId = payload["id"];
+      if (typeof msgId !== "string") break;
+      const idx = dropMessages.findIndex((m) => m.id === msgId);
+      if (idx >= 0) {
+        dropMessages.splice(idx, 1);
+        if (dropOpen) renderDropMessages();
+      }
+      break;
+    }
+    case "drop_history_cleared": {
+      // Peer device cleared Drop history — mirror locally.
+      dropMessages.length = 0;
+      if (dropOpen) renderDropMessages();
+      break;
+    }
   }
 }
 
@@ -3263,7 +3299,7 @@ async function deleteDropMessage(id: number): Promise<void> {
   try {
     const resp = await fetchWithTimeout(DROP_MESSAGES_URL + "/" + id, { method: "DELETE", headers: bearer(), credentials: "same-origin" }, FETCH_TIMEOUT_FAST_MS);
     if (!resp.ok && resp.status !== 404) throw new Error("HTTP " + resp.status);
-    dropMessages = dropMessages.filter((m) => m.id !== id); renderDropMessages();
+    // 删除成功后等待 SSE drop_message_deleted 事件推送，不主动操作本地数组
   } catch (e) { dropStatusText("删除失败：" + (e as Error).message, true); }
 }
 async function uploadDropFile(file: File): Promise<string> {
@@ -3276,17 +3312,25 @@ async function uploadDropFile(file: File): Promise<string> {
 }
 async function sendDrop(): Promise<void> {
   const text = dropTextInput.value.trim(); const files = [...(dropFileInput.files || [])];
-  if (!text && !files.length) return; dropSend.disabled = true;
+  if (!text && !files.length) return;
+  // 前端文本长度校验（后端限制 16,000 字符）
+  if (text.length > 16000) {
+    dropStatusText("文本超过 16,000 字符限制", true);
+    return;
+  }
+  dropSend.disabled = true;
   try {
     const refs: Array<{ file_id: string }> = [];
     for (const file of files) { dropStatusText("正在上传 " + file.name + "…"); refs.push({ file_id: await uploadDropFile(file) }); }
     const resp = await fetchWithTimeout(DROP_SEND_URL, { method: "POST", headers: { ...bearer(), "Content-Type": "application/json" }, credentials: "same-origin", body: JSON.stringify({ text, attachments: refs, device_id: dropDeviceId, device_name: navigator.userAgent.slice(0, 40) }) }, FETCH_TIMEOUT_CHAT_MS);
     if (!resp.ok) throw new Error("HTTP " + resp.status);
-    dropTextInput.value = ""; dropFileInput.value = ""; await loadDropMessages();
+    dropTextInput.value = ""; dropFileInput.value = "";
+    // 发送成功后等待 SSE 事件推送，不主动刷新列表
+    dropStatusText("");
   } catch (e) { dropStatusText("发送失败：" + (e as Error).message, true); } finally { dropSend.disabled = false; }
 }
 function closeDrop(): void { dropOpen = false; if (dropTimer) clearInterval(dropTimer); dropTimer = null; dropPanel.hidden = true; msgs.hidden = false; footerEl.hidden = false; dropEntry.focus(); }
-function openDrop(): void { dropOpen = true; dropPanel.hidden = false; msgs.hidden = true; footerEl.hidden = true; void loadDropMessages(); if (dropTimer) clearInterval(dropTimer); dropTimer = setInterval(() => { if (dropOpen) void loadDropMessages(); }, 15000); dropTextInput.focus(); }
+function openDrop(): void { dropOpen = true; dropPanel.hidden = false; msgs.hidden = true; footerEl.hidden = true; void loadDropMessages(); dropTextInput.focus(); }
 
 function newSession(): void {
   cancelInflightSend();
@@ -5385,7 +5429,7 @@ dropAttach.addEventListener("click", () => { dropFileInput.value = ""; dropFileI
 dropComposer.addEventListener("submit", (e) => { e.preventDefault(); void sendDrop(); });
 dropClear.addEventListener("click", async () => {
   if (!window.confirm("清空所有 Drop 内容？")) return;
-  try { const r = await fetchWithTimeout(DROP_CLEAR_URL, { method: "POST", headers: bearer(), credentials: "same-origin" }, FETCH_TIMEOUT_FAST_MS); if (!r.ok) throw new Error("HTTP " + r.status); dropMessages = []; renderDropMessages(); } catch (e) { dropStatusText("清空失败：" + (e as Error).message, true); }
+  try { const r = await fetchWithTimeout(DROP_CLEAR_URL, { method: "POST", headers: bearer(), credentials: "same-origin" }, FETCH_TIMEOUT_FAST_MS); if (!r.ok) throw new Error("HTTP " + r.status); /* 等待 SSE drop_history_cleared 事件推送 */ } catch (e) { dropStatusText("清空失败：" + (e as Error).message, true); }
 });
 
 // Escape-to-close is owned by the sidebar's focus trap (installed in
