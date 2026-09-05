@@ -1090,8 +1090,14 @@ class MysqlStorage(AbstractStorage):
                     "       size_bytes, storage_key, committed, "
                     "       uploaded_at, committed_at "
                     "FROM webchat_files "
-                    "WHERE committed = 0 AND uploaded_at < %s "
-                    "ORDER BY uploaded_at ASC LIMIT %s",
+                    "WHERE uploaded_at < %s AND ("
+                    "      (session_id <> 'drop' AND committed = 0)"
+                    "   OR (session_id = 'drop' AND NOT EXISTS ("
+                    "       SELECT 1 FROM webchat_drop_messages d"
+                    "       WHERE d.token_name = webchat_files.token_name"
+                    "         AND d.file_id = webchat_files.file_id"
+                    "   ))"
+                    ") ORDER BY uploaded_at ASC LIMIT %s",
                     (uncommitted_files_before_ts, limit),
                 )
                 orphan_rows = await cur.fetchall()

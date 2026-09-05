@@ -117,7 +117,7 @@ const FETCH_TIMEOUT_PROBE_MS = 3_000;       // pre-send connectivity confirm —
 // user event AND the assistant event in race-B (long-poll delivers events
 // before /chat returns). Pair with PENDING_TTL_MS so entries live long
 // enough to actually match.
-const DEDUP_TS_WINDOW_S = 600;
+const DEDUP_TS_WINDOW_S = 660;
 const DEDUP_CONTENT_LEN = 200;
 
 // Stream-failure circuit breaker: if the /chat/stream endpoint trips
@@ -1448,7 +1448,7 @@ setSyncStatus("live");
 // Match key: `(session_id, role, content trimmed to first DEDUP_CONTENT_LEN
 // chars)` plus event ts within ±DEDUP_TS_WINDOW_S of the locally recorded ts.
 // Buffer entries are consumed-on-match (one event consumes one local pending
-// entry) and time out after 60s so a long-poll outage can't leak entries
+// entry) and time out after PENDING_TTL_MS so a long-poll outage cannot leak entries
 // forever.
 
 interface PendingLocal {
@@ -1459,7 +1459,7 @@ interface PendingLocal {
   recordedAtSec: number;            // local clock when we rendered it; matches against event ts
   expiresAt: number;                 // ms
 }
-const PENDING_TTL_MS = 660_000;
+const PENDING_TTL_MS = DEDUP_TS_WINDOW_S * 1000;
 
 function loadPendingLocals(): PendingLocal[] {
   let parsed: unknown = null;

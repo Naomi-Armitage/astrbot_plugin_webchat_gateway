@@ -110,6 +110,13 @@ _BLOCKED_DROP_MIME = frozenset(
         "image/svg+xml",
         "text/html",
         "application/xhtml+xml",
+        "application/javascript",
+        "text/javascript",
+        "application/x-javascript",
+        "application/ecmascript",
+        "text/ecmascript",
+        "application/xml",
+        "text/xml",
     }
 )
 
@@ -330,13 +337,16 @@ def make_drop_handlers(deps: DropDeps):
                         token_name=row.token_name, file_id=row.file_id
                     )
                 )
-            rows = await deps.storage.list_drop_messages(
-                token_name=row.token_name,
-                limit=100_000,
-                before_id=None,
-                include_deleted=True,
+            # Never perform a compatibility full-table scan here. A legacy
+            # backend without the COUNT API cannot answer safely at scale:
+            # truncation can under-count references and release an in-use file.
+            # Unknown is handled as unsafe by destructive callers.
+            logger.warning(
+                "[WebChatGateway] storage backend lacks count_drop_file_references; "
+                "refusing fallback full-table scan for file=%s",
+                row.file_id,
             )
-            return sum(1 for message in rows if message.file_id == row.file_id)
+            return None
         except Exception:
             logger.exception(
                 "[WebChatGateway] drop reference count failed file=%s",

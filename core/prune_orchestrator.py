@@ -212,12 +212,34 @@ class PruneOrchestrator:
         # re-discovered next iter.
         files_deleted = 0
         if file_store is not None and filtered_files:
-            files_deleted = await release_files_safely(
-                storage=storage,
-                file_store=file_store,
-                rows=filtered_files,
-                log_label="prune_loop",
-            )
+            # Drop files can become referenced after the candidate query. The
+            # upload gate serializes this re-check with send/clear.
+            chat_files = [r for r in filtered_files if r.session_id != "drop"]
+            drop_files = [r for r in filtered_files if r.session_id == "drop"]
+            if chat_files:
+                files_deleted += await release_files_safely(
+                    storage=storage, file_store=file_store, rows=chat_files,
+                    log_label="prune_loop",
+                )
+            for row in drop_files:
+                async with self._drop_mutation_gate(row.token_name):
+                    counter = getattr(storage, "count_drop_file_references", None)
+                    if not callable(counter):
+                        continue
+                    try:
+                        refs = int(await counter(token_name=row.token_name, file_id=row.file_id))
+                    except Exception:
+                        logger.exception(
+                            "[WebChatGateway] drop orphan reference check failed file=%s",
+                            row.file_id,
+                        )
+                        continue
+                    if refs != 0:
+                        continue
+                    files_deleted += await release_files_safely(
+                        storage=storage, file_store=file_store, rows=[row],
+                        log_label="prune_drop_orphan",
+                    )
 
         # Step 6: events + session_meta. session_meta DELETE uses
         # `NOT EXISTS(file)` so any cascade file whose storage delete

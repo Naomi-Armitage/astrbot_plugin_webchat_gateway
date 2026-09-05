@@ -1051,8 +1051,14 @@ class SqliteStorage(AbstractStorage):
             "SELECT file_id, token_name, session_id, mime, size_bytes, "
             "       storage_key, committed, uploaded_at, committed_at, filename "
             "FROM webchat_files "
-            "WHERE committed = 0 AND uploaded_at < ? "
-            "ORDER BY uploaded_at ASC LIMIT ?",
+            "WHERE uploaded_at < ? AND ("
+            "      (session_id <> 'drop' AND committed = 0)"
+            "   OR (session_id = 'drop' AND NOT EXISTS ("
+            "       SELECT 1 FROM webchat_drop_messages d"
+            "       WHERE d.token_name = webchat_files.token_name"
+            "         AND d.file_id = webchat_files.file_id"
+            "   ))"
+            ") ORDER BY uploaded_at ASC LIMIT ?",
             (uncommitted_files_before_ts, limit),
         ) as cursor:
             orphan_rows = await cursor.fetchall()
