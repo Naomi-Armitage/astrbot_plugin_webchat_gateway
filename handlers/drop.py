@@ -1392,7 +1392,11 @@ def make_drop_serve_handler(deps: DropDeps):
             )
 
         normalized_mime = (row.mime or "").split(";", 1)[0].strip().lower()
-        is_image = normalized_mime in _INLINE_DROP_MIME
+        # Images remain inline for the Drop thumbnail path by default. A
+        # caller can explicitly request a download (the adjacent client
+        # download button) without fetching the response into JS memory.
+        force_download = request.query.get("download", "") == "1"
+        is_image = normalized_mime in _INLINE_DROP_MIME and not force_download
         cors = build_cors_headers(origin, allowed, same_origin_host=same_host)
         if is_image:
             disposition = 'inline'

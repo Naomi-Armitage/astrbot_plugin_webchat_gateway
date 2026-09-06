@@ -360,6 +360,15 @@ class TestDropEndpoints:
             assert resp.status == 200
             # Images keep the inline render path (thumbnail grid).
             assert resp.headers["Content-Disposition"].startswith("inline")
+            # The adjacent Drop download action explicitly asks the server
+            # for an attachment response, including for image MIME types.
+            resp = await client.get(
+                f"/api/webchat/drop/files/{up['file_id']}?download=1",
+                headers=headers,
+            )
+            assert resp.status == 200
+            assert resp.headers["Content-Disposition"].startswith("attachment")
+            assert "photo.png" in resp.headers["Content-Disposition"]
         finally:
             await self._close(client, server)
 
