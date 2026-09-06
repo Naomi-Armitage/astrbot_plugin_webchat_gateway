@@ -3315,15 +3315,16 @@ function shouldAutoLoadDropImage(size: number | undefined): boolean {
     || connection?.effectiveType === "slow-2g"
     || connection?.effectiveType === "2g"
     || connection?.effectiveType === "3g";
-  const knownFastNetwork = connection?.type === "wifi"
-    || connection?.type === "ethernet"
-    || connection?.effectiveType === "4g";
-  // Unknown sizes must stay gated on constrained or unknown networks.
+  // effectiveType describes speed, not transport: fast cellular can also
+  // report "4g". Only a known Wi-Fi/wired connection may auto-load large images.
+  const knownFixedNetwork = connection?.type === "wifi"
+    || connection?.type === "ethernet";
+  // Unknown sizes always require an explicit load action.
   if (typeof size !== "number" || !Number.isFinite(size) || size < 0) {
     return false;
   }
   if (size <= DROP_LARGE_IMAGE_BYTES) return true;
-  return knownFastNetwork && !constrained;
+  return knownFixedNetwork && !constrained;
 }
 
 function renderDropMessages(): void {
@@ -3411,7 +3412,7 @@ async function sendDrop(): Promise<void> {
     await loadDropMessages();
   } catch (e) { dropStatusText("发送失败：" + (e as Error).message, true); } finally { dropSend.disabled = false; }
 }
-function closeDrop(): void { dropOpen = false; dropLoadedImages.clear(); if (dropTimer) clearInterval(dropTimer); dropTimer = null; dropPanel.hidden = true; dropPanel.setAttribute("aria-hidden", "true"); dropEntry.setAttribute("aria-expanded", "false"); footerEl.hidden = false; dropEntry.focus(); }
+function closeDrop(): void { dropOpen = false; dropLoadedImages.clear(); dropMessagesEl.replaceChildren(); if (dropTimer) clearInterval(dropTimer); dropTimer = null; dropPanel.hidden = true; dropPanel.setAttribute("aria-hidden", "true"); dropEntry.setAttribute("aria-expanded", "false"); footerEl.hidden = false; dropEntry.focus(); }
 function openDrop(): void { dropOpen = true; dropPanel.hidden = false; dropPanel.setAttribute("aria-hidden", "false"); dropEntry.setAttribute("aria-expanded", "true"); footerEl.hidden = true; void loadDropMessages(); if (dropTimer) clearInterval(dropTimer); dropTimer = setInterval(() => { if (dropOpen && !document.hidden) void loadDropMessages(); }, 15000); dropTextInput.focus(); }
 
 function newSession(): void {

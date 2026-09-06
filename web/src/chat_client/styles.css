@@ -1879,7 +1879,7 @@ body.lightbox-open { overflow: hidden; }
   margin-top: 2px;
 }
 .drop-entry{margin-top:6px}
-.drop-panel[hidden]{display:none}
+.drop-panel[hidden],.drop-entry[hidden],footer[hidden]{display:none}
 /* Drop is a separate chat surface. Keep it out of the normal message flow so
    opening it never resizes or splits the active conversation. */
 .drop-panel{position:absolute;z-index:8;top:64px;right:0;width:min(460px,calc(100% - 16px));height:min(680px,calc(100% - 82px));min-height:240px;display:flex;flex-direction:column;padding:16px;background:var(--paper);border:1px solid var(--rule);border-radius:14px;box-shadow:0 12px 32px var(--shadow-strong)}
@@ -1888,3 +1888,7 @@ body.lightbox-open { overflow: hidden; }
 .drop-attachment{display:flex;flex-direction:column;gap:6px}.drop-attachment-actions{display:flex;align-items:center;gap:8px}.drop-download{display:inline-flex;align-items:center;gap:4px;color:var(--accent);font-size:12px}.drop-download::before{content:"↓";font-size:14px}.drop-image-gate{display:flex;align-items:center;gap:8px;color:var(--ink-soft);font-size:12px}.drop-image-gate button{border:1px solid var(--rule);background:var(--card);color:var(--ink);border-radius:7px;padding:5px 8px;cursor:pointer;font:inherit;font-size:12px}.drop-image-gate button:hover{border-color:var(--accent);color:var(--accent-strong)}
 .drop-panel{top:auto;bottom:18px}
 @media(max-width:719px){.drop-panel{top:52px;bottom:auto;height:calc(100% - 64px)}}
+
+/* Drop previews preserve the original aspect ratio instead of the chat grid's square crop. */
+.drop-item .drop-image-preview{max-width:240px;min-width:0}
+.drop-item img.msg-image{display:block;width:auto;height:auto;max-width:100%;max-height:240px;aspect-ratio:auto;object-fit:contain;border-radius:8px}
