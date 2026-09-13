@@ -820,12 +820,10 @@ def make_drop_handlers(deps: DropDeps):
         # double the user's storage footprint.
         async with deps.upload_gate.acquire(token.name):
             try:
-                committed_total = (
-                    await deps.storage.total_committed_size_for_token(token.name)
-                )
+                total_size = await deps.storage.total_size_for_token(token.name)
             except Exception:
                 logger.exception(
-                    "[WebChatGateway] drop total_committed_size failed"
+                    "[WebChatGateway] drop total_size_for_token failed"
                 )
                 return json_response(
                     {"error": "storage_unavailable"}, status=503,
@@ -833,16 +831,17 @@ def make_drop_handlers(deps: DropDeps):
                     same_origin_host=gated.same_host,
                     extra_headers={"Retry-After": "5"},
                 )
-            # Check quota against committed files only. Uncommitted temporary
-            # files are cleaned by orphan GC; counting them would incorrectly
-            # reject uploads when the user has orphaned temporaries.
-            if committed_total + len(file_content) > per_token_quota_bytes:
+            # Include uncommitted rows so repeatedly uploading files without
+            # sending them cannot exceed the shared per-token storage budget
+            # before orphan GC runs.
+            if total_size + len(file_content) > per_token_quota_bytes:
                 await deps.audit.write(
                     "drop_upload_rejected",
                     name=token.name,
                     ip=ip,
                     detail={
                         "reason": "storage_quota_exceeded",
+                        "total_size": total_size,
                         "size": len(file_content),
                     },
                 )
@@ -888,7 +887,6 @@ def make_drop_handlers(deps: DropDeps):
                     origin=origin, allowed_origins=allowed,
                     same_origin_host=gated.same_host,
                 )
-
 
         # Reservation and object write are complete before releasing
         # the gate, so other mutations cannot observe a partial upload.

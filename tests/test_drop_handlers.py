@@ -331,6 +331,67 @@ class TestDropEndpoints:
         finally:
             await self._close(client, server)
 
+    async def test_upload_quota_counts_uncommitted_files(self, tmp_path: Path):
+        """An abandoned upload still consumes the shared Drop quota.
+
+        The upload row is intentionally left uncommitted, matching the state
+        created when a client uploads a file but never sends it. The quota
+        check must include that row so repeated abandoned uploads cannot
+        bypass the storage cap until orphan cleanup runs.
+        """
+        client, server, storage, _bus, _guard, _fs, headers, name = (
+            await self._client(tmp_path)
+        )
+        try:
+            quota = 10 * 1024 * 1024
+            await storage.insert_file(
+                file_id="u" * 16,
+                token_name=name,
+                session_id="drop",
+                mime="text/plain",
+                size_bytes=quota,
+                storage_key=f"{name}/u.txt",
+                now=100,
+                filename="abandoned.txt",
+            )
+
+            resp = await client.post(
+                "/api/webchat/drop/upload",
+                headers=headers,
+                data=_upload_form(b"x", "next.txt"),
+            )
+            assert resp.status == 429
+            assert (await resp.json())["error"] == "storage_quota_exceeded"
+            assert await storage.total_size_for_token(name) == quota
+        finally:
+            await self._close(client, server)
+
+    async def test_upload_quota_query_failure_returns_503(
+        self, tmp_path: Path
+    ):
+        client, server, storage, _bus, _guard, _fs, headers, name = (
+            await self._client(tmp_path)
+        )
+
+        async def fail_total(_token_name: str) -> int:
+            raise RuntimeError("database unavailable")
+
+        storage.total_size_for_token = fail_total  # type: ignore[method-assign]
+        try:
+            resp = await client.post(
+                "/api/webchat/drop/upload",
+                headers=headers,
+                data=_upload_form(b"x", "next.txt"),
+            )
+            assert resp.status == 503
+            assert (await resp.json())["error"] == "storage_unavailable"
+            assert resp.headers["Retry-After"] == "5"
+            assert await storage.list_files_for_session(
+                token_name=name, session_id="drop"
+            ) == []
+        finally:
+            await self._close(client, server)
+
     async def test_image_upload_sniffs_real_mime_and_serves_inline(
         self, tmp_path: Path
     ):

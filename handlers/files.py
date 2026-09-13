@@ -119,8 +119,8 @@ def make_upload_handler(deps: UploadDeps):
     """POST {prefix}/upload — multipart image upload.
 
     Single file per request, called repeatedly for batches by the
-    composer. Lock-free: uploads are file I/O, not LLM serialization, so
-    a token's concurrent uploads run in parallel.
+    composer. The per-token upload gate serializes quota accounting and
+    persistence so concurrent uploads cannot pass the same storage cap.
     """
 
     max_size_bytes = deps.max_file_size_mb * 1024 * 1024
@@ -313,12 +313,12 @@ def make_upload_handler(deps: UploadDeps):
         # observing a partially saved file while preserving quota safety.
         async with deps.upload_gate.acquire(token.name):
             try:
-                committed_total = await deps.storage.total_committed_size_for_token(
+                total_size = await deps.storage.total_size_for_token(
                     token.name
                 )
             except Exception:
                 logger.exception(
-                    "[WebChatGateway] total_committed_size_for_token failed"
+                    "[WebChatGateway] total_size_for_token failed"
                 )
                 return json_response(
                     {"error": "storage_unavailable"}, status=503,
@@ -326,17 +326,17 @@ def make_upload_handler(deps: UploadDeps):
                     same_origin_host=same_host,
                     extra_headers={"Retry-After": "5"},
                 )
-            # Check quota against committed files only. Uncommitted temporary
-            # files are cleaned by orphan GC; counting them would incorrectly
-            # reject uploads when the user has orphaned temporaries.
-            if committed_total + len(file_content) > per_token_quota_bytes:
+            # Include uncommitted rows so repeatedly uploading files without
+            # attaching them cannot exceed the per-token storage budget before
+            # orphan GC runs.
+            if total_size + len(file_content) > per_token_quota_bytes:
                 await deps.audit.write(
                     "upload_rejected",
                     name=token.name,
                     ip=ip,
                     detail={
                         "reason": "storage_quota_exceeded",
-                        "committed": committed_total,
+                        "total_size": total_size,
                         "size": len(file_content),
                     },
                 )
@@ -389,7 +389,6 @@ def make_upload_handler(deps: UploadDeps):
                     same_origin_host=same_host,
                 )
 
-
         # Reservation and object write are complete before releasing
         # the gate, so other mutations cannot observe a partial upload.
         await deps.audit.write(
@@ -401,15 +400,9 @@ def make_upload_handler(deps: UploadDeps):
                 "size": len(file_content),
                 "mime": mime,
                 "session_id": session_id,
-                # `committed_total` is the pre-upload committed sum (NOT
-                # including this file yet, NOT including uncommitted
-                # orphans). Operators monitoring abuse can correlate
-                # rapid uploads against the slow-rising committed sum:
-                # a spike in upload_ok events with flat committed_total
-                # indicates the "upload many, attach few" pattern that
-                # plan §"Storage quota check timing" calls out as the
-                # accepted 1-hour orphan-window spike.
-                "committed_total": committed_total,
+                # Pre-upload total, including uncommitted rows. This provides
+                # the exact value used for the quota decision.
+                "total_size": total_size,
             },
         )
         # Wire-format `url` is the path under the gateway, not absolute;
