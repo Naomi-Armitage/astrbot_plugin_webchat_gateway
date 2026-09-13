@@ -58,6 +58,8 @@ const DROP_MESSAGES_URL = API + "/drop/messages";
 const DROP_CLEAR_URL = API + "/drop/clear";
 const DROP_FILE_URL = (id: string): string => API + "/drop/files/" + encodeURIComponent(id);
 const LS_DROP_DEVICE = "wcg.drop.device_id";
+const LS_DROP_LAYOUT = "wcg.drop.layout";
+const LS_DROP_GEOMETRY = "wcg.drop.geometry";
 // Per-message action endpoints. `sid` and `index` are URL-segments — the
 // server's path layout matches cfg.conversations_message_path and
 // cfg.conversations_regenerate_path.
@@ -297,6 +299,7 @@ const msgs = $("messages");
 const badge = $("quotaBadge");
 const syncStatusEl = $("syncStatus");
 const whoEl = $("who");
+const wrapEl = document.querySelector<HTMLElement>(".wrap")!;
 const sidebarEl = $("sidebar");
 const sidebarToggleBtn = $<HTMLButtonElement>("sidebarToggle");
 const sidebarBackdrop = $("sidebarBackdrop");
@@ -312,9 +315,11 @@ const dropOverlayEl = $("dropOverlay");
 const footerEl = document.querySelector("footer") as HTMLElement;
 const dropEntry = $<HTMLButtonElement>("dropEntry");
 const dropPanel = $<HTMLElement>("dropPanel");
+const dropLayoutSwitch = $<HTMLDivElement>("dropLayoutSwitch");
+const dropPanelHead = $<HTMLDivElement>("dropPanel").querySelector<HTMLDivElement>("[data-drop-drag-handle]")!;
 const dropMessagesEl = $<HTMLDivElement>("dropMessages");
 const dropComposer = $<HTMLFormElement>("dropComposer");
-const dropTextInput = $<HTMLInputElement>("dropTextInput");
+const dropTextInput = $<HTMLTextAreaElement>("dropTextInput");
 const dropFileInput = $<HTMLInputElement>("dropFileInput");
 const dropAttach = $<HTMLButtonElement>("dropAttach");
 const dropClose = $<HTMLButtonElement>("dropClose");
@@ -3280,6 +3285,31 @@ interface DropMessage {
   text: string; created_at: number; file_id?: string; filename?: string;
   mime?: string; size?: number;
 }
+type DropLayout = "full" | "float" | "dock";
+interface DropGeometry {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
+const DROP_MIN_WIDTH = 320;
+const DROP_MIN_HEIGHT = 320;
+const DROP_DOCK_WIDTH = "clamp(320px, 34vw, 460px)";
+const DROP_DOCK_MIN_VIEWPORT = 900;
+const dropLayoutFromStorage = (): DropLayout => {
+  const value = localStorage.getItem(LS_DROP_LAYOUT);
+  return value === "float" || value === "dock" ? value : "full";
+};
+const dropGeometryFromStorage = (): DropGeometry | null => {
+  try {
+    const value = JSON.parse(localStorage.getItem(LS_DROP_GEOMETRY) || "null") as Partial<DropGeometry> | null;
+    if (!value || ![value.left, value.top, value.width, value.height].every((n) => typeof n === "number" && Number.isFinite(n))) return null;
+    return { left: value.left!, top: value.top!, width: value.width!, height: value.height! };
+  } catch {
+    return null;
+  }
+};
 let dropOpen = false;
 let dropTimer: ReturnType<typeof setInterval> | null = null;
 let dropMessages: DropMessage[] = [];
@@ -3288,11 +3318,88 @@ const DROP_LARGE_IMAGE_BYTES = 5 * 1024 * 1024;
 // New requests, events and successful mutations invalidate older list responses.
 let dropLoadSeq = 0;
 let dropMaxFileBytes = 100 * 1024 * 1024;
+let dropLayout: DropLayout = dropLayoutFromStorage();
+let dropGeometry: DropGeometry = dropGeometryFromStorage() ?? {
+  left: Math.max(16, window.innerWidth - 484),
+  top: Math.max(16, window.innerHeight - 704),
+  width: 460,
+  height: 680,
+};
+let dropDragState: { pointerId: number; offsetX: number; offsetY: number } | null = null;
+let dropSending = false;
+const dropResizeObserver = typeof ResizeObserver === "undefined"
+  ? null
+  : new ResizeObserver(() => {
+    if (dropOpen && dropPanel.dataset.layout === "float") readDropGeometryFromPanel();
+  });
+dropResizeObserver?.observe(dropPanel);
 const dropDeviceId = (() => {
   const old = localStorage.getItem(LS_DROP_DEVICE);
   if (old && /^[A-Za-z0-9_\-.:]{8,64}$/.test(old)) return old;
   const value = newId(); localStorage.setItem(LS_DROP_DEVICE, value); return value;
 })();
+
+function isCompactDropViewport(): boolean {
+  return window.matchMedia("(max-width: 719px)").matches;
+}
+
+function clampDropGeometry(value: DropGeometry): DropGeometry {
+  const maxWidth = Math.max(1, window.innerWidth - 16);
+  const maxHeight = Math.max(1, window.innerHeight - 16);
+  const width = Math.min(maxWidth, Math.max(Math.min(DROP_MIN_WIDTH, maxWidth), value.width));
+  const height = Math.min(maxHeight, Math.max(Math.min(DROP_MIN_HEIGHT, maxHeight), value.height));
+  return {
+    width,
+    height,
+    left: Math.min(Math.max(8, value.left), Math.max(8, window.innerWidth - width - 8)),
+    top: Math.min(Math.max(8, value.top), Math.max(8, window.innerHeight - height - 8)),
+  };
+}
+
+function persistDropGeometry(): void {
+  dropGeometry = clampDropGeometry(dropGeometry);
+  try { localStorage.setItem(LS_DROP_GEOMETRY, JSON.stringify(dropGeometry)); } catch {}
+}
+
+function readDropGeometryFromPanel(): void {
+  if (dropPanel.dataset.layout !== "float" || dropPanel.hidden) return;
+  const rect = dropPanel.getBoundingClientRect();
+  if (rect.width < 1 || rect.height < 1) return;
+  dropGeometry = clampDropGeometry({ left: rect.left, top: rect.top, width: rect.width, height: rect.height });
+  try { localStorage.setItem(LS_DROP_GEOMETRY, JSON.stringify(dropGeometry)); } catch {}
+}
+
+function setDropLayout(layout: DropLayout, persist = true): void {
+  dropLayout = layout;
+  const effectiveLayout: DropLayout = isCompactDropViewport()
+    || (layout === "dock" && window.innerWidth < DROP_DOCK_MIN_VIEWPORT)
+    ? "full"
+    : layout;
+  dropPanel.dataset.layout = effectiveLayout;
+  wrapEl.classList.toggle("drop-docked", dropOpen && effectiveLayout === "dock");
+  wrapEl.style.setProperty("--drop-dock-width", DROP_DOCK_WIDTH);
+  dropLayoutSwitch.querySelectorAll<HTMLButtonElement>("[data-drop-layout]").forEach((button) => {
+    const selected = button.dataset.dropLayout === effectiveLayout;
+    button.setAttribute("aria-checked", String(selected));
+  });
+  if (effectiveLayout === "float") {
+    dropGeometry = clampDropGeometry(dropGeometry);
+    dropPanel.style.left = `${dropGeometry.left}px`;
+    dropPanel.style.top = `${dropGeometry.top}px`;
+    dropPanel.style.width = `${dropGeometry.width}px`;
+    dropPanel.style.height = `${dropGeometry.height}px`;
+  } else {
+    dropPanel.style.removeProperty("left");
+    dropPanel.style.removeProperty("top");
+    dropPanel.style.removeProperty("width");
+    dropPanel.style.removeProperty("height");
+  }
+  footerEl.hidden = dropOpen && effectiveLayout === "full";
+  if (persist) {
+    try { localStorage.setItem(LS_DROP_LAYOUT, layout); } catch {}
+  }
+}
+
 function dropStatusText(text: string, bad = false): void {
   dropStatus.textContent = text; dropStatus.dataset.state = bad ? "bad" : "";
 }
@@ -3328,36 +3435,80 @@ function shouldAutoLoadDropImage(size: number | undefined): boolean {
 }
 
 function renderDropMessages(): void {
+  const previousScrollTop = dropMessagesEl.scrollTop;
+  const previousScrollHeight = dropMessagesEl.scrollHeight;
+  const wasNearBottom = previousScrollHeight - (previousScrollTop + dropMessagesEl.clientHeight) < 80;
   dropMessagesEl.replaceChildren();
-  if (!dropMessages.length) { const e = document.createElement("p"); e.className = "drop-empty"; e.textContent = "还没有 Drop 内容。"; dropMessagesEl.append(e); return; }
+  if (!dropMessages.length) {
+    const empty = document.createElement("div"); empty.className = "empty-state drop-empty";
+    const icon = document.createElement("span"); icon.className = "empty-icon"; icon.setAttribute("aria-hidden", "true");
+    icon.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18M3 12h18"/><path d="m7 7 10 10M17 7 7 17"/></svg>';
+    const title = document.createElement("p"); title.className = "empty-title"; title.textContent = "还没有 Drop 内容";
+    const hint = document.createElement("p"); hint.className = "empty-hint"; hint.textContent = "把文字或文件发到这里，其他设备会立即看到。";
+    empty.append(icon, title, hint); dropMessagesEl.append(empty); return;
+  }
   for (const item of [...dropMessages].reverse()) {
-    const row = document.createElement("article"); row.className = "drop-item" + (item.device_id === dropDeviceId ? " mine" : "");
-    const head = document.createElement("div"); head.className = "drop-item-head"; head.textContent = (item.device_name || "设备") + " · " + relativeTime(item.created_at * 1000); row.append(head);
+    const mine = item.device_id === dropDeviceId;
+    const row = document.createElement("div"); row.className = `msg-row drop-msg ${mine ? "user-row" : "bot-row"}`;
+    const bubble = document.createElement("div"); bubble.className = `msg drop-bubble ${mine ? "user" : "bot"}`;
+    if (item.text) { const text = document.createElement("div"); text.className = "drop-item-text"; text.textContent = item.text; bubble.append(text); }
     if (item.kind === "file" && item.file_id) {
-      const attachment = document.createElement("div"); attachment.className = "drop-attachment";
-      const download = document.createElement("a"); download.className = "drop-download"; download.href = DROP_FILE_URL(item.file_id) + "?download=1"; download.download = item.filename || "download"; download.rel = "noopener"; download.textContent = "下载";
       if (isDropImage(item.mime)) {
         const shouldLoad = dropLoadedImages.has(item.file_id) || shouldAutoLoadDropImage(item.size);
         if (shouldLoad) {
-          const preview = document.createElement("a"); preview.className = "drop-image-preview"; preview.href = DROP_FILE_URL(item.file_id); preview.target = "_blank"; preview.rel = "noopener";
-          const img = document.createElement("img"); img.className = "msg-image"; img.src = DROP_FILE_URL(item.file_id); img.alt = item.filename || "Drop 图片"; img.loading = "lazy"; attachImgErrorRetry(img); preview.append(img); attachment.append(preview);
+          bubble.classList.add("has-image");
+          if (!item.text) bubble.classList.add("has-image-only");
+          const grid = document.createElement("div"); grid.className = "msg-attachments cnt-1";
+          const preview = document.createElement("button"); preview.type = "button"; preview.className = "drop-image-preview"; preview.setAttribute("aria-label", "查看图片");
+          const img = document.createElement("img"); img.className = "msg-image"; img.src = DROP_FILE_URL(item.file_id); img.alt = item.filename || "Drop 图片"; img.loading = "lazy"; attachImgErrorRetry(img);
+          preview.append(img);
+          const ref: AttachmentRef = { file_id: item.file_id, mime: item.mime || "application/octet-stream" };
+          preview.onclick = () => openLightbox([ref], 0, (attachment) => DROP_FILE_URL(attachment.file_id));
+          grid.append(preview);
+          if (item.text) {
+            const text = bubble.querySelector<HTMLElement>(".drop-item-text");
+            text?.classList.add("msg-text");
+            bubble.insertBefore(grid, text ?? null);
+          } else {
+            bubble.append(grid);
+          }
         } else {
+          const attachment = document.createElement("div"); attachment.className = "drop-attachment";
           const gate = document.createElement("div"); gate.className = "drop-image-gate";
           const label = document.createElement("span"); label.textContent = `图片 · ${dropFileSize(item.size)}`;
           const load = document.createElement("button"); load.type = "button"; load.textContent = "加载图片"; load.onclick = () => { dropLoadedImages.add(item.file_id!); renderDropMessages(); };
-          gate.append(label, load); attachment.append(gate);
+          gate.append(label, load); attachment.append(gate); bubble.append(attachment);
         }
       } else {
+        const attachment = document.createElement("div"); attachment.className = "drop-attachment";
         const link = document.createElement("div"); link.className = "drop-file-link";
         const icon = document.createElement("span"); icon.className = "drop-file-icon"; icon.textContent = "FILE";
         const details = document.createElement("span"); details.className = "drop-file-details";
         const name = document.createElement("span"); name.className = "drop-file-name"; name.textContent = item.filename || "文件";
         const meta = document.createElement("span"); meta.className = "drop-file-meta"; meta.textContent = dropFileSize(item.size);
         details.append(name, meta); link.append(icon, details); attachment.append(link);
+        bubble.append(attachment);
       }
-      const actions = document.createElement("div"); actions.className = "drop-attachment-actions"; actions.append(download); attachment.append(actions); row.append(attachment);
-    } else { const text = document.createElement("div"); text.className = "drop-item-text"; text.textContent = item.text; row.append(text); }
-    const del = document.createElement("button"); del.type = "button"; del.className = "drop-item-delete"; del.textContent = "删除"; del.onclick = () => { void deleteDropMessage(item.id); }; row.append(del); dropMessagesEl.append(row);
+    }
+    row.append(bubble);
+    const actions = document.createElement("div"); actions.className = "drop-message-actions";
+    if (item.text) {
+      const copy = document.createElement("button"); copy.type = "button"; copy.className = "drop-action-btn"; copy.setAttribute("aria-label", "复制消息"); copy.title = "复制"; copy.innerHTML = ICON_COPY;
+      copy.onclick = () => { void writeClipboard(item.text).then((ok) => { if (ok) flashActionButton(copy); }); };
+      actions.append(copy);
+    }
+    if (item.kind === "file" && item.file_id) {
+      const download = document.createElement("a"); download.className = "drop-action-btn drop-download-btn"; download.href = DROP_FILE_URL(item.file_id) + "?download=1"; download.download = item.filename || "download"; download.rel = "noopener"; download.setAttribute("aria-label", "下载文件"); download.title = "下载";
+      download.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>';
+      actions.append(download);
+    }
+    const del = document.createElement("button"); del.type = "button"; del.className = "drop-action-btn drop-item-delete"; del.setAttribute("aria-label", "删除 Drop 消息"); del.title = "删除"; del.innerHTML = ICON_TRASH; del.onclick = () => { void deleteDropMessage(item.id); };
+    actions.append(del); row.append(actions); dropMessagesEl.append(row);
+  }
+  if (wasNearBottom) {
+    dropMessagesEl.scrollTop = dropMessagesEl.scrollHeight;
+  } else {
+    dropMessagesEl.scrollTop = Math.max(0, previousScrollTop + (dropMessagesEl.scrollHeight - previousScrollHeight));
   }
 }
 async function loadDropMessages(): Promise<void> {
@@ -3393,27 +3544,94 @@ async function uploadDropFile(file: File): Promise<string> {
   if (!resp.ok || typeof data.file_id !== "string") throw new Error(typeof data.error === "string" ? data.error : "上传失败");
   return data.file_id;
 }
+function autosizeDropInput(): void {
+  dropTextInput.style.height = "auto";
+  dropTextInput.style.height = `${Math.min(dropTextInput.scrollHeight, 160)}px`;
+}
+
 async function sendDrop(): Promise<void> {
   const text = dropTextInput.value.trim(); const files = [...(dropFileInput.files || [])];
-  if (!text && !files.length) return;
+  if (dropSending || (!text && !files.length)) return;
   // 前端文本长度校验（后端限制 16,000 字符）
   if (text.length > 16000) {
     dropStatusText("文本超过 16,000 字符限制", true);
     return;
   }
+  dropSending = true;
   dropSend.disabled = true;
   try {
     const refs: Array<{ file_id: string }> = [];
     for (const file of files) { dropStatusText("正在上传 " + file.name + "…"); refs.push({ file_id: await uploadDropFile(file) }); }
-    const resp = await fetchWithTimeout(DROP_SEND_URL, { method: "POST", headers: { ...bearer(), "Content-Type": "application/json" }, credentials: "same-origin", body: JSON.stringify({ text, attachments: refs, device_id: dropDeviceId, device_name: navigator.userAgent.slice(0, 40) }) }, FETCH_TIMEOUT_CHAT_MS);
+    const resp = await fetchWithTimeout(DROP_SEND_URL, { method: "POST", headers: { ...bearer(), "Content-Type": "application/json" }, credentials: "same-origin", body: JSON.stringify({ text, attachments: refs, device_id: dropDeviceId, device_name: "设备" }) }, FETCH_TIMEOUT_CHAT_MS);
     if (!resp.ok) throw new Error("HTTP " + resp.status);
-    dropTextInput.value = ""; dropFileInput.value = "";
+    dropTextInput.value = ""; dropFileInput.value = ""; autosizeDropInput();
     dropLoadSeq += 1;
     await loadDropMessages();
-  } catch (e) { dropStatusText("发送失败：" + (e as Error).message, true); } finally { dropSend.disabled = false; }
+  } catch (e) { dropStatusText("发送失败：" + (e as Error).message, true); } finally { dropSending = false; dropSend.disabled = false; }
 }
-function closeDrop(): void { dropOpen = false; dropLoadedImages.clear(); dropMessagesEl.replaceChildren(); if (dropTimer) clearInterval(dropTimer); dropTimer = null; dropPanel.hidden = true; dropPanel.setAttribute("aria-hidden", "true"); dropEntry.setAttribute("aria-expanded", "false"); footerEl.hidden = false; dropEntry.focus(); }
-function openDrop(): void { dropOpen = true; dropPanel.hidden = false; dropPanel.setAttribute("aria-hidden", "false"); dropEntry.setAttribute("aria-expanded", "true"); footerEl.hidden = true; void loadDropMessages(); if (dropTimer) clearInterval(dropTimer); dropTimer = setInterval(() => { if (dropOpen && !document.hidden) void loadDropMessages(); }, 15000); dropTextInput.focus(); }
+function closeDrop(): void {
+  dropOpen = false; dropLoadedImages.clear(); dropMessagesEl.replaceChildren();
+  if (dropTimer) clearInterval(dropTimer);
+  dropTimer = null;
+  dropPanel.hidden = true; dropPanel.setAttribute("aria-hidden", "true"); dropEntry.setAttribute("aria-expanded", "false");
+  wrapEl.classList.remove("drop-docked");
+  footerEl.hidden = false;
+  dropEntry.focus();
+}
+function openDrop(): void {
+  dropOpen = true;
+  dropPanel.hidden = false; dropPanel.setAttribute("aria-hidden", "false"); dropEntry.setAttribute("aria-expanded", "true");
+  setDropLayout(dropLayout, false);
+  void loadDropMessages();
+  if (dropTimer) clearInterval(dropTimer);
+  dropTimer = setInterval(() => { if (dropOpen && !document.hidden) void loadDropMessages(); }, 15000);
+  autosizeDropInput(); dropTextInput.focus();
+}
+
+function beginDropDrag(e: PointerEvent): void {
+  if (!dropOpen || dropPanel.dataset.layout !== "float" || e.button !== 0) return;
+  const target = e.target as Element | null;
+  if (target?.closest("button, a, input, textarea, [data-drop-layout]")) return;
+  const rect = dropPanel.getBoundingClientRect();
+  dropDragState = { pointerId: e.pointerId, offsetX: e.clientX - rect.left, offsetY: e.clientY - rect.top };
+  dropPanelHead.setPointerCapture?.(e.pointerId);
+  dropPanelHead.classList.add("is-dragging");
+  e.preventDefault();
+}
+
+function moveDropDrag(e: PointerEvent): void {
+  if (!dropDragState || e.pointerId !== dropDragState.pointerId || dropPanel.dataset.layout !== "float") return;
+  dropGeometry = clampDropGeometry({
+    ...dropGeometry,
+    left: e.clientX - dropDragState.offsetX,
+    top: e.clientY - dropDragState.offsetY,
+  });
+  dropPanel.style.left = `${dropGeometry.left}px`;
+  dropPanel.style.top = `${dropGeometry.top}px`;
+}
+
+function finishDropDrag(e: PointerEvent): void {
+  if (!dropDragState || e.pointerId !== dropDragState.pointerId) return;
+  dropDragState = null;
+  dropPanelHead.classList.remove("is-dragging");
+  readDropGeometryFromPanel();
+  persistDropGeometry();
+}
+
+dropPanelHead.addEventListener("pointerdown", beginDropDrag);
+window.addEventListener("pointermove", moveDropDrag);
+window.addEventListener("pointerup", finishDropDrag);
+window.addEventListener("pointercancel", finishDropDrag);
+window.addEventListener("resize", () => {
+  if (!dropOpen) return;
+  if (dropPanel.dataset.layout === "float") {
+    dropGeometry = clampDropGeometry(dropGeometry);
+    setDropLayout("float", false);
+    persistDropGeometry();
+  } else {
+    setDropLayout(dropLayout, false);
+  }
+});
 
 function newSession(): void {
   if (dropOpen) closeDrop();
@@ -4306,7 +4524,11 @@ function updateSendButtonState(): void {
 
 let lightboxKeydown: ((e: KeyboardEvent) => void) | null = null;
 let lightboxFocusTrap: FocusTrap | null = null;
-function openLightbox(attachments: AttachmentRef[], startIndex: number): void {
+function openLightbox(
+  attachments: AttachmentRef[],
+  startIndex: number,
+  srcFor: (attachment: AttachmentRef) => string = (attachment) => fileServeUrl(attachment.file_id),
+): void {
   if (!attachments.length) return;
   let idx = Math.max(0, Math.min(startIndex, attachments.length - 1));
   const overlay = document.createElement("div");
@@ -4350,7 +4572,7 @@ function openLightbox(attachments: AttachmentRef[], startIndex: number): void {
 
   const paint = (): void => {
     const a = attachments[idx]!;
-    img.src = fileServeUrl(a.file_id);
+    img.src = srcFor(a);
     counter.textContent = `${idx + 1} / ${attachments.length}`;
   };
   paint();
@@ -4891,10 +5113,11 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
       // delivered the matching `message_added` first, `applyEvent`
       // already pushed history + rendered a sibling bot bubble; pushing
       // again here would duplicate both. Detect via a content-equality
-      // probe on the last 2 history entries and a 30s freshness window
+      // probe on the last 10 history entries and a 30s freshness window
       // — matches → drop the streaming bubble + skip push + skip
-      // recordOptimistic (no future event will match).
-      const tail = sess.history.slice(-2);
+      // recordOptimistic (no future event will match). 窗口从 2 扩大到
+      // 10，覆盖用户在流式中断和事件到达之间插入多条新消息的场景。
+      const tail = sess.history.slice(-10);
       const echoedByEvent = tail.some(
         (h) => h.role === "bot" && h.text === snapshot.pending && (Date.now() - h.ts) < 30_000,
       );
@@ -4909,7 +5132,15 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
       saveStore();
       renderSessionList();
     }
-    recordOptimistic(sid, "assistant", snapshot.pending);
+    // 只记录完整消息到 pendingLocals。incomplete 消息（用户中断或
+    // 服务端标记 incomplete=true 的）不参与 consumeIfDuplicate 去重，
+    // 因为服务端可能会在后台继续生成并推送完整版本——部分文本的
+    // contentKey（前 200 字符）可能与完整文本不匹配，导致去重失效
+    // 和双气泡。incomplete 消息的去重完全依赖 fallback 机制
+    // （history tail 比对，见上方 echoedByEvent 检查）。
+    if (!snapshot.incomplete) {
+      recordOptimistic(sid, "assistant", snapshot.pending);
+    }
   };
 
   const finalizeOk = (info: StreamDoneInfo): void => {
@@ -4995,8 +5226,12 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
       // For "post" mark the user's message as stopped so it stays
       // visible with a "已停止 · 重试 · 编辑" footer instead of being
       // wiped on next refresh by ingestConversationDetail.
+      // 但是：只有在服务端未接受请求时（!streamId）才标记失败。
+      // streamId 存在说明服务端已持久化 PendingStream 并开始生成
+      // （即使客户端未收到 chunk），此时标记失败会导致用户消息显示
+      // 重试按钮，但服务端实际继续生成并通过长轮询推送完整回复。
       discardBubble();
-      if (kind === "post") {
+      if (kind === "post" && !streamId) {
         markLastUserAsFailed(opts.message ?? "", opts.attachments, "stopped");
       }
       return "ok";
@@ -5066,7 +5301,11 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
       // instead of dropping a separate red error bubble the user can't
       // act on. Resume-kind keeps the old behavior because resume doesn't
       // own a user echo to attach the failure to.
-      if (kind === "post") {
+      // 但是：只有在服务端未接受请求时（!streamId）才标记失败。
+      // streamId 存在但收到 error 帧说明 LLM 调用失败，但请求本身
+      // 已被服务端接受并持久化——标记为 send_failed 会误导用户认为
+      // 消息未送达，实际上只是生成阶段出错。
+      if (kind === "post" && !streamId) {
         markLastUserAsFailed(opts.message ?? "", opts.attachments, "send_failed");
       } else if (isSoft) {
         addMessageBubble("notice", streamErrorCopy(sce.code));
@@ -5508,9 +5747,21 @@ sidebarToggleBtn.addEventListener("click", () => {
 sidebarBackdrop.addEventListener("click", closeMobileSidebar);
 dropEntry.addEventListener("click", () => { closeMobileSidebar(); openDrop(); });
 dropClose.addEventListener("click", closeDrop);
+dropLayoutSwitch.addEventListener("click", (e) => {
+  const target = (e.target as Element | null)?.closest<HTMLButtonElement>("[data-drop-layout]");
+  if (!target) return;
+  const layout = target.dataset.dropLayout;
+  if (layout === "full" || layout === "float" || layout === "dock") setDropLayout(layout);
+});
 dropRefresh.addEventListener("click", () => { void loadDropMessages(); });
 dropAttach.addEventListener("click", () => { dropFileInput.value = ""; dropFileInput.click(); });
 dropComposer.addEventListener("submit", (e) => { e.preventDefault(); void sendDrop(); });
+dropTextInput.addEventListener("input", autosizeDropInput);
+dropTextInput.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter" || e.isComposing || e.keyCode === 229 || e.shiftKey) return;
+  if (window.matchMedia("(pointer: coarse)").matches) return;
+  e.preventDefault(); void sendDrop();
+});
 dropClear.addEventListener("click", async () => {
   if (!window.confirm("清空所有 Drop 内容？")) return;
   dropLoadSeq += 1;

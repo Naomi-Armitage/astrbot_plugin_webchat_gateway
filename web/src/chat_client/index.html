@@ -61,12 +61,49 @@
           </div>
         </header>
 
-        <section id="dropPanel" class="drop-panel" hidden aria-hidden="true" aria-labelledby="dropTitle" role="dialog">
-          <div class="drop-panel-head"><div><h2 id="dropTitle">Drop</h2><p>在已登录设备之间传递文字和文件</p></div>
-            <div class="drop-panel-actions"><button id="dropRefresh" type="button">刷新</button><button id="dropClear" type="button">清空</button><button id="dropClose" type="button">关闭</button></div></div>
+        <section id="dropPanel" class="drop-panel" data-layout="full" hidden aria-hidden="true" aria-labelledby="dropTitle" role="dialog">
+          <div class="drop-panel-head" data-drop-drag-handle>
+            <div class="drop-panel-title">
+              <span class="drop-panel-mark" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 3v18M3 12h18"/><path d="m7 7 10 10M17 7 7 17"/>
+                </svg>
+              </span>
+              <div><h2 id="dropTitle">Drop</h2><p>在已登录设备之间传递文字和文件</p></div>
+            </div>
+            <div class="drop-panel-toolbar">
+              <div id="dropLayoutSwitch" class="drop-layout-switch" role="radiogroup" aria-label="Drop 窗口布局">
+                <button type="button" data-drop-layout="full" role="radio" aria-checked="true" title="全屏">全屏</button>
+                <button type="button" data-drop-layout="float" role="radio" aria-checked="false" title="浮动窗口">浮窗</button>
+                <button type="button" data-drop-layout="dock" role="radio" aria-checked="false" title="右侧栏">右侧栏</button>
+              </div>
+              <div class="drop-panel-actions">
+                <button id="dropRefresh" type="button" aria-label="刷新 Drop" title="刷新">刷新</button>
+                <button id="dropClear" type="button" aria-label="清空 Drop" title="清空">清空</button>
+                <button id="dropClose" type="button" aria-label="关闭 Drop" title="关闭">关闭</button>
+              </div>
+            </div>
+          </div>
           <div id="dropMessages" class="drop-messages" role="log" aria-live="polite"></div>
-          <form id="dropComposer" class="drop-composer"><input id="dropFileInput" type="file" multiple hidden /><button id="dropAttach" type="button">添加文件</button><input id="dropTextInput" type="text" placeholder="写点什么…" /><button id="dropSend" type="submit">发送</button></form>
+          <form id="dropComposer" class="drop-composer">
+            <input id="dropFileInput" type="file" multiple hidden />
+            <div class="composer-row drop-composer-row">
+              <div class="composer-input drop-composer-input">
+                <button id="dropAttach" type="button" class="drop-plus-btn" aria-label="添加文件" title="添加文件">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M21.44 11.05 12.25 20.24a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 1 1-2.83-2.83l8.49-8.48"/>
+                  </svg>
+                </button>
+                <textarea id="dropTextInput" rows="1" placeholder="写点什么…"></textarea>
+              </div>
+              <button id="dropSend" class="drop-send" type="submit" aria-label="发送 Drop 消息">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m22 2-7 20-4-9-9-4 20-7Z"/></svg>
+                <span>发送</span>
+              </button>
+            </div>
+          </form>
           <div id="dropStatus" class="drop-status" role="status"></div>
+          <div class="drop-resize-hint" aria-hidden="true"></div>
         </section>
         <div id="messages">
 

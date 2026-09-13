@@ -1732,56 +1732,177 @@ body.lightbox-open { overflow: hidden; }
   }
 }
 
-/* ----- Drop (multi-device self-to-self transfer) ----------------------
- *
- * Visually mirrors the chat panel: right-aligned "user" bubbles for
- * the local device, left-aligned "bot" bubbles for peers with a
- * device-name header. The .drop-bubble class is a marker so a Drop
- * bubble keeps the existing chat bubble shape but gets two Drop-
- * specific affordances (the device header + the file-link treatment).
- *
- * Reusing .msg-row.user-row / .msg-row.bot-row is intentional: the
- * existing right/left alignment + hover-action chrome already work
- * for both surfaces. The new rules below only add Drop-specific shape.
- */
 
-.drop-device-head {
-  font-size: 12px;
+/* ----- Drop layout shell ------------------------------------------------
+   Drop uses the same message rows, bubbles, attachment treatment and
+   composer language as the regular chat. The shell only changes where that
+   shared surface lives: the normal page, a movable/resizable window, or a
+   right-hand collaboration dock. */
+.drop-panel {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  padding: 0 20px 18px;
+  background: var(--paper);
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  overflow: hidden;
+}
+.drop-panel[hidden] { display: none; }
+.drop-panel[data-layout="float"] {
+  position: fixed;
+  inset: auto;
+  min-width: 320px;
+  min-height: 320px;
+  width: 460px;
+  height: 680px;
+  max-width: calc(100vw - 16px);
+  max-height: calc(100vh - 16px);
+  max-height: calc(100dvh - 16px);
+  resize: both;
+  padding: 0 16px 14px;
+  border: 1px solid var(--rule);
+  border-radius: 12px;
+  box-shadow: 0 16px 42px var(--shadow-strong);
+}
+.drop-panel[data-layout="dock"] {
+  position: fixed;
+  inset: 0 0 0 auto;
+  width: var(--drop-dock-width, clamp(320px, 34vw, 460px));
+  height: 100dvh;
+  min-width: 0;
+  min-height: 0;
+  padding: 0 16px calc(14px + env(safe-area-inset-bottom));
+  border-left: 1px solid var(--rule);
+  box-shadow: -10px 0 26px var(--shadow);
+}
+.wrap.drop-docked {
+  max-width: none;
+  margin: 0;
+  --drop-dock-width: clamp(320px, 34vw, 460px);
+}
+.wrap.drop-docked .main { margin-right: var(--drop-dock-width); }
+.drop-panel-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 14px;
+  min-height: 72px;
+  padding: 16px 0 12px;
+  border-bottom: 1px solid color-mix(in oklab, var(--rule) 72%, transparent);
+  background: color-mix(in oklab, var(--paper) 84%, transparent);
+  user-select: none;
+  touch-action: none;
+}
+.drop-panel-head:not(.is-dragging) { cursor: grab; }
+.drop-panel-head.is-dragging { cursor: grabbing; }
+.drop-panel-title { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.drop-panel-mark {
+  width: 30px;
+  height: 30px;
+  flex: 0 0 30px;
+  display: grid;
+  place-items: center;
+  color: var(--accent-strong);
+  background: var(--accent-soft);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+}
+.drop-panel-mark svg { width: 17px; height: 17px; }
+.drop-panel-head h2 { margin: 0; font: 600 16px/1.3 var(--font-display); color: var(--ink); }
+.drop-panel-head p { margin: 2px 0 0; color: var(--ink-soft); font-size: 12px; white-space: nowrap; }
+.drop-panel-toolbar { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.drop-layout-switch { display: inline-flex; align-items: center; gap: 2px; padding: 2px; background: var(--paper-deep); border: 1px solid var(--rule); border-radius: 8px; }
+.drop-layout-switch button,
+.drop-panel-actions button {
+  appearance: none;
+  border: 1px solid transparent;
+  background: transparent;
   color: var(--ink-soft);
-  padding: 0 12px 4px;
-  letter-spacing: 0.02em;
-  max-width: 78%;
+  border-radius: 6px;
+  padding: 5px 8px;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.2;
+  cursor: pointer;
+  white-space: nowrap;
 }
-
-.msg-row.bot-row.drop-msg .drop-device-head {
-  align-self: flex-start;
+.drop-layout-switch button:hover,
+.drop-panel-actions button:hover { color: var(--ink); background: var(--card); border-color: var(--rule); }
+.drop-layout-switch button[aria-checked="true"] { color: var(--accent-strong); background: var(--card); border-color: color-mix(in oklab, var(--accent) 32%, var(--rule)); font-weight: 600; box-shadow: 0 1px 2px var(--shadow); }
+.drop-panel-actions { display: flex; align-items: center; gap: 3px; }
+.drop-panel-actions button:last-child:hover { color: var(--bad); border-color: color-mix(in oklab, var(--bad) 35%, var(--rule)); }
+.drop-messages {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 18px 0;
+  scrollbar-width: thin;
 }
-
-.msg-row.user-row.drop-msg .drop-device-head {
-  display: none;  /* local device identity is already in the sidebar */
+.drop-messages:has(.msg)::before { content: ""; flex: 1; }
+.drop-messages::-webkit-scrollbar { width: 8px; }
+.drop-messages::-webkit-scrollbar-thumb { background: color-mix(in oklab, var(--ink-soft) 35%, transparent); border-radius: 999px; }
+.drop-messages .msg-row { max-width: 78%; }
+.drop-msg .msg { max-width: none; }
+.drop-msg .drop-item-text { white-space: pre-wrap; overflow-wrap: break-word; word-break: normal; }
+.drop-msg .msg-text { white-space: pre-wrap; }
+.drop-message-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin: -2px 4px 0;
+  min-height: 24px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .15s ease;
 }
-
-/* Drop bubbles — no markdown, no streaming. Same shape as chat bubbles
- * (padding/border-radius) so the visual rhythm matches. */
-.msg.drop-bubble {
-  font-size: 14px;
-  line-height: 1.55;
+.drop-msg:hover .drop-message-actions,
+.drop-msg:focus-within .drop-message-actions,
+.drop-msg.actions-revealed .drop-message-actions { opacity: 1; pointer-events: auto; }
+.drop-msg.user-row .drop-message-actions { align-self: flex-end; }
+.drop-msg.bot-row .drop-message-actions { align-self: flex-start; }
+.drop-action-btn {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 4px;
+  border: 0;
+  background: transparent;
+  color: var(--ink-soft);
+  border-radius: 6px;
+  cursor: pointer;
+  text-decoration: none;
 }
-
-/* Drop is a peer-to-peer space, not another assistant thread. Keep the
- * left-hand peer bubble neutral instead of inheriting the bot tail and
- * assistant-like contrast from the chat surface. */
-.msg-row.bot-row.drop-msg .drop-bubble {
-  background: var(--card);
-  color: var(--ink);
-  border-color: var(--rule);
-  border-radius: 14px;
-  box-shadow: 0 1px 2px var(--shadow);
-}
-
+.drop-action-btn:hover { color: var(--accent-strong); background: var(--accent-soft); }
+.drop-action-btn.copied { color: var(--good); background: color-mix(in oklab, var(--good) 12%, transparent); }
+.drop-action-btn svg { width: 16px; height: 16px; pointer-events: none; }
+.drop-item-delete:hover { color: var(--bad); background: color-mix(in oklab, var(--bad) 10%, transparent); }
+.drop-empty { max-width: 360px; }
+.drop-empty .empty-icon { width: 48px; height: 48px; border-radius: 14px; }
+.drop-empty .empty-icon svg { width: 22px; height: 22px; }
+.drop-attachment { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.drop-bubble.has-image { padding: 0; overflow: hidden; }
+.drop-bubble.has-image .msg-attachments { max-width: 320px; margin: 0; border-radius: 0; }
+.drop-bubble.has-image .msg-text { padding: 6px 12px 8px; margin: 0; }
+.drop-bubble.has-image-only { background: transparent; border-color: transparent; box-shadow: none; padding: 0; overflow: visible; }
+.drop-bubble.has-image-only .msg-attachments { border-radius: 12px; }
 .drop-image-preview {
   appearance: none;
   display: block;
+  width: 100%;
   margin: 0;
   padding: 0;
   border: 0;
@@ -1789,106 +1910,59 @@ body.lightbox-open { overflow: hidden; }
   color: inherit;
   cursor: zoom-in;
   line-height: 0;
-  border-radius: 8px;
 }
-.drop-image-preview:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 3px;
-}
-
-.drop-bubble img.msg-image {
+.drop-image-preview:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.drop-bubble .msg-attachments.cnt-1 .drop-image-preview img.msg-image { width: 100%; height: auto; max-height: 320px; aspect-ratio: auto; object-fit: contain; border-radius: 0; }
+.drop-file-link { display: inline-flex; align-items: center; gap: 8px; max-width: 100%; padding: 8px 10px; border-radius: 9px; background: var(--paper-deep); color: var(--ink); text-decoration: none; font-size: 13px; }
+.drop-file-link:hover { background: color-mix(in oklab, var(--paper-deep) 82%, var(--ink)); color: var(--ink); }
+.drop-file-icon { display: inline-grid; place-items: center; flex: 0 0 30px; width: 30px; height: 30px; border: 1px solid var(--rule); border-radius: 7px; color: var(--accent-strong); background: var(--card); font-size: 9px; font-weight: 700; letter-spacing: .02em; }
+.drop-file-details { display: flex; flex-direction: column; min-width: 0; gap: 1px; }
+.drop-file-name { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.drop-file-meta { color: var(--ink-soft); font-size: 11px; line-height: 1.3; }
+.drop-image-gate { display: flex; align-items: center; gap: 8px; color: var(--ink-soft); font-size: 12px; }
+.drop-image-gate button { border: 1px solid var(--rule); background: var(--card); color: var(--ink); border-radius: 7px; padding: 5px 8px; cursor: pointer; font: inherit; font-size: 12px; }
+.drop-image-gate button:hover { border-color: var(--accent); color: var(--accent-strong); }
+.drop-composer { flex: 0 0 auto; padding-top: 8px; border-top: 1px solid color-mix(in oklab, var(--rule) 72%, transparent); }
+.drop-composer-row { display: flex; align-items: flex-end; gap: 10px; }
+.drop-composer-input { flex: 1; min-width: 0; display: flex; align-items: flex-end; gap: 2px; min-height: 38px; padding: 0 5px; background: var(--card); border: 1px solid var(--rule); border-radius: 10px; transition: border-color .15s ease, box-shadow .15s ease; }
+.drop-composer-input:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--ring); }
+.drop-plus-btn { flex: 0 0 30px; width: 30px; height: 36px; display: inline-grid; place-items: center; padding: 0; border: 0; background: transparent; color: var(--ink-soft); border-radius: 8px; cursor: pointer; }
+.drop-plus-btn:hover { color: var(--accent); background: var(--accent-soft); }
+.drop-plus-btn svg { width: 18px; height: 18px; }
+.drop-composer textarea { flex: 1; min-width: 0; min-height: 36px; max-height: 160px; padding: 7px 6px; resize: none; overflow-y: auto; scrollbar-width: none; border: 0; outline: 0; background: transparent; color: var(--ink); font: inherit; line-height: 22px; }
+.drop-composer textarea::-webkit-scrollbar { display: none; }
+.drop-composer textarea::placeholder { color: var(--ink-soft); }
+.drop-send { min-height: 38px; display: inline-flex; align-items: center; gap: 7px; padding: 0 14px; border: 1px solid var(--accent); border-radius: 10px; background: var(--accent); color: #fff; font: 600 14px/1 var(--font-ui); cursor: pointer; }
+.drop-send:hover:not(:disabled) { background: var(--accent-strong); border-color: var(--accent-strong); }
+.drop-send:disabled { opacity: .5; cursor: not-allowed; }
+.drop-send svg { width: 14px; height: 14px; }
+.drop-status { min-height: 20px; padding-top: 4px; color: var(--ink-soft); font-size: 12px; }
+.drop-status[data-state="bad"] { color: var(--bad); }
+.drop-resize-hint { display: none; }
+.drop-panel[data-layout="float"] .drop-resize-hint {
   display: block;
-  max-width: 240px;
-  max-height: 240px;
-  border-radius: 8px;
-  margin: 4px 0 6px;
-  cursor: zoom-in;
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  width: 11px;
+  height: 11px;
+  border-right: 2px solid color-mix(in oklab, var(--ink-soft) 65%, transparent);
+  border-bottom: 2px solid color-mix(in oklab, var(--ink-soft) 65%, transparent);
+  pointer-events: none;
 }
-
-.drop-file-link {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 8px 12px;
-  border-radius: 10px;
-  background: var(--paper-deep);
-  color: var(--ink);
-  text-decoration: none;
-  font-size: 13px;
-  word-break: break-all;
+@media (hover: none) {
+  .drop-message-actions { opacity: 1; pointer-events: auto; }
 }
-
-.drop-file-link:hover {
-  background: color-mix(in oklab, var(--paper-deep) 82%, var(--ink));
-  filter: brightness(1.05);
+@media (max-width: 719px) {
+  .drop-panel,
+  .drop-panel[data-layout="float"],
+  .drop-panel[data-layout="dock"] { position: absolute; inset: 0; width: auto; height: auto; min-width: 0; min-height: 0; padding: 0 14px calc(12px + env(safe-area-inset-bottom)); border: 0; border-radius: 0; box-shadow: none; resize: none; }
+  .drop-panel-head { align-items: flex-start; flex-direction: column; gap: 8px; padding-top: 12px; }
+  .drop-panel-toolbar { width: 100%; justify-content: space-between; }
+  .drop-panel-head p { white-space: normal; }
+  .drop-messages .msg-row { max-width: 86%; }
+  .drop-composer-row { gap: 8px; }
+  .drop-send { min-height: 40px; padding: 0 12px; }
+  .drop-composer-input { min-height: 40px; }
+  .drop-composer textarea { min-height: 38px; font-size: 16px; }
 }
-.drop-file-icon {
-  display: inline-grid;
-  place-items: center;
-  flex: 0 0 32px;
-  width: 32px;
-  height: 32px;
-  border: 1px solid var(--rule);
-  border-radius: 7px;
-  color: var(--accent-strong);
-  background: var(--card);
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: .02em;
-}
-.drop-file-details {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-  gap: 1px;
-}
-.drop-file-name {
-  max-width: 220px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.drop-file-meta {
-  color: var(--ink-soft);
-  font-size: 11px;
-  line-height: 1.3;
-}
-
-.drop-empty .empty-hint {
-  max-width: 260px;
-}
-
-/* Sidebar Drop entry — fixed virtual session. Sits above the chat
- * list, never editable, never deleted. The .drop-pick-wrap keeps the
- * two-line label aligned to the time slot on the right. */
-.drop-session-item .session-pick {
-  align-items: center;
-}
-
-.drop-pick-wrap {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-  flex: 1;
-}
-
-.drop-pick-sub {
-  font-size: 11px;
-  color: var(--ink-soft);
-  letter-spacing: 0.03em;
-  margin-top: 2px;
-}
-.drop-entry{margin-top:6px}
-.drop-panel[hidden],.drop-entry[hidden],footer[hidden]{display:none}
-/* Drop is a separate chat surface. Keep it out of the normal message flow so
-   opening it never resizes or splits the active conversation. */
-.drop-panel{position:absolute;z-index:8;top:64px;right:0;width:min(460px,calc(100% - 16px));height:min(680px,calc(100% - 82px));min-height:240px;display:flex;flex-direction:column;padding:16px;background:var(--paper);border:1px solid var(--rule);border-radius:14px;box-shadow:0 12px 32px var(--shadow-strong)}
-.drop-panel-head{display:flex;align-items:center;justify-content:space-between;gap:12px;border-bottom:1px solid var(--rule);padding-bottom:12px}.drop-panel-head h2{margin:0;font-size:18px}.drop-panel-head p{margin:2px 0 0;color:var(--ink-soft);font-size:12px}.drop-panel-actions{display:flex;gap:6px}.drop-panel-actions button,.drop-composer button{border:1px solid var(--rule);background:var(--card);color:var(--ink);border-radius:8px;padding:7px 10px;cursor:pointer;font:inherit;font-size:12px}.drop-messages{flex:1;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:8px;padding:14px 2px}.drop-item{align-self:flex-start;max-width:82%;padding:9px 12px;border:1px solid var(--rule);border-radius:12px 12px 12px 4px;background:var(--card);position:relative}.drop-item.mine{align-self:flex-end;background:var(--highlight);color:var(--on-highlight);border-radius:12px 12px 4px 12px}.drop-item-head{color:var(--ink-soft);font-size:11px;margin-bottom:4px}.drop-item-text{white-space:pre-wrap;overflow-wrap:anywhere}.drop-item-delete{border:0;background:transparent;color:var(--ink-soft);font-size:11px;cursor:pointer;margin-top:4px;padding:0}.drop-composer{display:flex;gap:6px;padding-top:10px;border-top:1px solid var(--rule)}.drop-composer input[type=text]{flex:1;min-width:0;border:1px solid var(--rule);border-radius:8px;background:var(--card);color:var(--ink);padding:8px 10px;font:inherit}.drop-status{min-height:20px;padding-top:4px;color:var(--ink-soft);font-size:12px}.drop-status[data-state=bad]{color:var(--bad)}.drop-empty{margin:auto;color:var(--ink-soft)}
-@media(max-width:719px){.drop-panel{top:52px;right:8px;width:calc(100% - 16px);height:calc(100% - 64px);padding:12px}.drop-panel-head{align-items:flex-start;flex-direction:column}.drop-composer{flex-wrap:wrap}.drop-composer input[type=text]{order:3;flex-basis:100%}}
-.drop-attachment{display:flex;flex-direction:column;gap:6px}.drop-attachment-actions{display:flex;align-items:center;gap:8px}.drop-download{display:inline-flex;align-items:center;gap:4px;color:var(--accent);font-size:12px}.drop-download::before{content:"↓";font-size:14px}.drop-image-gate{display:flex;align-items:center;gap:8px;color:var(--ink-soft);font-size:12px}.drop-image-gate button{border:1px solid var(--rule);background:var(--card);color:var(--ink);border-radius:7px;padding:5px 8px;cursor:pointer;font:inherit;font-size:12px}.drop-image-gate button:hover{border-color:var(--accent);color:var(--accent-strong)}
-.drop-panel{top:auto;bottom:18px}
-@media(max-width:719px){.drop-panel{top:52px;bottom:auto;height:calc(100% - 64px)}}
-
-/* Drop previews preserve the original aspect ratio instead of the chat grid's square crop. */
-.drop-item .drop-image-preview{max-width:240px;min-width:0}
-.drop-item img.msg-image{display:block;width:auto;height:auto;max-width:100%;max-height:240px;aspect-ratio:auto;object-fit:contain;border-radius:8px}
