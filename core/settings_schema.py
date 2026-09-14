@@ -147,33 +147,33 @@ FIELDS: tuple[SettingField, ...] = (
         hint="每次请求携带最近 N 轮历史，建议 4-12。",
     ),
     SettingField(
-        key=”auto_title_enabled”,
-        section=”对话行为”,
-        type=”bool”,
-        label=”启用自动生成会话标题”,
+        key="auto_title_enabled",
+        section="对话行为",
+        type="bool",
+        label="启用自动生成会话标题",
         hint=(
-            “若关闭，POST /api/webchat/title 直接返回 503 title_disabled。”
-            “前端会保持”新会话”标题，用户仍可手动重命名。”
+            "若关闭，POST /api/webchat/title 直接返回 503 title_disabled。"
+            "前端会保持\"新会话\"标题，用户仍可手动重命名。"
         ),
     ),
     SettingField(
-        key=”title_provider_id”,
-        section=”对话行为”,
-        type=”string”,
-        label=”标题生成模型 (Provider ID)”,
+        key="title_provider_id",
+        section="对话行为",
+        type="string",
+        label="标题生成模型 (Provider ID)",
         hint=(
-            “自动标题使用的模型。留空则跟随对话模型；填入轻量快速的模型 “
-            “(如 gpt-3.5-turbo) 可加速标题生成且节省成本。”
+            "自动标题使用的模型。留空则跟随对话模型；填入轻量快速的模型 "
+            "(如 gpt-3.5-turbo) 可加速标题生成且节省成本。"
         ),
     ),
     SettingField(
-        key=”title_fallback_provider_id”,
-        section=”对话行为”,
-        type=”string”,
-        label=”标题生成降级备选 (Fallback Provider ID)”,
+        key="title_fallback_provider_id",
+        section="对话行为",
+        type="string",
+        label="标题生成降级备选 (Fallback Provider ID)",
         hint=(
-            “当主标题模型不可用时，自动降级使用此 provider；再不可用时回退到”
-            “对话模型链 (chat_provider_id → chat_fallback → 全局)。”
+            "当主标题模型不可用时，自动降级使用此 provider；再不可用时回退到"
+            "对话模型链 (chat_provider_id → chat_fallback → 全局)。"
         ),
     ),
     SettingField(

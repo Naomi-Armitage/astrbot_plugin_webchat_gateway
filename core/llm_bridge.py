@@ -611,8 +611,8 @@ class LlmBridge:
         "你是会话标题生成器。根据对话内容，用 4-8 个简体中文字概括用户的核心需求或话题。\n"
         "规则：\n"
         "- 只输出标题，不加标点、引号、emoji\n"
-        "- 概括意图而非复述内容（例如"你好"→"问候"或"闲聊"，而非"你好有什么需要帮助"）\n"
-        "- 技术问题提取关键词（例如"Python 列表推导"、"Docker 容器配置"）\n"
+        "- 概括意图而非复述内容（例如\"你好\"→\"问候\"或\"闲聊\"，而非\"你好有什么需要帮助\"）\n"
+        "- 技术问题提取关键词（例如\"Python 列表推导\"、\"Docker 容器配置\"）\n"
         "- 日常对话用简洁标签（问候、闲聊、求助等）"
     )
 
@@ -632,24 +632,24 @@ class LlmBridge:
 
     @staticmethod
     def _post_process_title(raw: str, fallback: str) -> str:
-        text = (raw or “”).strip()
+        text = (raw or "").strip()
         # Take first line only.
         if text:
-            text = text.split(“\n”, 1)[0].strip()
+            text = text.split("\n", 1)[0].strip()
         # Strip surrounding quotes (ASCII + full-width).
         for _ in range(2):
-            if len(text) >= 2 and text[0] == text[-1] and text[0] in “\”’`””’’「」『』《》”:
+            if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"’`""’’「」『』《》":
                 text = text[1:-1].strip()
             else:
                 break
         # Tighter cap for compact session bubbles: 15 chars fits short labels
-        # like “Python 列表推导” (8) or “Docker 容器启动问题” (11) without
+        # like "Python 列表推导" (8) or "Docker 容器启动问题" (11) without
         # truncating, while long-winded LLM outputs get cut early.
         if len(text) > 15:
             text = text[:15]
         if text:
             return text
-        return (fallback or “”).strip()[:15]
+        return (fallback or "").strip()[:15]
 
     async def generate_title(
         self,
