@@ -49,6 +49,11 @@
           <span id="syncStatus" class="badge sync-status" data-state="live" title="同步状态">实时</span>
           <span id="quotaBadge" class="badge">--</span>
           <div class="actions">
+            <div id="dropLayoutSwitch" class="drop-layout-switch" role="radiogroup" aria-label="Drop 窗口布局" hidden>
+              <button type="button" data-drop-layout="full" role="radio" aria-checked="true" title="全屏">全屏</button>
+              <button type="button" data-drop-layout="float" role="radio" aria-checked="false" title="浮动窗口">浮窗</button>
+              <button type="button" data-drop-layout="dock" role="radio" aria-checked="false" title="右侧栏">右侧栏</button>
+            </div>
             <button id="themeToggle" type="button" class="icon-only"
               aria-label="切换深浅色" aria-pressed="false">
               <svg id="themeIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -61,29 +66,7 @@
           </div>
         </header>
 
-        <section id="dropPanel" class="drop-panel" data-layout="full" hidden aria-hidden="true" aria-labelledby="dropTitle" role="dialog">
-          <div class="drop-panel-head" data-drop-drag-handle>
-            <div class="drop-panel-title">
-              <span class="drop-panel-mark" aria-hidden="true">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M12 3v18M3 12h18"/><path d="m7 7 10 10M17 7 7 17"/>
-                </svg>
-              </span>
-              <div><h2 id="dropTitle">Drop</h2><p>在已登录设备之间传递文字和文件</p></div>
-            </div>
-            <div class="drop-panel-toolbar">
-              <div id="dropLayoutSwitch" class="drop-layout-switch" role="radiogroup" aria-label="Drop 窗口布局">
-                <button type="button" data-drop-layout="full" role="radio" aria-checked="true" title="全屏">全屏</button>
-                <button type="button" data-drop-layout="float" role="radio" aria-checked="false" title="浮动窗口">浮窗</button>
-                <button type="button" data-drop-layout="dock" role="radio" aria-checked="false" title="右侧栏">右侧栏</button>
-              </div>
-              <div class="drop-panel-actions">
-                <button id="dropRefresh" type="button" aria-label="刷新 Drop" title="刷新">刷新</button>
-                <button id="dropClear" type="button" aria-label="清空 Drop" title="清空">清空</button>
-                <button id="dropClose" type="button" aria-label="关闭 Drop" title="关闭">关闭</button>
-              </div>
-            </div>
-          </div>
+        <section id="dropPanel" class="drop-panel" data-layout="full" hidden aria-hidden="true" aria-label="Drop" role="dialog">
           <div id="dropMessages" class="drop-messages" role="log" aria-live="polite"></div>
           <form id="dropComposer" class="drop-composer">
             <input id="dropFileInput" type="file" multiple hidden />

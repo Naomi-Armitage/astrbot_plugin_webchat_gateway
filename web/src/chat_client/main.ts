@@ -55,7 +55,6 @@ const FILES_URL = `${API}/files`;
 const DROP_SEND_URL = API + "/drop/send";
 const DROP_UPLOAD_URL = API + "/drop/upload";
 const DROP_MESSAGES_URL = API + "/drop/messages";
-const DROP_CLEAR_URL = API + "/drop/clear";
 const DROP_FILE_URL = (id: string): string => API + "/drop/files/" + encodeURIComponent(id);
 const LS_DROP_DEVICE = "wcg.drop.device_id";
 const LS_DROP_LAYOUT = "wcg.drop.layout";
@@ -300,6 +299,9 @@ const badge = $("quotaBadge");
 const syncStatusEl = $("syncStatus");
 const whoEl = $("who");
 const wrapEl = document.querySelector<HTMLElement>(".wrap")!;
+const chatHeader = document.querySelector<HTMLElement>(".main > header")!;
+const chatHeaderMount = document.createComment("chat-header-mount");
+chatHeader.before(chatHeaderMount);
 const sidebarEl = $("sidebar");
 const sidebarToggleBtn = $<HTMLButtonElement>("sidebarToggle");
 const sidebarBackdrop = $("sidebarBackdrop");
@@ -313,18 +315,15 @@ const imgRatioBar = $<HTMLDivElement>("imgRatioBar");
 const composerAttachmentsEl = $("composer-attachments");
 const dropOverlayEl = $("dropOverlay");
 const footerEl = document.querySelector("footer") as HTMLElement;
+const clearHistoryBtn = $<HTMLButtonElement>("clearHistory");
 const dropEntry = $<HTMLButtonElement>("dropEntry");
 const dropPanel = $<HTMLElement>("dropPanel");
 const dropLayoutSwitch = $<HTMLDivElement>("dropLayoutSwitch");
-const dropPanelHead = $<HTMLDivElement>("dropPanel").querySelector<HTMLDivElement>("[data-drop-drag-handle]")!;
 const dropMessagesEl = $<HTMLDivElement>("dropMessages");
 const dropComposer = $<HTMLFormElement>("dropComposer");
 const dropTextInput = $<HTMLTextAreaElement>("dropTextInput");
 const dropFileInput = $<HTMLInputElement>("dropFileInput");
 const dropAttach = $<HTMLButtonElement>("dropAttach");
-const dropClose = $<HTMLButtonElement>("dropClose");
-const dropRefresh = $<HTMLButtonElement>("dropRefresh");
-const dropClear = $<HTMLButtonElement>("dropClear");
 const dropSend = $<HTMLButtonElement>("dropSend");
 const dropStatus = $<HTMLDivElement>("dropStatus");
 
@@ -3091,7 +3090,7 @@ function renderSessionList(): void {
 
 function switchSession(id: string): void {
   if (!store.sessions[id]) return;
-  if (dropOpen) closeDrop();
+  if (dropOpen) closeDrop(false);
   if (id !== store.activeId) {
     // Leaving this session abandons any non-streaming send started under it;
     // cancel it so it can't hold the connection (streaming sends self-recover
@@ -3327,6 +3326,21 @@ let dropGeometry: DropGeometry = dropGeometryFromStorage() ?? {
 };
 let dropDragState: { pointerId: number; offsetX: number; offsetY: number } | null = null;
 let dropSending = false;
+
+function mountChatHeaderInDrop(): void {
+  if (chatHeader.parentElement !== dropPanel) dropPanel.prepend(chatHeader);
+  chatHeader.classList.add("drop-header");
+  chatHeader.setAttribute("data-drop-drag-handle", "");
+  dropLayoutSwitch.hidden = false;
+}
+
+function restoreChatHeader(): void {
+  if (chatHeader.parentElement !== chatHeaderMount.parentNode) chatHeaderMount.after(chatHeader);
+  chatHeader.classList.remove("drop-header", "is-dragging");
+  chatHeader.removeAttribute("data-drop-drag-handle");
+  dropLayoutSwitch.hidden = true;
+}
+
 const dropResizeObserver = typeof ResizeObserver === "undefined"
   ? null
   : new ResizeObserver(() => {
@@ -3569,19 +3583,23 @@ async function sendDrop(): Promise<void> {
     await loadDropMessages();
   } catch (e) { dropStatusText("发送失败：" + (e as Error).message, true); } finally { dropSending = false; dropSend.disabled = false; }
 }
-function closeDrop(): void {
+function closeDrop(restoreFocus = true): void {
   dropOpen = false; dropLoadedImages.clear(); dropMessagesEl.replaceChildren();
   if (dropTimer) clearInterval(dropTimer);
   dropTimer = null;
   dropPanel.hidden = true; dropPanel.setAttribute("aria-hidden", "true"); dropEntry.setAttribute("aria-expanded", "false");
   wrapEl.classList.remove("drop-docked");
   footerEl.hidden = false;
-  dropEntry.focus();
+  restoreChatHeader();
+  updateClearButtonState();
+  if (restoreFocus) dropEntry.focus();
 }
 function openDrop(): void {
   dropOpen = true;
   dropPanel.hidden = false; dropPanel.setAttribute("aria-hidden", "false"); dropEntry.setAttribute("aria-expanded", "true");
+  mountChatHeaderInDrop();
   setDropLayout(dropLayout, false);
+  updateClearButtonState();
   void loadDropMessages();
   if (dropTimer) clearInterval(dropTimer);
   dropTimer = setInterval(() => { if (dropOpen && !document.hidden) void loadDropMessages(); }, 15000);
@@ -3594,8 +3612,8 @@ function beginDropDrag(e: PointerEvent): void {
   if (target?.closest("button, a, input, textarea, [data-drop-layout]")) return;
   const rect = dropPanel.getBoundingClientRect();
   dropDragState = { pointerId: e.pointerId, offsetX: e.clientX - rect.left, offsetY: e.clientY - rect.top };
-  dropPanelHead.setPointerCapture?.(e.pointerId);
-  dropPanelHead.classList.add("is-dragging");
+  chatHeader.setPointerCapture?.(e.pointerId);
+  chatHeader.classList.add("is-dragging");
   e.preventDefault();
 }
 
@@ -3613,12 +3631,12 @@ function moveDropDrag(e: PointerEvent): void {
 function finishDropDrag(e: PointerEvent): void {
   if (!dropDragState || e.pointerId !== dropDragState.pointerId) return;
   dropDragState = null;
-  dropPanelHead.classList.remove("is-dragging");
+  chatHeader.classList.remove("is-dragging");
   readDropGeometryFromPanel();
   persistDropGeometry();
 }
 
-dropPanelHead.addEventListener("pointerdown", beginDropDrag);
+chatHeader.addEventListener("pointerdown", beginDropDrag);
 window.addEventListener("pointermove", moveDropDrag);
 window.addEventListener("pointerup", finishDropDrag);
 window.addEventListener("pointercancel", finishDropDrag);
@@ -3634,7 +3652,7 @@ window.addEventListener("resize", () => {
 });
 
 function newSession(): void {
-  if (dropOpen) closeDrop();
+  if (dropOpen) closeDrop(false);
   cancelInflightSend();
   const fresh = blankSession();
   store.sessions[fresh.id] = fresh;
@@ -5676,7 +5694,10 @@ async function runNonStreamingSend(sid: string, message: string, attachments: At
   }
 }
 
-$<HTMLButtonElement>("clearHistory").onclick = () => { void clearActiveHistory(); };
+clearHistoryBtn.onclick = () => {
+  if (dropOpen) void loadDropMessages();
+  else void clearActiveHistory();
+};
 $<HTMLButtonElement>("newSessionBtn").onclick = newSession;
 
 // Disable the "clear history" button while a stream is in flight for
@@ -5691,7 +5712,16 @@ $<HTMLButtonElement>("newSessionBtn").onclick = newSession;
 // the button shows the user "wait for the message to finish" up
 // front, which is the safer pattern for irreversible actions.
 function updateClearButtonState(): void {
-  const btn = $<HTMLButtonElement>("clearHistory");
+  const btn = clearHistoryBtn;
+  if (dropOpen) {
+    btn.textContent = "刷新";
+    btn.title = "刷新";
+    btn.setAttribute("aria-label", "刷新");
+    btn.disabled = false;
+    return;
+  }
+  btn.textContent = "清空";
+  btn.removeAttribute("aria-label");
   const sid = store.activeId;
   const streaming = !!(sid && store.pendingStreams[sid]);
   btn.disabled = streaming;
@@ -5746,14 +5776,12 @@ sidebarToggleBtn.addEventListener("click", () => {
 });
 sidebarBackdrop.addEventListener("click", closeMobileSidebar);
 dropEntry.addEventListener("click", () => { closeMobileSidebar(); openDrop(); });
-dropClose.addEventListener("click", closeDrop);
 dropLayoutSwitch.addEventListener("click", (e) => {
   const target = (e.target as Element | null)?.closest<HTMLButtonElement>("[data-drop-layout]");
   if (!target) return;
   const layout = target.dataset.dropLayout;
   if (layout === "full" || layout === "float" || layout === "dock") setDropLayout(layout);
 });
-dropRefresh.addEventListener("click", () => { void loadDropMessages(); });
 dropAttach.addEventListener("click", () => { dropFileInput.value = ""; dropFileInput.click(); });
 dropComposer.addEventListener("submit", (e) => { e.preventDefault(); void sendDrop(); });
 dropTextInput.addEventListener("input", autosizeDropInput);
@@ -5761,17 +5789,6 @@ dropTextInput.addEventListener("keydown", (e) => {
   if (e.key !== "Enter" || e.isComposing || e.keyCode === 229 || e.shiftKey) return;
   if (window.matchMedia("(pointer: coarse)").matches) return;
   e.preventDefault(); void sendDrop();
-});
-dropClear.addEventListener("click", async () => {
-  if (!window.confirm("清空所有 Drop 内容？")) return;
-  dropLoadSeq += 1;
-  try {
-    const r = await fetchWithTimeout(DROP_CLEAR_URL, { method: "POST", headers: bearer(), credentials: "same-origin" }, FETCH_TIMEOUT_FAST_MS);
-    if (!r.ok) throw new Error("HTTP " + r.status);
-    // Refetch so a peer addition after the clear is preserved even if its event
-    // arrived before this HTTP response.
-    await loadDropMessages();
-  } catch (e) { dropStatusText("清空失败：" + (e as Error).message, true); }
 });
 
 // Escape-to-close is owned by the sidebar's focus trap (installed in
