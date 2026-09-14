@@ -171,14 +171,15 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
 }
 
 .session-item {
-  display: flex; align-items: stretch; gap: 2px;
+  display: flex; align-items: stretch; gap: 0;
   margin: 4px 10px;
   background: var(--card);
   border: 1px solid var(--rule);
   border-radius: 12px;
   box-shadow: 0 1px 2px var(--shadow);
   overflow: hidden;
-  transition: background .12s ease, border-color .12s ease, box-shadow .12s ease;
+  position: relative;
+  transition: background .12s ease, border-color .12s ease, box-shadow .12s ease, transform .2s ease;
 }
 .session-item:hover {
   border-color: color-mix(in oklab, var(--ink-soft) 35%, var(--rule));
@@ -191,53 +192,78 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
 }
 .session-pick {
   flex: 1; min-width: 0;
-  display: flex; flex-direction: row; align-items: center; justify-content: space-between;
-  gap: 8px;
+  display: flex; flex-direction: column; align-items: stretch;
+  gap: 2px;
   padding: 10px 12px; background: transparent; border: 0;
   text-align: left; cursor: pointer; font: inherit;
   color: var(--ink); min-height: 44px;
+  position: relative;
+  z-index: 1;
 }
 .session-pick:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .session-title {
   font-size: 14px; font-weight: 500; color: var(--ink);
-  flex: 1;
-  min-width: 0;
   text-overflow: ellipsis; overflow: hidden; white-space: nowrap;
+}
+.session-meta {
+  display: flex; align-items: center; justify-content: flex-end;
+  gap: 4px;
 }
 .session-time {
   font-size: 11px;
   color: var(--ink-soft);
-  flex: 0 0 auto;
   white-space: nowrap;
   opacity: 0.8;
 }
 .session-del {
-  width: 32px; flex: 0 0 32px;
+  position: absolute; right: 0; top: 0; bottom: 0;
+  width: 56px;
   display: inline-grid; place-items: center;
-  background: transparent; border: 0;
-  color: var(--ink-soft); cursor: pointer;
+  background: color-mix(in oklab, var(--bad) 85%, transparent);
+  border: 0;
+  color: var(--bad);
+  cursor: pointer;
   opacity: 0;
-  transition: opacity .12s ease, color .12s ease, background .12s ease;
+  pointer-events: none;
+  transition: opacity .15s ease;
+  z-index: 2;
 }
-.session-del svg { width: 14px; height: 14px; }
-.session-item:hover .session-del,
-.session-item:focus-within .session-del { opacity: 1; }
-.session-del:hover { color: var(--bad); background: color-mix(in oklab, var(--bad) 10%, transparent); }
-@media (hover: none) { .session-del { opacity: 1; width: 36px; flex-basis: 36px; } }
+.session-del svg { width: 16px; height: 16px; }
+@media (hover: hover) {
+  .session-item:hover .session-del { opacity: 1; pointer-events: auto; }
+}
+.session-del:hover { background: color-mix(in oklab, var(--bad) 92%, transparent); }
+@media (hover: none) {
+  .session-del { opacity: 0; pointer-events: none; }
+  .session-item[data-swipe="left"] .session-del { opacity: 1; pointer-events: auto; }
+}
+
+.session-pin {
+  position: absolute; left: 0; top: 0; bottom: 0;
+  width: 56px;
+  display: inline-grid; place-items: center;
+  background: color-mix(in oklab, var(--accent) 85%, transparent);
+  border: 0;
+  color: var(--accent);
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .15s ease;
+  z-index: 2;
+}
+.session-pin svg { width: 16px; height: 16px; }
+@media (hover: hover) {
+  .session-item:hover .session-pin { opacity: 1; pointer-events: auto; }
+}
+.session-pin:hover { background: color-mix(in oklab, var(--accent) 92%, transparent); }
+@media (hover: none) {
+  .session-pin { opacity: 0; pointer-events: none; }
+  .session-item[data-swipe="right"] .session-pin { opacity: 1; pointer-events: auto; }
+}
 
 .session-edit {
-  width: 32px; flex: 0 0 32px;
-  display: inline-grid; place-items: center;
-  background: transparent; border: 0;
-  color: var(--ink-soft); cursor: pointer;
-  opacity: 0;
-  transition: opacity .12s ease, color .12s ease, background .12s ease;
+  display: none;
 }
-.session-edit svg { width: 14px; height: 14px; }
-.session-item:hover .session-edit,
-.session-item:focus-within .session-edit { opacity: 1; }
-.session-edit:hover { color: var(--accent); background: color-mix(in oklab, var(--accent) 10%, transparent); }
-@media (hover: none) { .session-edit { opacity: 1; width: 36px; flex-basis: 36px; } }
 
 .session-title-input {
   flex: 1; min-width: 0;
@@ -249,11 +275,10 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
   outline: none;
 }
 .session-title-input:focus { box-shadow: 0 0 0 3px var(--ring); }
-.session-item[data-editing="true"] .session-pick,
-.session-item[data-editing="true"] .session-edit,
+.session-item[data-editing="true"] .session-pick { padding: 4px; }
+.session-item[data-editing="true"] .session-pin,
 .session-item[data-editing="true"] .session-del { display: none; }
 .session-item[data-editing="true"] {
-  padding: 4px;
   background: var(--card);
 }
 
@@ -1835,18 +1860,19 @@ body.lightbox-open { overflow: hidden; }
 .drop-layout-switch button {
   appearance: none;
   border: 1px solid transparent;
-  background: transparent;
-  color: var(--ink-soft);
+  background: var(--accent);
+  color: var(--bg-0);
   border-radius: 6px;
   padding: 5px 8px;
   font: inherit;
   font-size: 12px;
   line-height: 1.2;
+  font-weight: 500;
   cursor: pointer;
   white-space: nowrap;
 }
-.drop-layout-switch button:hover { color: var(--ink); background: var(--card); border-color: var(--rule); }
-.drop-layout-switch button[aria-checked="true"] { color: var(--accent-strong); background: var(--card); border-color: color-mix(in oklab, var(--accent) 32%, var(--rule)); font-weight: 600; box-shadow: 0 1px 2px var(--shadow); }
+.drop-layout-switch button:hover { background: color-mix(in oklab, var(--accent) 85%, black); }
+.drop-layout-switch button[aria-checked="true"] { color: var(--ink); background: var(--card); border-color: var(--rule); font-weight: 400; box-shadow: 0 1px 2px var(--shadow); }
 @container chathead (max-width: 480px) {
   header.drop-header .actions {
     flex: 0 0 100%;

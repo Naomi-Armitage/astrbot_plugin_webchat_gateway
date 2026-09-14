@@ -100,6 +100,8 @@ const TITLE_MAX = 25;
 const RENAME_MAX = 40;
 const TRASH_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6M10 11v6M14 11v6"/></svg>';
 const PENCIL_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>';
+const PIN_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 17v5M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a3 3 0 0 0-6 0z"/></svg>';
+const PINNED_SVG = '<svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 17v5M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a3 3 0 0 0-6 0z"/></svg>';
 
 const LONG_POLL_TIMEOUT_S = 25;
 const SHORT_POLL_INTERVAL_MS = 30_000;
@@ -3071,25 +3073,31 @@ function renderSessionList(): void {
     pick.className = "session-pick"; pick.type = "button";
     const title = document.createElement("span");
     title.className = "session-title"; title.textContent = sess.title || "新会话";
+    const meta = document.createElement("div");
+    meta.className = "session-meta";
     const time = document.createElement("span");
     time.className = "session-time";
     if (sync.sidebarTypingFor.has(sess.id)) {
-      // Peer device is currently driving a stream for this session that
-      // we're not actively attached to. Surface a tiny "正在输入…" cue on
-      // the sidebar entry's time line so the user knows there's activity
-      // they can tab into.
       time.textContent = "正在输入…";
     } else {
       time.textContent = relativeTime(sess.lastActiveAt);
     }
-    pick.append(title, time);
+    meta.append(time);
+    pick.append(title, meta);
     pick.addEventListener("click", () => switchSession(sess.id));
 
-    const edit = document.createElement("button");
-    edit.className = "session-edit"; edit.type = "button";
-    edit.setAttribute("aria-label", "重命名"); edit.title = "重命名";
-    edit.innerHTML = PENCIL_SVG;
-    edit.addEventListener("click", (e) => { e.stopPropagation(); beginRename(sess.id); });
+    // 双击标题进入编辑模式
+    title.addEventListener("dblclick", (e) => {
+      e.stopPropagation();
+      beginRename(sess.id);
+    });
+
+    const pin = document.createElement("button");
+    pin.className = "session-pin"; pin.type = "button";
+    pin.setAttribute("aria-label", sess.pinned ? "取消置顶" : "置顶会话");
+    pin.title = sess.pinned ? "取消置顶" : "置顶会话";
+    pin.innerHTML = sess.pinned ? PINNED_SVG : PIN_SVG;
+    pin.addEventListener("click", (e) => { e.stopPropagation(); void togglePinSession(sess.id); });
 
     const del = document.createElement("button");
     del.className = "session-del"; del.type = "button";
@@ -3097,10 +3105,61 @@ function renderSessionList(): void {
     del.innerHTML = TRASH_SVG;
     del.addEventListener("click", (e) => { e.stopPropagation(); void deleteSession(sess.id); });
 
-    li.append(pick, edit, del);
+    li.append(pin, pick, del);
+
+    // 移动端滑动逻辑
+    let startX = 0, currentX = 0, isDragging = false;
+    li.addEventListener("touchstart", (e) => {
+      // 重置其他所有项的滑动状态
+      sessionListEl.querySelectorAll(".session-item").forEach((item) => {
+        if (item !== li) {
+          (item as HTMLElement).style.transform = "";
+          delete (item as HTMLElement).dataset.swipe;
+        }
+      });
+      startX = e.touches[0].clientX;
+      currentX = startX;
+      isDragging = true;
+    }, { passive: true });
+
+    li.addEventListener("touchmove", (e) => {
+      if (!isDragging) return;
+      currentX = e.touches[0].clientX;
+      const deltaX = currentX - startX;
+      if (Math.abs(deltaX) > 10) {
+        li.style.transform = `translateX(${deltaX}px)`;
+      }
+    }, { passive: true });
+
+    li.addEventListener("touchend", () => {
+      if (!isDragging) return;
+      isDragging = false;
+      const deltaX = currentX - startX;
+      if (deltaX < -60) {
+        li.dataset.swipe = "left";
+        li.style.transform = "translateX(-80px)";
+      } else if (deltaX > 60) {
+        li.dataset.swipe = "right";
+        li.style.transform = "translateX(80px)";
+      } else {
+        delete li.dataset.swipe;
+        li.style.transform = "";
+      }
+    });
+
     sessionListEl.appendChild(li);
   }
 }
+
+// 点击列表外区域重置所有滑动状态
+document.addEventListener("click", (e) => {
+  if (!sessionListEl.contains(e.target as Node)) {
+    sessionListEl.querySelectorAll(".session-item").forEach((item) => {
+      (item as HTMLElement).style.transform = "";
+      delete (item as HTMLElement).dataset.swipe;
+    });
+  }
+});
 
 function switchSession(id: string): void {
   if (!store.sessions[id]) return;
@@ -3266,6 +3325,24 @@ async function deleteSession(id: string): Promise<void> {
   saveStore();
   renderSessionList();
   void flushSessionDeletes();
+}
+
+async function togglePinSession(id: string): Promise<void> {
+  const sess = store.sessions[id];
+  if (!sess) return;
+  const newPinned = !sess.pinned;
+  const prev = sess.pinned;
+  sess.pinned = newPinned;
+  saveStore();
+  renderSessionList();
+  try {
+    await patchSession(id, { pinned: newPinned });
+  } catch (e) {
+    sess.pinned = prev;
+    saveStore();
+    renderSessionList();
+    console.error("置顶失败:", e);
+  }
 }
 
 async function clearActiveHistory(): Promise<void> {
