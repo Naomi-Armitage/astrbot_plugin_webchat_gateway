@@ -31,6 +31,7 @@ Endpoints (all registered in handlers/server.py under cfg.drop_*):
   GET  {prefix}/drop/messages?before=&limit=   newest-first pagination
   DELETE {prefix}/drop/messages/{message_id}   soft-delete one message
   POST {prefix}/drop/clear         hard-clear own history + release files
+  DELETE {prefix}/drop/files/{file_id}           discard an unsent upload
 """
 
 from __future__ import annotations
@@ -312,7 +313,7 @@ def _ext_for_drop_mime(mime: str) -> str:
 
 
 def make_drop_handlers(deps: DropDeps):
-    """Build the five Drop endpoints. Returns a dict of handlers —
+    """Build the Drop endpoints. Returns a dict of handlers —
     same shape as make_conversation_handlers so server.py mounts them
     uniformly."""
 
@@ -324,8 +325,9 @@ def make_drop_handlers(deps: DropDeps):
         """Return Drop references, or None when the backend cannot answer.
 
         Unknown is deliberately treated as unsafe by destructive callers.
-        The fallback scan keeps older third-party storage implementations
-        source-compatible while current SQLite/MySQL backends use a COUNT.
+        Current SQLite/MySQL backends answer with an indexed COUNT; older
+        third-party backends without that optional method are left untouched
+        rather than risking an incomplete full-table scan.
         """
         if not row.file_id:
             return 0
@@ -635,8 +637,8 @@ def make_drop_handlers(deps: DropDeps):
                             "[WebChatGateway] drop send rollback raised"
                         )
                 # Do NOT push events after rollback — the rows no longer exist.
-                # Clearing the events list ensures the success path's push at L623
-                # does not send phantom messages to peers.
+                # Clearing the events list also protects the success path below
+                # from ever publishing phantom messages to peers.
                 events.clear()
                 return json_response(
                     {"error": "internal_error"}, status=500,
@@ -644,9 +646,12 @@ def make_drop_handlers(deps: DropDeps):
                     same_origin_host=gated.same_host,
                 )
 
-        # Push events only after successful persist. The rollback path above
-        # clears the events list to prevent phantom messages.
-        await _push_events(token.name, events, now)
+            # Keep event append inside the same per-token mutation gate as the
+            # Drop row writes. If send released the gate first, a concurrent
+            # clear could publish `drop_history_cleared` and then this late
+            # `drop_message_added`, making the just-cleared message reappear
+            # briefly on peer devices.
+            await _push_events(token.name, events, now)
         await deps.audit.write(
             "drop_sent",
             name=token.name,
@@ -978,10 +983,15 @@ def make_drop_handlers(deps: DropDeps):
         has_more = len(rows) > limit
         if has_more:
             rows = rows[:limit]
+        # `before` is the cursor for the next page. Only expose it when there
+        # is another page; returning null at the end lets clients disable
+        # their "load older" affordance without issuing an empty request.
+        next_before = rows[-1].id if has_more and rows else None
         return json_response(
             {
                 "messages": [_drop_message_payload(r) for r in rows],
                 "has_more": has_more,
+                "before": next_before,
             },
             origin=origin,
             allowed_origins=allowed,
@@ -1040,24 +1050,27 @@ def make_drop_handlers(deps: DropDeps):
                     origin=origin, allowed_origins=allowed,
                     same_origin_host=gated.same_host,
                 )
-        if changed:
-            await _push_events(
-                token.name,
-                [
-                    NewEvent(
-                        event_type=EVENT_DROP_MESSAGE_DELETED,
-                        session_id=DROP_SESSION_ID,
-                        payload=json.dumps({"id": message_id}),
-                    )
-                ],
-                now,
-            )
-            await deps.audit.write(
-                "drop_message_deleted",
-                name=token.name,
-                ip=ip,
-                detail={"message_id": message_id, "kind": row.kind},
-            )
+            if changed:
+                # Serialize the event with the row mutation. A clear/send
+                # cannot overtake this delete while the same token gate is
+                # held, so peers observe one deterministic mutation order.
+                await _push_events(
+                    token.name,
+                    [
+                        NewEvent(
+                            event_type=EVENT_DROP_MESSAGE_DELETED,
+                            session_id=DROP_SESSION_ID,
+                            payload=json.dumps({"id": message_id}),
+                        )
+                    ],
+                    now,
+                )
+                await deps.audit.write(
+                    "drop_message_deleted",
+                    name=token.name,
+                    ip=ip,
+                    detail={"message_id": message_id, "kind": row.kind},
+                )
         return json_response(
             {"ok": True, "id": message_id},
             origin=origin,
@@ -1078,8 +1091,10 @@ def make_drop_handlers(deps: DropDeps):
             return _disabled(request, origin)
 
         async with deps.upload_gate.acquire(token.name):
-            # Collect file rows BEFORE the wipe so the release has the
-            # storage_keys (same pattern as _clear_history_inner).
+            # Collect file rows before the database transaction so the
+            # storage keys are still available. The per-token gate also keeps
+            # uploads/sends from adding a row between this read and the
+            # transaction below.
             try:
                 file_rows = await deps.storage.list_drop_files(
                     token_name=token.name
@@ -1095,8 +1110,9 @@ def make_drop_handlers(deps: DropDeps):
                     same_origin_host=gated.same_host,
                     extra_headers={"Retry-After": "5"},
                 )
-            # Release storage objects before deleting their message/file rows.
-            # A partial release leaves the rows reachable for a retry.
+
+            # Release storage objects first. A partial release leaves every
+            # database row intact, making a retry able to finish the cleanup.
             if file_rows:
                 try:
                     released_count = await release_files_safely(
@@ -1116,50 +1132,37 @@ def make_drop_handlers(deps: DropDeps):
                         same_origin_host=gated.same_host,
                         extra_headers={"Retry-After": "5"},
                     )
-            if file_rows:
-                try:
-                    db_removed = await deps.storage.delete_files_by_ids(
-                        [row.file_id for row in file_rows]
-                    )
-                except Exception:
-                    logger.exception("[WebChatGateway] drop clear file-row delete failed")
-                    return json_response(
-                        {"error": "storage_unavailable"}, status=503,
-                        origin=origin, allowed_origins=allowed,
-                        same_origin_host=gated.same_host,
-                        extra_headers={"Retry-After": "5"},
-                    )
-                if db_removed is not None and int(db_removed) != len(file_rows):
-                    return json_response(
-                        {"error": "storage_unavailable"}, status=503,
-                        origin=origin, allowed_origins=allowed,
-                        same_origin_host=gated.same_host,
-                        extra_headers={"Retry-After": "5"},
-                    )
+
             now = int(time.time())
             try:
+                # This storage primitive deletes both Drop tables in one
+                # database transaction. Do not split it into a file-row
+                # delete followed by a message delete: a failure in the
+                # latter would leave references to an already-removed row.
                 removed = await deps.storage.clear_drop_history(
                     token_name=token.name, now=now
                 )
             except Exception:
-                logger.exception("[WebChatGateway] drop clear failed")
+                logger.exception("[WebChatGateway] atomic drop clear failed")
                 return json_response(
                     {"error": "internal_error"}, status=500,
                     origin=origin, allowed_origins=allowed,
                     same_origin_host=gated.same_host,
                 )
-        # File rows were removed before the message clear above.
-        await _push_events(
-            token.name,
-            [
-                NewEvent(
-                    event_type=EVENT_DROP_HISTORY_CLEARED,
-                    session_id=DROP_SESSION_ID,
-                    payload="{}",
-                )
-            ],
-            now,
-        )
+            # Event append stays in the same gate as the atomic database
+            # clear. A concurrent send therefore cannot publish an add after
+            # this clear event and resurrect a message on peer devices.
+            await _push_events(
+                token.name,
+                [
+                    NewEvent(
+                        event_type=EVENT_DROP_HISTORY_CLEARED,
+                        session_id=DROP_SESSION_ID,
+                        payload="{}",
+                    )
+                ],
+                now,
+            )
         await deps.audit.write(
             "drop_cleared",
             name=token.name,
@@ -1168,6 +1171,102 @@ def make_drop_handlers(deps: DropDeps):
         )
         return json_response(
             {"ok": True, "removed": removed},
+            origin=origin,
+            allowed_origins=allowed,
+            same_origin_host=gated.same_host,
+        )
+
+    # ----- DELETE {prefix}/drop/files/{file_id} -----
+
+    async def discard_drop_file(request: web.Request) -> web.Response:
+        """Release an uploaded Drop file that was never sent.
+
+        The client calls this after a failed ``/drop/send`` so a batch upload
+        does not wait for orphan GC. Ownership and the Drop namespace are
+        checked before deleting, and a referenced file is never removed (a
+        lost/late send response must remain recoverable).
+        """
+        gated = await gate_request(request, deps)
+        if isinstance(gated, web.Response):
+            return gated
+        token = gated.token
+        ip = gated.ip
+        origin = gated.origin
+        if not deps.enabled:
+            return _disabled(request, origin)
+
+        file_id = (request.match_info.get("file_id") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16}", file_id):
+            return json_response(
+                {"error": "invalid_file_id"}, status=400,
+                origin=origin, allowed_origins=allowed,
+                same_origin_host=gated.same_host,
+            )
+
+        async with deps.upload_gate.acquire(token.name):
+            try:
+                row = await deps.storage.get_file(file_id)
+            except Exception:
+                logger.exception("[WebChatGateway] drop discard get_file failed")
+                return json_response(
+                    {"error": "storage_unavailable"}, status=503,
+                    origin=origin, allowed_origins=allowed,
+                    same_origin_host=gated.same_host,
+                    extra_headers={"Retry-After": "5"},
+                )
+            # Missing and cross-token rows intentionally collapse to 404.
+            if (
+                row is None
+                or row.token_name != token.name
+                or row.session_id != DROP_SESSION_ID
+            ):
+                return json_response(
+                    {"error": "not_found"}, status=404,
+                    origin=origin, allowed_origins=allowed,
+                    same_origin_host=gated.same_host,
+                )
+            ref_count = await _drop_reference_count(row)
+            if ref_count is None:
+                return json_response(
+                    {"error": "storage_unavailable"}, status=503,
+                    origin=origin, allowed_origins=allowed,
+                    same_origin_host=gated.same_host,
+                    extra_headers={"Retry-After": "5"},
+                )
+            if ref_count > 0:
+                # This can happen when the upload request races a successful
+                # send whose response was lost. Keep the file and let the
+                # normal message/delete lifecycle own it.
+                return json_response(
+                    {"error": "file_in_use"}, status=409,
+                    origin=origin, allowed_origins=allowed,
+                    same_origin_host=gated.same_host,
+                )
+            try:
+                released = await release_files_safely(
+                    storage=deps.storage,
+                    file_store=deps.file_store,
+                    rows=[row],
+                    log_label="drop_discard",
+                )
+            except Exception:
+                logger.exception("[WebChatGateway] drop discard release failed")
+                released = 0
+            if released != 1:
+                return json_response(
+                    {"error": "storage_unavailable"}, status=503,
+                    origin=origin, allowed_origins=allowed,
+                    same_origin_host=gated.same_host,
+                    extra_headers={"Retry-After": "5"},
+                )
+        await deps.audit.write(
+            "drop_file_discarded",
+            name=token.name,
+            ip=ip,
+            detail={"file_id": file_id},
+        )
+        return json_response(
+            {"ok": True, "file_id": file_id},
             origin=origin,
             allowed_origins=allowed,
             same_origin_host=gated.same_host,
@@ -1188,6 +1287,7 @@ def make_drop_handlers(deps: DropDeps):
         "list": list_drop,
         "delete": delete_drop,
         "clear": clear_drop,
+        "discard_file": discard_drop_file,
         "preflight": preflight,
     }
 

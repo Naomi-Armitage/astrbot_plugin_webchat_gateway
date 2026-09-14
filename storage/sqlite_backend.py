@@ -1400,21 +1400,32 @@ class SqliteStorage(AbstractStorage):
     async def clear_drop_history(
         self, *, token_name: str, now: int
     ) -> int:
-        # Hard delete is fine here — clear is operator-initiated and
-        # emits its own drop_history_cleared event so peer devices can
-        # nuke their local cache of the same id range. We soft-delete
-        # first (so a concurrent reader sees a consistent state), then
-        # hard-delete in the same transaction; `now` is accepted for
-        # parity with soft_delete_drop_message and future "soft-then-
-        # prune" consolidation.
+        # Clear is operator-initiated and emits its own
+        # drop_history_cleared event. The message and Drop-file deletes stay
+        # in this one transaction; the handler has already removed the
+        # corresponding storage objects and will retry the whole operation if
+        # this transaction fails.
         del now
         async with self._write_lock:
-            cur = await self._db.execute(
-                "DELETE FROM webchat_drop_messages WHERE token_name = ?",
-                (token_name,),
-            )
-            await self._db.commit()
-        return int(cur.rowcount or 0)
+            try:
+                messages_cur = await self._db.execute(
+                    "DELETE FROM webchat_drop_messages WHERE token_name = ?",
+                    (token_name,),
+                )
+                await self._db.execute(
+                    "DELETE FROM webchat_files "
+                    "WHERE token_name = ? AND session_id = 'drop'",
+                    (token_name,),
+                )
+                message_count = int(messages_cur.rowcount or 0)
+                await self._db.commit()
+            except BaseException:
+                try:
+                    await self._db.rollback()
+                except Exception:
+                    pass
+                raise
+        return message_count
 
     async def list_drop_messages_to_purge(
         self, *, before_ts: int, limit: int = 500

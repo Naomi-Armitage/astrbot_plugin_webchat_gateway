@@ -222,6 +222,10 @@ def build_app(deps: ServerDeps) -> web.Application:
     app.router.add_post(cfg.drop_clear_path, drop["clear"])
     app.router.add_options(cfg.drop_clear_path, drop_preflight)
     app.router.add_get(cfg.drop_files_serve_path, drop_serve)
+    # A failed multi-file Drop send can explicitly discard the temporary
+    # uploads it created. The handler keeps referenced files intact and shares
+    # the same path/auth policy as the GET serve route.
+    app.router.add_delete(cfg.drop_files_serve_path, drop["discard_file"])
     app.router.add_options(cfg.drop_files_serve_path, drop_preflight)
 
     conv = make_conversation_handlers(deps.conv, deps.conv_service)

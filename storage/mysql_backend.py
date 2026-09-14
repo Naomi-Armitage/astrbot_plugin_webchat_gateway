@@ -1464,14 +1464,22 @@ class MysqlStorage(AbstractStorage):
     async def clear_drop_history(
         self, *, token_name: str, now: int
     ) -> int:
-        del now  # parity with the sqlite backend; see its docstring
+        # Keep message and Drop-file row deletion in one transaction. The
+        # handler removes storage objects before entering this transaction;
+        # a database failure therefore leaves both rows available for retry.
+        del now
         async with self._write_tx() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     "DELETE FROM webchat_drop_messages WHERE token_name = %s",
                     (token_name,),
                 )
-                affected = cur.rowcount or 0
+                affected = int(cur.rowcount or 0)
+                await cur.execute(
+                    "DELETE FROM webchat_files "
+                    "WHERE token_name = %s AND session_id = %s",
+                    (token_name, "drop"),
+                )
         return affected
 
     async def list_drop_messages_to_purge(

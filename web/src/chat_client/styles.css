@@ -1843,6 +1843,9 @@ body.lightbox-open { overflow: hidden; }
 .drop-messages:has(.msg)::before { content: ""; flex: 1; }
 .drop-messages::-webkit-scrollbar { width: 8px; }
 .drop-messages::-webkit-scrollbar-thumb { background: color-mix(in oklab, var(--ink-soft) 35%, transparent); border-radius: 999px; }
+.drop-load-older { order: -1; align-self: center; flex: 0 0 auto; border: 1px solid var(--rule); border-radius: 7px; padding: 6px 10px; background: transparent; color: var(--ink-soft); font: inherit; font-size: 12px; cursor: pointer; }
+.drop-load-older:hover:not(:disabled) { color: var(--accent-strong); border-color: var(--accent); background: var(--accent-soft); }
+.drop-load-older:disabled { opacity: .6; cursor: wait; }
 .drop-messages .msg-row { max-width: 78%; }
 .drop-msg .msg { max-width: none; }
 .drop-msg .drop-item-text { white-space: pre-wrap; overflow-wrap: break-word; word-break: normal; }

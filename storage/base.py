@@ -761,13 +761,14 @@ class AbstractStorage(ABC):
     async def clear_drop_history(
         self, *, token_name: str, now: int
     ) -> int:
-        """Hard DELETE every row for `token_name`. Returns row count.
+        """Hard DELETE every Drop row and Drop file row for `token_name`.
+        Returns the message row count.
 
         Called by the chat client's `clearDrop` action. Cascades to
-        the file-store via the chat-sync handler so all attached files
-        are released too — without that, hard-deleted message rows
-        would leave orphaned committed=1 file rows with no path to
-        cleanup. See `core.drop_service.DropService.clear_all`.
+        the file-store via the handler so all attached objects are released
+        before this database transaction. Keeping both table deletes atomic
+        prevents a failed clear from leaving message rows pointing at file
+        rows that were already removed.
         """
 
     @abstractmethod

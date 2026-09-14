@@ -132,6 +132,9 @@ class TestDropEndpoints:
             "/api/webchat/drop/messages/{message_id}", handlers["delete"]
         )
         app.router.add_post("/api/webchat/drop/clear", handlers["clear"])
+        app.router.add_delete(
+            "/api/webchat/drop/files/{file_id}", handlers["discard_file"]
+        )
         app.router.add_get(
             "/api/webchat/drop/files/{file_id}",
             make_drop_serve_handler(deps),
@@ -558,6 +561,65 @@ class TestDropEndpoints:
             assert any(
                 u.event_type == "drop_history_cleared" for u in updates
             )
+        finally:
+            await self._close(client, server)
+
+    async def test_discard_unsent_upload_releases_file(self, tmp_path: Path):
+        client, server, storage, _bus, _guard, file_store, headers, name = (
+            await self._client(tmp_path)
+        )
+        try:
+            resp = await client.post(
+                "/api/webchat/drop/upload",
+                headers=headers,
+                data=_upload_form(b"temporary", "temp.txt"),
+            )
+            assert resp.status == 200
+            file_id = (await resp.json())["file_id"]
+            row = await storage.get_file(file_id)
+            assert row is not None
+            assert await file_store.read(storage_key=row.storage_key) == b"temporary"
+
+            resp = await client.delete(
+                f"/api/webchat/drop/files/{file_id}", headers=headers
+            )
+            assert resp.status == 200
+            assert await storage.get_file(file_id) is None
+            assert await file_store.read(storage_key=row.storage_key) is None
+
+            # Idempotent cleanup after a timeout/lost response.
+            resp = await client.delete(
+                f"/api/webchat/drop/files/{file_id}", headers=headers
+            )
+            assert resp.status == 404
+        finally:
+            await self._close(client, server)
+
+    async def test_discard_rejects_referenced_file(self, tmp_path: Path):
+        client, server, storage, _bus, _guard, _fs, headers, _name = (
+            await self._client(tmp_path)
+        )
+        try:
+            resp = await client.post(
+                "/api/webchat/drop/upload",
+                headers=headers,
+                data=_upload_form(b"keep", "keep.txt"),
+            )
+            file_id = (await resp.json())["file_id"]
+            resp = await client.post(
+                "/api/webchat/drop/send",
+                headers=headers,
+                json={
+                    "attachments": [{"file_id": file_id}],
+                    "device_id": "device-abcdef1",
+                },
+            )
+            assert resp.status == 200
+            resp = await client.delete(
+                f"/api/webchat/drop/files/{file_id}", headers=headers
+            )
+            assert resp.status == 409
+            assert await storage.get_file(file_id) is not None
         finally:
             await self._close(client, server)
 

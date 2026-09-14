@@ -2592,6 +2592,9 @@ function applyEvent(ev: ServerEvent): void {
       // Peer device cleared Drop history — mirror locally.
       dropLoadSeq += 1;
       dropMessages.length = 0;
+      dropHasMore = false;
+      dropBefore = null;
+      dropLoadingOlder = false;
       dropLoadedImages.clear();
       if (dropOpen) renderDropMessages();
       break;
@@ -2815,6 +2818,7 @@ function handle401(): void {
   clearTimer("shortPollTimer");
   clearTimer("probeTimer");
   clearTimer("retryTimer");
+  clearDropFallbackTimer();
   localStorage.removeItem(LS_TOKEN);
   // pts is per-token; a stale value from the old token would make the
   // next login's long-poll trail the new token's max_pts indefinitely.
@@ -2845,6 +2849,10 @@ function handleEventsResponse(data: ServerEventsResponse): { needsImmediateRefet
     // Event history no longer covers the requested cursor.  Refresh the open
     // Drop panel as well as chat history so it cannot remain stale after a
     // reconnect or long offline period.
+    // The event log no longer covers the local cursor, so previously loaded
+    // pages may include messages deleted while the client was offline. A
+    // preserving merge would keep those stale rows; rebuild the Drop window
+    // from the server's current head instead.
     if (dropOpen) void loadDropMessages();
     return { needsImmediateRefetch: true };
   }
@@ -2896,6 +2904,7 @@ async function runLongPoll(): Promise<void> {
           // Too many failures while in long-poll → degrade to short-poll.
           sync.transport = "polling";
           setSyncStatus("polling");
+          updateDropFallbackPolling();
           startShortPoll();
           startProbeTimer();
           return;
@@ -2937,12 +2946,14 @@ async function shortPollOnce(): Promise<void> {
       await coldRefetch();
     }
     setSyncStatus("polling");
+    updateDropFallbackPolling();
     sync.shortPollTimer = setTimeout(() => { void shortPollOnce(); }, SHORT_POLL_INTERVAL_MS);
   } catch (e) {
     if ((e as { name?: string }).name === "AbortError") return;
     registerFailure();
     sync.consecutiveBackoffSteps = Math.min(sync.consecutiveBackoffSteps + 1, BACKOFF_LADDER_MS.length - 1);
     if (recentFailsInWindow() >= FAIL_THRESHOLD) setSyncStatus("offline");
+    updateDropFallbackPolling();
     sync.shortPollTimer = setTimeout(() => { void shortPollOnce(); }, currentBackoffMs());
   }
 }
@@ -2978,6 +2989,7 @@ async function probeLongPoll(): Promise<void> {
     clearTimer("shortPollTimer");
     clearTimer("probeTimer");
     setSyncStatus("live");
+    updateDropFallbackPolling();
     void runLongPoll();
   } catch {
     if (sync.transport === "polling") startProbeTimer();
@@ -2987,6 +2999,7 @@ async function probeLongPoll(): Promise<void> {
 function onVisibilityChange(): void {
   if (document.hidden) {
     abortInflightLongPoll();
+    clearDropFallbackTimer();
     // Also abort any active SSE stream. When the page is backgrounded,
     // browsers may throttle network connections, causing SSE to drop.
     // Explicitly aborting here ensures the drop is recognized as a
@@ -2999,7 +3012,8 @@ function onVisibilityChange(): void {
       sync.streamAbort.abort();
     }
   } else if (!sync.stopped) {
-    if (dropOpen) void loadDropMessages();
+    if (dropOpen) void loadDropMessages({ preserveOlder: true });
+    updateDropFallbackPolling();
     if (sync.transport === "live") void runLongPoll();
     else if (sync.transport === "polling") void shortPollOnce();
     // Back to foreground: if the active session has a PendingStream — e.g.
@@ -3310,10 +3324,15 @@ const dropGeometryFromStorage = (): DropGeometry | null => {
   }
 };
 let dropOpen = false;
-let dropTimer: ReturnType<typeof setInterval> | null = null;
+let dropFallbackTimer: ReturnType<typeof setTimeout> | null = null;
 let dropMessages: DropMessage[] = [];
+let dropHasMore = false;
+let dropBefore: number | null = null;
+let dropLoadingOlder = false;
 const dropLoadedImages = new Set<string>();
 const DROP_LARGE_IMAGE_BYTES = 5 * 1024 * 1024;
+const DROP_PAGE_SIZE = 50;
+const DROP_FALLBACK_REFRESH_MS = 15_000;
 // New requests, events and successful mutations invalidate older list responses.
 let dropLoadSeq = 0;
 let dropMaxFileBytes = 100 * 1024 * 1024;
@@ -3448,6 +3467,48 @@ function shouldAutoLoadDropImage(size: number | undefined): boolean {
   return knownFixedNetwork && !constrained;
 }
 
+function clearDropFallbackTimer(): void {
+  if (dropFallbackTimer !== null) {
+    clearTimeout(dropFallbackTimer);
+    dropFallbackTimer = null;
+  }
+}
+
+function scheduleDropFallbackRefresh(): void {
+  clearDropFallbackTimer();
+  // The event channel is authoritative while live. A full history refresh is
+  // only a degraded-transport safety net, so healthy SSE/long-poll sessions do
+  // not issue a duplicate request every 15 seconds.
+  if (sync.stopped || !dropOpen || document.hidden || sync.transport === "live") return;
+  dropFallbackTimer = setTimeout(() => {
+    dropFallbackTimer = null;
+    if (sync.stopped || !dropOpen || document.hidden || sync.transport === "live") return;
+    void loadDropMessages({ preserveOlder: true }).finally(() => {
+      scheduleDropFallbackRefresh();
+    });
+  }, DROP_FALLBACK_REFRESH_MS);
+}
+
+function updateDropFallbackPolling(): void {
+  if (sync.stopped || !dropOpen || document.hidden || sync.transport === "live") {
+    clearDropFallbackTimer();
+    return;
+  }
+  scheduleDropFallbackRefresh();
+}
+
+function appendDropLoadOlderButton(): void {
+  if (!dropHasMore || dropBefore === null) return;
+  const older = document.createElement("button");
+  older.type = "button";
+  older.className = "drop-load-older";
+  older.textContent = dropLoadingOlder ? "正在加载…" : "加载更早消息";
+  older.disabled = dropLoadingOlder;
+  older.setAttribute("aria-label", "加载更早消息");
+  older.onclick = () => { void loadOlderDropMessages(); };
+  dropMessagesEl.append(older);
+}
+
 function renderDropMessages(): void {
   const previousScrollTop = dropMessagesEl.scrollTop;
   const previousScrollHeight = dropMessagesEl.scrollHeight;
@@ -3459,8 +3520,13 @@ function renderDropMessages(): void {
     icon.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18M3 12h18"/><path d="m7 7 10 10M17 7 7 17"/></svg>';
     const title = document.createElement("p"); title.className = "empty-title"; title.textContent = "还没有 Drop 内容";
     const hint = document.createElement("p"); hint.className = "empty-hint"; hint.textContent = "把文字或文件发到这里，其他设备会立即看到。";
-    empty.append(icon, title, hint); dropMessagesEl.append(empty); return;
+    empty.append(icon, title, hint); dropMessagesEl.append(empty);
+    // Deleting the visible page can leave older pages behind. Keep the
+    // pagination affordance reachable even when the current window is empty.
+    appendDropLoadOlderButton();
+    return;
   }
+  appendDropLoadOlderButton();
   for (const item of [...dropMessages].reverse()) {
     const mine = item.device_id === dropDeviceId;
     const row = document.createElement("div"); row.className = `msg-row drop-msg ${mine ? "user-row" : "bot-row"}`;
@@ -3525,17 +3591,119 @@ function renderDropMessages(): void {
     dropMessagesEl.scrollTop = Math.max(0, previousScrollTop + (dropMessagesEl.scrollHeight - previousScrollHeight));
   }
 }
-async function loadDropMessages(): Promise<void> {
+interface DropListResponse {
+  messages?: DropMessage[];
+  has_more?: boolean;
+  before?: number | null;
+}
+
+function dropCursorFromResponse(data: DropListResponse, messages: DropMessage[]): number | null {
+  if (data.has_more !== true || !messages.length) return null;
+  const raw = data.before;
+  if (typeof raw === "number" && Number.isInteger(raw) && raw > 0) return raw;
+  const last = messages[messages.length - 1];
+  return typeof last?.id === "number" && Number.isInteger(last.id) ? last.id : null;
+}
+
+async function loadDropMessages(options: { preserveOlder?: boolean } = {}): Promise<void> {
+  const preserveOlder = options.preserveOlder === true;
   const requestSeq = ++dropLoadSeq;
   try {
-    const resp = await fetchWithTimeout(DROP_MESSAGES_URL, { headers: bearer(), credentials: "same-origin" }, FETCH_TIMEOUT_FAST_MS);
+    const url = `${DROP_MESSAGES_URL}?limit=${DROP_PAGE_SIZE}`;
+    const resp = await fetchWithTimeout(url, { headers: bearer(), credentials: "same-origin" }, FETCH_TIMEOUT_FAST_MS);
     if (resp.status === 401) { handle401(); return; }
     if (!resp.ok) throw new Error("HTTP " + resp.status);
-    const data = await resp.json() as { messages?: DropMessage[] };
+    const data = await resp.json() as DropListResponse;
     if (requestSeq !== dropLoadSeq) return;
-    dropMessages = Array.isArray(data.messages) ? data.messages : []; if (dropOpen) renderDropMessages(); dropStatusText("");
+    const incoming = Array.isArray(data.messages) ? data.messages : [];
+    if (preserveOlder && dropMessages.length) {
+      // A head refresh must not throw away pages the user already loaded.
+      // Merge by server id so events and refreshes remain idempotent.
+      const hadOlderPages = dropHasMore && dropBefore !== null;
+      const headCursor = dropCursorFromResponse(data, incoming);
+      const incomingIds = new Set(incoming.map((item) => item.id));
+      if (data.has_more !== true) {
+        // The head response is the complete current history. Rows that were
+        // deleted while the event channel was degraded must not survive in
+        // the local cache just because an older page had been loaded.
+        dropMessages = dropMessages.filter((item) => incomingIds.has(item.id));
+      } else if (headCursor !== null) {
+        // The response covers every live row at/after its cursor. Keep only
+        // those rows plus pages strictly older than that cursor.
+        dropMessages = dropMessages.filter(
+          (item) => item.id < headCursor || incomingIds.has(item.id),
+        );
+      }
+      const merged = new Map<number, DropMessage>();
+      for (const item of dropMessages) merged.set(item.id, item);
+      for (const item of incoming) merged.set(item.id, item);
+      dropMessages = [...merged.values()].sort((a, b) => b.id - a.id);
+      if (data.has_more !== true) {
+        dropHasMore = false;
+        dropBefore = null;
+      } else if (!hadOlderPages) {
+        dropBefore = headCursor;
+        dropHasMore = headCursor !== null;
+      }
+      // When older pages are already loaded, retain their cursor. The head
+      // response's cursor only describes the first page, not the oldest page
+      // currently present in the local list.
+    } else {
+      dropMessages = incoming.sort((a, b) => b.id - a.id);
+      dropBefore = dropCursorFromResponse(data, incoming);
+      dropHasMore = dropBefore !== null;
+    }
+    if (dropOpen) renderDropMessages();
+    dropStatusText("");
   } catch (e) {
     if (requestSeq === dropLoadSeq) dropStatusText("加载失败：" + (e as Error).message, true);
+  }
+}
+
+async function loadOlderDropMessages(): Promise<void> {
+  if (dropLoadingOlder || !dropHasMore || dropBefore === null) return;
+  const cursor = dropBefore;
+  dropLoadingOlder = true;
+  if (dropOpen) renderDropMessages();
+  const requestSeq = ++dropLoadSeq;
+  try {
+    const url = `${DROP_MESSAGES_URL}?limit=${DROP_PAGE_SIZE}&before=${encodeURIComponent(String(cursor))}`;
+    const resp = await fetchWithTimeout(url, { headers: bearer(), credentials: "same-origin" }, FETCH_TIMEOUT_FAST_MS);
+    if (resp.status === 401) { handle401(); return; }
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const data = await resp.json() as DropListResponse;
+    if (requestSeq !== dropLoadSeq) return;
+    const incoming = Array.isArray(data.messages) ? data.messages : [];
+    const incomingIds = new Set(incoming.map((item) => item.id));
+    const nextCursor = dropCursorFromResponse(data, incoming);
+    if (data.has_more !== true) {
+      // This response covers the complete remaining range below `cursor`.
+      // Remove rows deleted while the older-page request was in flight.
+      dropMessages = dropMessages.filter(
+        (item) => item.id >= cursor || incomingIds.has(item.id),
+      );
+    } else if (nextCursor !== null) {
+      // The returned page covers [nextCursor, cursor). Preserve the already
+      // loaded head and rows strictly older than the new cursor.
+      dropMessages = dropMessages.filter(
+        (item) => item.id >= cursor || item.id < nextCursor || incomingIds.has(item.id),
+      );
+    }
+    const merged = new Map<number, DropMessage>();
+    for (const item of dropMessages) merged.set(item.id, item);
+    for (const item of incoming) merged.set(item.id, item);
+    dropMessages = [...merged.values()].sort((a, b) => b.id - a.id);
+    dropHasMore = data.has_more === true && incoming.length > 0;
+    dropBefore = dropHasMore ? dropCursorFromResponse(data, incoming) : null;
+    // A malformed/empty response must not leave an endless disabled cursor.
+    if (dropHasMore && dropBefore === null) dropHasMore = false;
+    if (dropOpen) renderDropMessages();
+    dropStatusText("");
+  } catch (e) {
+    if (requestSeq === dropLoadSeq) dropStatusText("加载失败：" + (e as Error).message, true);
+  } finally {
+    dropLoadingOlder = false;
+    if (dropOpen) renderDropMessages();
   }
 }
 async function deleteDropMessage(id: number): Promise<void> {
@@ -3558,6 +3726,27 @@ async function uploadDropFile(file: File): Promise<string> {
   if (!resp.ok || typeof data.file_id !== "string") throw new Error(typeof data.error === "string" ? data.error : "上传失败");
   return data.file_id;
 }
+
+async function discardUploadedDropFile(fileId: string): Promise<void> {
+  try {
+    const resp = await fetchWithTimeout(
+      DROP_FILE_URL(fileId),
+      { method: "DELETE", headers: bearer(), credentials: "same-origin" },
+      FETCH_TIMEOUT_FAST_MS,
+    );
+    // 404 means the server already rolled the temporary row back; 409 means
+    // the send actually committed and the file is now referenced. Both are
+    // safe outcomes for best-effort failure cleanup.
+    if (!resp.ok && resp.status !== 404 && resp.status !== 409) {
+      throw new Error("HTTP " + resp.status);
+    }
+  } catch (error) {
+    // Orphan GC remains the last-resort cleanup if this request is itself
+    // interrupted. Do not replace the original send error with this one.
+    console.warn("Drop 临时文件清理失败", fileId, error);
+  }
+}
+
 function autosizeDropInput(): void {
   dropTextInput.style.height = "auto";
   dropTextInput.style.height = `${Math.min(dropTextInput.scrollHeight, 160)}px`;
@@ -3573,20 +3762,36 @@ async function sendDrop(): Promise<void> {
   }
   dropSending = true;
   dropSend.disabled = true;
+  const uploadedFileIds: string[] = [];
+  let sendAccepted = false;
   try {
     const refs: Array<{ file_id: string }> = [];
-    for (const file of files) { dropStatusText("正在上传 " + file.name + "…"); refs.push({ file_id: await uploadDropFile(file) }); }
+    for (const file of files) {
+      dropStatusText("正在上传 " + file.name + "…");
+      const fileId = await uploadDropFile(file);
+      uploadedFileIds.push(fileId);
+      refs.push({ file_id: fileId });
+    }
     const resp = await fetchWithTimeout(DROP_SEND_URL, { method: "POST", headers: { ...bearer(), "Content-Type": "application/json" }, credentials: "same-origin", body: JSON.stringify({ text, attachments: refs, device_id: dropDeviceId, device_name: "设备" }) }, FETCH_TIMEOUT_CHAT_MS);
     if (!resp.ok) throw new Error("HTTP " + resp.status);
+    sendAccepted = true;
     dropTextInput.value = ""; dropFileInput.value = ""; autosizeDropInput();
     dropLoadSeq += 1;
-    await loadDropMessages();
-  } catch (e) { dropStatusText("发送失败：" + (e as Error).message, true); } finally { dropSending = false; dropSend.disabled = false; }
+    await loadDropMessages({ preserveOlder: true });
+  } catch (e) {
+    if (!sendAccepted && uploadedFileIds.length) {
+      await Promise.allSettled(uploadedFileIds.map(discardUploadedDropFile));
+    }
+    dropStatusText("发送失败：" + (e as Error).message, true);
+  } finally { dropSending = false; dropSend.disabled = false; }
 }
 function closeDrop(restoreFocus = true): void {
-  dropOpen = false; dropLoadedImages.clear(); dropMessagesEl.replaceChildren();
-  if (dropTimer) clearInterval(dropTimer);
-  dropTimer = null;
+  dropOpen = false;
+  dropLoadSeq += 1;
+  dropLoadingOlder = false;
+  dropLoadedImages.clear();
+  dropMessagesEl.replaceChildren();
+  clearDropFallbackTimer();
   dropPanel.hidden = true; dropPanel.setAttribute("aria-hidden", "true"); dropEntry.setAttribute("aria-expanded", "false");
   wrapEl.classList.remove("drop-docked");
   footerEl.hidden = false;
@@ -3596,13 +3801,16 @@ function closeDrop(restoreFocus = true): void {
 }
 function openDrop(): void {
   dropOpen = true;
+  dropMessages = [];
+  dropHasMore = false;
+  dropBefore = null;
+  dropLoadingOlder = false;
   dropPanel.hidden = false; dropPanel.setAttribute("aria-hidden", "false"); dropEntry.setAttribute("aria-expanded", "true");
   mountChatHeaderInDrop();
   setDropLayout(dropLayout, false);
   updateClearButtonState();
   void loadDropMessages();
-  if (dropTimer) clearInterval(dropTimer);
-  dropTimer = setInterval(() => { if (dropOpen && !document.hidden) void loadDropMessages(); }, 15000);
+  updateDropFallbackPolling();
   autosizeDropInput(); dropTextInput.focus();
 }
 
@@ -5695,7 +5903,7 @@ async function runNonStreamingSend(sid: string, message: string, attachments: At
 }
 
 clearHistoryBtn.onclick = () => {
-  if (dropOpen) void loadDropMessages();
+  if (dropOpen) void loadDropMessages({ preserveOlder: true });
   else void clearActiveHistory();
 };
 $<HTMLButtonElement>("newSessionBtn").onclick = newSession;
@@ -5740,6 +5948,7 @@ $<HTMLButtonElement>("logout").onclick = () => {
   clearTimer("shortPollTimer");
   clearTimer("probeTimer");
   clearTimer("retryTimer");
+  clearDropFallbackTimer();
   // Server-clear the wcg_file cookie + record server-side logout. The
   // cookie is HttpOnly so JS can't touch it directly; the response's
   // Set-Cookie header is what the browser commits. We POST under the

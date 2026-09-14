@@ -306,9 +306,10 @@ Drop 是聊天页左侧固定的虚拟会话（session_id 留字面量 `drop`）
 | --- | --- | --- |
 | POST | `{prefix}/drop/send` | body `{text?, attachments?, device_id, device_name}`：文字 + 文件附件（file_id 必须是本 token 已上传到 `/drop/upload` 的）。返回 `{messages:[{id, device_id, device_name, kind: "text"|"file", text, file_id?, filename?, mime?, size?, created_at}, ...]}`。`device_id` 服务端不存，仅按 `^[A-Za-z0-9_\-.:]{8,64}$` 校验；`device_name` 走 UA 推导 + 客户端 localStorage 覆盖。失败码：`invalid_payload` / `invalid_device_id` / `invalid_attachment` / `text_too_long` / `storage_quota_exceeded` / `drop_disabled`。 |
 | POST | `{prefix}/drop/upload` | multipart `file` + 可选 `filename` 字段。任意文件类型；图片走 PIL sniff 与现有 `uploads.allowed_mime` 一致，其他类型信任声明 MIME 但服务端强制拒绝 `image/svg+xml` / `text/html` / `application/xhtml+xml` 与 `.html` / `.svg` / `.xhtml` 等可执行扩展名（stored-XSS 与 XHTML 执行上下文防御）。返回 `{file_id, mime, size, filename}`。失败码：`unsupported_type` (415) / `storage_quota_exceeded` (429) / `payload_too_large` (413)。 |
-| GET  | `{prefix}/drop/messages?limit=50&before={id}` | newest-first 分页（`before_id` 游标）。返回 `{messages:[...], has_more}`。`has_more` 用 peek+1 判定（边界页与全满页可区分）。 |
+| GET  | `{prefix}/drop/messages?limit=50&before={id}` | newest-first 分页（`before_id` 游标）。返回 `{messages:[...], has_more, before}`；有下一页时 `before` 是本页最旧消息 id，否则为 `null`。`has_more` 用 peek+1 判定（边界页与全满页可区分）。 |
 | DELETE | `{prefix}/drop/messages/{message_id}` | 软删除一条。返回 `{ok, id}`；已删除的 id 统一返回 `404 not_found`（幂等）。peer 设备在事件长轮询里收到 `drop_message_deleted`，按 id 移除本地气泡。 |
 | POST | `{prefix}/drop/clear` | 硬清空整个 Drop 历史 + 释放所有附件。前端 confirm 后调；返回 `{ok, removed}`。peer 设备收到 `drop_history_cleared`。 |
+| DELETE | `{prefix}/drop/files/{file_id}` | 删除尚未发送的临时上传；若文件已经被 Drop 消息引用则返回 `409 file_in_use` 并保留文件。 |
 | GET  | `{prefix}/drop/files/{file_id}` | 服务 Drop 文件。**图片 MIME 走 `inline` 缩略图渲染，非图片 MIME 强制 `attachment` 附件下载（防止 stored-XSS / XHTML 误渲染）。** 文件名取自 `webchat_files.filename`（utf-8 时走 RFC 5987 `filename*=`）。与 `/files/{id}` 同样的双认证（bearer + `wcg_file` cookie）；跨 token 一律 404 不区分（防枚举）。 |
 
 ### 管理端点
