@@ -64,6 +64,8 @@ class LlmBridge:
         total_stream_timeout_seconds: float | None = None,
         chat_provider_id: str = "",
         chat_fallback_provider_id: str = "",
+        title_provider_id: str = "",
+        title_fallback_provider_id: str = "",
     ) -> None:
         self._context = context
         self._history_turns = max(0, history_turns)
@@ -85,6 +87,19 @@ class LlmBridge:
         # default. Empty string disables the middle tier (legacy
         # two-step chain: pinned → global).
         self._chat_provider_fallback = (chat_fallback_provider_id or "").strip()
+        # Operator-pinned title provider override. When non-empty,
+        # title generation uses this provider first; if missing/disabled,
+        # falls back to the chat provider chain (pinned → fallback →
+        # global). Allows cheaper/faster models for titles (e.g.
+        # GPT-3.5-turbo for titles, GPT-4 for chat) without splitting
+        # the chat provider config. Empty string keeps legacy behavior
+        # (title shares the chat provider).
+        self._title_provider_override = (title_provider_id or "").strip()
+        # Title fallback: when the title provider is set but missing/disabled,
+        # step down to this before falling back to the chat provider chain.
+        # Allows two-tier title resilience (title_primary → title_fallback →
+        # chat_primary → chat_fallback → global). Empty string disables.
+        self._title_provider_fallback = (title_fallback_provider_id or "").strip()
         # Process-lifetime memo of "provider X (in role Y) was missing
         # at lookup time". `_resolve_provider_id` runs per chat call;
         # without this, every call after the configured provider
@@ -114,11 +129,21 @@ class LlmBridge:
             self._total_stream_timeout = float(total_stream_timeout_seconds)
         self._persona_cache: tuple[str | None, str | None] | None = None
 
-    async def _resolve_provider_id(self, *, umo: str) -> str | None:
+    async def _resolve_provider_id(self, *, umo: str, for_title: bool = False) -> str | None:
         """Return the chat provider id to use for ``umo``.
 
-        Three-tier resolution chain — first viable wins:
+        When ``for_title=True``, checks the title provider override first;
+        if not set or missing, checks title fallback, then falls back to
+        the chat provider chain.
 
+        Title resolution chain (when ``for_title=True``):
+          1. ``title_provider_id`` (operator-pinned title override)
+          2. ``title_fallback_provider_id`` (title fallback tier)
+          3. ``chat_provider_id`` (chat primary)
+          4. ``chat_fallback_provider_id`` (chat fallback)
+          5. AstrBot's global default
+
+        Chat resolution chain (when ``for_title=False``):
           1. ``chat_provider_id`` (operator-pinned). Used if set AND
              the id still resolves to a live provider.
           2. ``chat_fallback_provider_id`` (operator-pinned mid-tier
@@ -137,6 +162,25 @@ class LlmBridge:
         means even the global default isn't wired — callers raise
         ``chat_provider_not_configured``.
         """
+        # Title-specific override: try it first, fall through to chat chain if missing.
+        if for_title:
+            if self._title_provider_override:
+                if self._context.get_provider_by_id(
+                    self._title_provider_override
+                ) is not None:
+                    return self._title_provider_override
+                self._warn_provider_missing(
+                    self._title_provider_override, role="title_primary"
+                )
+            if self._title_provider_fallback:
+                if self._context.get_provider_by_id(
+                    self._title_provider_fallback
+                ) is not None:
+                    return self._title_provider_fallback
+                self._warn_provider_missing(
+                    self._title_provider_fallback, role="title_fallback"
+                )
+
         if self._chat_provider_override:
             if self._context.get_provider_by_id(
                 self._chat_provider_override
@@ -564,8 +608,12 @@ class LlmBridge:
     # ----- Title generation -----
 
     _TITLE_SYSTEM_PROMPT = (
-        "你是会话标题生成器。根据下面的对话内容，用 6-12 个简体中文字符总结一个简短标题。\n"
-        "只输出标题文本，不要标点，不要解释，不要引号，不要 emoji。"
+        "你是会话标题生成器。根据对话内容，用 4-8 个简体中文字概括用户的核心需求或话题。\n"
+        "规则：\n"
+        "- 只输出标题，不加标点、引号、emoji\n"
+        "- 概括意图而非复述内容（例如"你好"→"问候"或"闲聊"，而非"你好有什么需要帮助"）\n"
+        "- 技术问题提取关键词（例如"Python 列表推导"、"Docker 容器配置"）\n"
+        "- 日常对话用简洁标签（问候、闲聊、求助等）"
     )
 
     @staticmethod
@@ -584,21 +632,24 @@ class LlmBridge:
 
     @staticmethod
     def _post_process_title(raw: str, fallback: str) -> str:
-        text = (raw or "").strip()
+        text = (raw or “”).strip()
         # Take first line only.
         if text:
-            text = text.split("\n", 1)[0].strip()
+            text = text.split(“\n”, 1)[0].strip()
         # Strip surrounding quotes (ASCII + full-width).
         for _ in range(2):
-            if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'`“”‘’「」『』《》":
+            if len(text) >= 2 and text[0] == text[-1] and text[0] in “\”’`””’’「」『』《》”:
                 text = text[1:-1].strip()
             else:
                 break
-        if len(text) > 30:
-            text = text[:30]
+        # Tighter cap for compact session bubbles: 15 chars fits short labels
+        # like “Python 列表推导” (8) or “Docker 容器启动问题” (11) without
+        # truncating, while long-winded LLM outputs get cut early.
+        if len(text) > 15:
+            text = text[:15]
         if text:
             return text
-        return (fallback or "").strip()[:25]
+        return (fallback or “”).strip()[:15]
 
     async def generate_title(
         self,
@@ -622,7 +673,10 @@ class LlmBridge:
             "",
         )
         try:
-            provider_id = await self._resolve_provider_id(umo=unified_origin)
+            # Try title provider first (if configured), fall back to chat provider chain
+            provider_id = await self._resolve_provider_id(
+                umo=unified_origin, for_title=True
+            )
             if not provider_id:
                 raise RuntimeError("chat_provider_not_configured")
             resp = await asyncio.wait_for(

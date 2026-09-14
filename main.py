@@ -194,6 +194,8 @@ class WebChatGatewayPlugin(Star):
                 ),
                 chat_provider_id=cfg.chat_provider_id,
                 chat_fallback_provider_id=cfg.chat_fallback_provider_id,
+                title_provider_id=cfg.title_provider_id,
+                title_fallback_provider_id=cfg.title_fallback_provider_id,
             )
 
             event_bus = EventBus()

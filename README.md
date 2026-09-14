@@ -176,6 +176,10 @@ curl -X POST http://127.0.0.1:6186/api/webchat/chat \
 | `history_turns` | `8` | 携带历史轮数（建议 4-12） |
 | `llm_timeout_seconds` | `60` | 单次 LLM 调用的超时秒数（范围 5-600，建议 30-120）；超时返回 `504 llm_timeout`，并写入审计事件 `llm_timeout` |
 | `persona_id` | `""` | 使用的人格（下拉框可选）；找不到时回退到"无人格"，并在日志里 WARNING |
+| `chat_provider_id` | `""` | 对话主 LLM provider ID（留空使用 AstrBot 全局默认） |
+| `chat_fallback_provider_id` | `""` | 对话主 provider 失效时的故障转移 provider ID |
+| `title_provider_id` | `""` | 标题生成专用 LLM provider ID（留空回退到对话主 LLM） |
+| `title_fallback_provider_id` | `""` | 标题生成 provider 失效时的故障转移 provider ID |
 | `default_daily_quota` | `200` | 签发新 Token 时的默认日配额（范围 1-1,000,000） |
 | `ip_brute_force_max_fails` | `10` | 同 IP 连续鉴权失败多少次后封禁，`0` 表示禁用 |
 | `ip_brute_force_block_seconds` | `900` | 封禁时长（秒，默认 15 分钟） |
