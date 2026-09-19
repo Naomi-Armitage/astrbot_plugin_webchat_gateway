@@ -57,8 +57,6 @@ const DROP_UPLOAD_URL = API + "/drop/upload";
 const DROP_MESSAGES_URL = API + "/drop/messages";
 const DROP_FILE_URL = (id: string): string => API + "/drop/files/" + encodeURIComponent(id);
 const LS_DROP_DEVICE = "wcg.drop.device_id";
-const LS_DROP_LAYOUT = "wcg.drop.layout";
-const LS_DROP_GEOMETRY = "wcg.drop.geometry";
 // Per-message action endpoints. `sid` and `index` are URL-segments — the
 // server's path layout matches cfg.conversations_message_path and
 // cfg.conversations_regenerate_path.
@@ -99,7 +97,6 @@ const RESIZE_SKIP_MAX_BYTES = 2 * 1024 * 1024;
 const TITLE_MAX = 25;
 const RENAME_MAX = 40;
 const TRASH_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6M10 11v6M14 11v6"/></svg>';
-const PENCIL_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>';
 const PIN_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 17v5M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a3 3 0 0 0-6 0z"/></svg>';
 const PINNED_SVG = '<svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 17v5M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a3 3 0 0 0-6 0z"/></svg>';
 
@@ -192,6 +189,9 @@ interface PendingAttachment {
   // The (possibly resized) blob actually uploaded — retained so a failed
   // upload can be retried in place without re-picking the file.
   blob?: Blob;
+  destination?: "drop";
+  filename?: string;
+  uploadVersion?: number;
 }
 interface HistoryItem {
   role: Role;
@@ -300,10 +300,8 @@ const msgs = $("messages");
 const badge = $("quotaBadge");
 const syncStatusEl = $("syncStatus");
 const whoEl = $("who");
-const wrapEl = document.querySelector<HTMLElement>(".wrap")!;
-const chatHeader = document.querySelector<HTMLElement>(".main > header")!;
-const chatHeaderMount = document.createComment("chat-header-mount");
-chatHeader.before(chatHeaderMount);
+const mainEl = document.querySelector<HTMLElement>(".main")!;
+const emptyStateTemplate = $("emptyState").cloneNode(true) as HTMLElement;
 const sidebarEl = $("sidebar");
 const sidebarToggleBtn = $<HTMLButtonElement>("sidebarToggle");
 const sidebarBackdrop = $("sidebarBackdrop");
@@ -319,15 +317,7 @@ const dropOverlayEl = $("dropOverlay");
 const footerEl = document.querySelector("footer") as HTMLElement;
 const clearHistoryBtn = $<HTMLButtonElement>("clearHistory");
 const dropEntry = $<HTMLButtonElement>("dropEntry");
-const dropPanel = $<HTMLElement>("dropPanel");
-const dropLayoutSwitch = $<HTMLDivElement>("dropLayoutSwitch");
 const dropMessagesEl = $<HTMLDivElement>("dropMessages");
-const dropComposer = $<HTMLFormElement>("dropComposer");
-const dropTextInput = $<HTMLTextAreaElement>("dropTextInput");
-const dropFileInput = $<HTMLInputElement>("dropFileInput");
-const dropAttach = $<HTMLButtonElement>("dropAttach");
-const dropSend = $<HTMLButtonElement>("dropSend");
-const dropStatus = $<HTMLDivElement>("dropStatus");
 
 const username = (localStorage.getItem(LS_USERNAME) || "Friend").trim() || "Friend";
 const strong = document.createElement("strong");
@@ -706,7 +696,7 @@ function showCopyToast(x: number, y: number): void {
     document.getElementById("_copyToast")?.classList.remove("show");
   }, 1100);
 }
-msgs.addEventListener("click", (e: MouseEvent) => {
+mainEl.addEventListener("click", (e: MouseEvent) => {
   const target = e.target as Element | null;
   if (!target) return;
   const copyBtn = target.closest<HTMLButtonElement>(".codeblock-copy");
@@ -748,6 +738,17 @@ msgs.addEventListener("click", (e: MouseEvent) => {
   const row = actionBtn.closest<HTMLElement>(".msg-row");
   const bubble = row?.querySelector<HTMLDivElement>(".msg");
   if (!bubble) return;
+  if (row?.dataset.dropId) {
+    const item = dropMessages.find((message) => message.id === Number(row.dataset.dropId));
+    if (!item) return;
+    if (actionBtn.dataset.action === "copy") {
+      const anchor = copyToastAnchor(e, actionBtn);
+      void copyMessage(item.text, actionBtn).then((ok) => { if (ok) showCopyToast(anchor.x, anchor.y); });
+    } else if (actionBtn.dataset.action === "delete") {
+      void deleteDropMessage(item.id);
+    }
+    return;
+  }
   switch (actionBtn.dataset.action) {
     case "copy": {
       const idx = indexOfRenderedBubble(bubble);
@@ -790,11 +791,11 @@ function cancelLongPress(): void {
   lpRow = null;
 }
 function closeAllRevealedActions(except?: Element | null): void {
-  msgs.querySelectorAll<HTMLElement>(".msg-row.actions-revealed").forEach((r) => {
+  mainEl.querySelectorAll<HTMLElement>(".msg-row.actions-revealed").forEach((r) => {
     if (r !== except) r.classList.remove("actions-revealed");
   });
 }
-msgs.addEventListener("touchstart", (e: TouchEvent) => {
+mainEl.addEventListener("touchstart", (e: TouchEvent) => {
   // Don't treat a tap on the action buttons themselves as a long-press
   // candidate — that would re-trigger reveal on a row that's already
   // open and feel laggy.
@@ -819,7 +820,7 @@ msgs.addEventListener("touchstart", (e: TouchEvent) => {
     lpTimer = null;
   }, LONG_PRESS_MS);
 }, { passive: true });
-msgs.addEventListener("touchmove", (e: TouchEvent) => {
+mainEl.addEventListener("touchmove", (e: TouchEvent) => {
   if (lpTimer === null || !lpStartXY) return;
   const t = e.touches[0];
   if (!t) return;
@@ -827,13 +828,13 @@ msgs.addEventListener("touchmove", (e: TouchEvent) => {
   const dy = t.clientY - lpStartXY[1];
   if (dx * dx + dy * dy > LONG_PRESS_MOVE_TOL_SQ) cancelLongPress();
 }, { passive: true });
-msgs.addEventListener("touchend", cancelLongPress, { passive: true });
-msgs.addEventListener("touchcancel", cancelLongPress, { passive: true });
+mainEl.addEventListener("touchend", cancelLongPress, { passive: true });
+mainEl.addEventListener("touchcancel", cancelLongPress, { passive: true });
 document.addEventListener("pointerdown", (e: PointerEvent) => {
   // Fast path: no revealed rows means nothing to close. Skips the
   // closest() walk on every pointerdown when long-press isn't active
   // (the common case on desktop).
-  if (!msgs.querySelector(".msg-row.actions-revealed")) return;
+  if (!mainEl.querySelector(".msg-row.actions-revealed")) return;
   const target = e.target as Element | null;
   if (!target) return;
   // A pointerdown inside a revealed row's actions is a button press —
@@ -862,8 +863,12 @@ function addMessageBubble(
   text: string,
   attachments?: AttachmentRef[],
   failure?: { reason: FailureReason },
+  options: { target?: HTMLElement; dropMessage?: DropMessage; scroll?: boolean } = {},
 ): HTMLDivElement {
-  hideTyping();
+  const target = options.target ?? msgs;
+  const dropMessage = options.dropMessage;
+  const srcFor = (a: AttachmentRef): string => dropMessage ? DROP_FILE_URL(a.file_id) : fileServeUrl(a.file_id);
+  if (target === msgs) hideTyping();
   const div = document.createElement("div");
   div.className = "msg " + role;
   // Attachments render for BOTH user and bot bubbles. User-side
@@ -901,15 +906,23 @@ function addMessageBubble(
       img.className = "msg-image";
       img.loading = "lazy";
       img.alt = "";
-      img.src = fileServeUrl(a.file_id);
+      img.src = srcFor(a);
       attachImgErrorRetry(img);
       const captureIdx = i;
-      img.addEventListener("click", () => openLightbox(list, captureIdx));
+      img.addEventListener("click", () => openLightbox(list, captureIdx, srcFor));
+      img.tabIndex = 0;
+      img.setAttribute("role", "button");
+      img.setAttribute("aria-label", "查看图片");
+      img.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        openLightbox(list, captureIdx, srcFor);
+      });
       grid.appendChild(img);
     }
     div.appendChild(grid);
   }
-  if (role === "bot") {
+  if (role === "bot" && !dropMessage) {
     div.classList.add("md");
     if (text) {
       if (hasImages) {
@@ -948,8 +961,9 @@ function addMessageBubble(
     const row = document.createElement("div");
     row.className = "msg-row " + role + "-row";
     row.appendChild(div);
-    row.appendChild(buildMessageActions(role, div));
-    msgs.appendChild(row);
+    if (dropMessage) row.dataset.dropId = String(dropMessage.id);
+    row.appendChild(buildMessageActions(role, div, dropMessage));
+    target.appendChild(row);
     // Failure chrome is applied AFTER the bubble is in the row so its
     // retry/edit/delete controls land as real DOM siblings in BOTH the
     // live-failure path and the replay path. On replay the bubble isn't
@@ -959,9 +973,9 @@ function addMessageBubble(
       applyUserFailureChrome(div, text, attachments);
     }
   } else {
-    msgs.appendChild(div);
+    target.appendChild(div);
   }
-  scrollToEnd();
+  if (options.scroll !== false) target.scrollTop = target.scrollHeight;
   return div;
 }
 
@@ -995,7 +1009,7 @@ function addMessageBubble(
 // Click handlers look up the bubble's current position in the rendered
 // history at click time (via indexOfRenderedBubble) so a delete that's
 // preceded by other deletes / inserts doesn't desync the index.
-function buildMessageActions(role: "user" | "bot", _bubble: HTMLDivElement): HTMLDivElement {
+function buildMessageActions(role: "user" | "bot", _bubble: HTMLDivElement, dropMessage?: DropMessage): HTMLDivElement {
   const actions = document.createElement("div");
   actions.className = "msg-actions";
   const copyBtn = document.createElement("button");
@@ -1005,7 +1019,7 @@ function buildMessageActions(role: "user" | "bot", _bubble: HTMLDivElement): HTM
   copyBtn.title = "复制";
   copyBtn.dataset.action = "copy";
   copyBtn.innerHTML = ICON_COPY;
-  actions.appendChild(copyBtn);
+  if (!dropMessage || dropMessage.text) actions.appendChild(copyBtn);
 
   const delBtn = document.createElement("button");
   delBtn.type = "button";
@@ -1016,6 +1030,19 @@ function buildMessageActions(role: "user" | "bot", _bubble: HTMLDivElement): HTM
   delBtn.innerHTML = ICON_TRASH;
   actions.appendChild(delBtn);
 
+  if (dropMessage) {
+    if (dropMessage.file_id) {
+      const download = document.createElement("a");
+      download.className = "msg-action-btn";
+      download.href = DROP_FILE_URL(dropMessage.file_id) + "?download=1";
+      download.download = dropMessage.filename || "download";
+      download.setAttribute("aria-label", "下载文件");
+      download.title = "下载";
+      download.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12m-5-5 5 5 5-5M5 21h14"/></svg>';
+      actions.append(download);
+    }
+    return actions;
+  }
   if (role === "bot") {
     const regenBtn = document.createElement("button");
     regenBtn.type = "button";
@@ -1952,7 +1979,7 @@ async function regenerateMessage(bubble: HTMLDivElement): Promise<void> {
   const ac = new AbortController();
   sync.streamAbort = ac;
   setSendMode("stop");
-  sendBtn.disabled = false;
+  updateSendButtonState();
 
   // Mount an empty streaming bubble at the tail of the message list.
   // Mirrors `attachStreamingBubble`'s shape (Text node + caret span +
@@ -2598,6 +2625,8 @@ function applyEvent(ev: ServerEvent): void {
       dropBefore = null;
       dropLoadingOlder = false;
       dropLoadedImages.clear();
+      dropHistoryVersion += 1;
+      invalidateDropUploads();
       if (dropOpen) renderDropMessages();
       break;
     }
@@ -3047,7 +3076,7 @@ function renderSessionList(): void {
     li.className = "session-item";
     li.setAttribute("role", "listitem");
     li.dataset.sessionId = sess.id;
-    if (sess.id === store.activeId) li.setAttribute("aria-current", "page");
+    if (!dropOpen && sess.id === store.activeId) li.setAttribute("aria-current", "page");
     const isEditing = editingSessionId === sess.id;
     if (isEditing) li.dataset.editing = "true";
 
@@ -3117,14 +3146,18 @@ function renderSessionList(): void {
           delete (item as HTMLElement).dataset.swipe;
         }
       });
-      startX = e.touches[0].clientX;
+      const touch = e.touches[0];
+      if (!touch) return;
+      startX = touch.clientX;
       currentX = startX;
       isDragging = true;
     }, { passive: true });
 
     li.addEventListener("touchmove", (e) => {
       if (!isDragging) return;
-      currentX = e.touches[0].clientX;
+      const touch = e.touches[0];
+      if (!touch) return;
+      currentX = touch.clientX;
       const deltaX = currentX - startX;
       if (Math.abs(deltaX) > 10) {
         li.style.transform = `translateX(${deltaX}px)`;
@@ -3163,6 +3196,7 @@ document.addEventListener("click", (e) => {
 
 function switchSession(id: string): void {
   if (!store.sessions[id]) return;
+  composerContext += 1;
   if (dropOpen) closeDrop(false);
   if (id !== store.activeId) {
     // Leaving this session abandons any non-streaming send started under it;
@@ -3375,31 +3409,6 @@ interface DropMessage {
   text: string; created_at: number; file_id?: string; filename?: string;
   mime?: string; size?: number;
 }
-type DropLayout = "full" | "float" | "dock";
-interface DropGeometry {
-  left: number;
-  top: number;
-  width: number;
-  height: number;
-}
-
-const DROP_MIN_WIDTH = 320;
-const DROP_MIN_HEIGHT = 320;
-const DROP_DOCK_WIDTH = "clamp(320px, 34vw, 460px)";
-const DROP_DOCK_MIN_VIEWPORT = 900;
-const dropLayoutFromStorage = (): DropLayout => {
-  const value = localStorage.getItem(LS_DROP_LAYOUT);
-  return value === "float" || value === "dock" ? value : "full";
-};
-const dropGeometryFromStorage = (): DropGeometry | null => {
-  try {
-    const value = JSON.parse(localStorage.getItem(LS_DROP_GEOMETRY) || "null") as Partial<DropGeometry> | null;
-    if (!value || ![value.left, value.top, value.width, value.height].every((n) => typeof n === "number" && Number.isFinite(n))) return null;
-    return { left: value.left!, top: value.top!, width: value.width!, height: value.height! };
-  } catch {
-    return null;
-  }
-};
 let dropOpen = false;
 let dropFallbackTimer: ReturnType<typeof setTimeout> | null = null;
 let dropMessages: DropMessage[] = [];
@@ -3412,106 +3421,36 @@ const DROP_PAGE_SIZE = 50;
 const DROP_FALLBACK_REFRESH_MS = 15_000;
 // New requests, events and successful mutations invalidate older list responses.
 let dropLoadSeq = 0;
+let dropHistoryVersion = 0;
 let dropMaxFileBytes = 100 * 1024 * 1024;
-let dropLayout: DropLayout = dropLayoutFromStorage();
-let dropGeometry: DropGeometry = dropGeometryFromStorage() ?? {
-  left: Math.max(16, window.innerWidth - 484),
-  top: Math.max(16, window.innerHeight - 704),
-  width: 460,
-  height: 680,
-};
-let dropDragState: { pointerId: number; offsetX: number; offsetY: number } | null = null;
+let chatSendMode: "send" | "stop" = "send";
 let dropSending = false;
+let dropClearing = false;
+let chatDraft = "";
+let dropDraft = "";
+let composerContext = 0;
+let imageGenerationEnabled = false;
+let dropNotice = "";
+let dropNoticeBad = false;
+let dropComposerAttachments: PendingAttachment[] = [];
 
-function mountChatHeaderInDrop(): void {
-  if (chatHeader.parentElement !== dropPanel) dropPanel.prepend(chatHeader);
-  chatHeader.classList.add("drop-header");
-  chatHeader.setAttribute("data-drop-drag-handle", "");
-  dropLayoutSwitch.hidden = false;
-}
-
-function restoreChatHeader(): void {
-  if (chatHeader.parentElement !== chatHeaderMount.parentNode) chatHeaderMount.after(chatHeader);
-  chatHeader.classList.remove("drop-header", "is-dragging");
-  chatHeader.removeAttribute("data-drop-drag-handle");
-  dropLayoutSwitch.hidden = true;
-}
-
-const dropResizeObserver = typeof ResizeObserver === "undefined"
-  ? null
-  : new ResizeObserver(() => {
-    if (dropOpen && dropPanel.dataset.layout === "float") readDropGeometryFromPanel();
-  });
-dropResizeObserver?.observe(dropPanel);
 const dropDeviceId = (() => {
   const old = localStorage.getItem(LS_DROP_DEVICE);
   if (old && /^[A-Za-z0-9_\-.:]{8,64}$/.test(old)) return old;
   const value = newId(); localStorage.setItem(LS_DROP_DEVICE, value); return value;
 })();
 
-function isCompactDropViewport(): boolean {
-  return window.matchMedia("(max-width: 719px)").matches;
-}
-
-function clampDropGeometry(value: DropGeometry): DropGeometry {
-  const maxWidth = Math.max(1, window.innerWidth - 16);
-  const maxHeight = Math.max(1, window.innerHeight - 16);
-  const width = Math.min(maxWidth, Math.max(Math.min(DROP_MIN_WIDTH, maxWidth), value.width));
-  const height = Math.min(maxHeight, Math.max(Math.min(DROP_MIN_HEIGHT, maxHeight), value.height));
-  return {
-    width,
-    height,
-    left: Math.min(Math.max(8, value.left), Math.max(8, window.innerWidth - width - 8)),
-    top: Math.min(Math.max(8, value.top), Math.max(8, window.innerHeight - height - 8)),
-  };
-}
-
-function persistDropGeometry(): void {
-  dropGeometry = clampDropGeometry(dropGeometry);
-  try { localStorage.setItem(LS_DROP_GEOMETRY, JSON.stringify(dropGeometry)); } catch {}
-}
-
-function readDropGeometryFromPanel(): void {
-  if (dropPanel.dataset.layout !== "float" || dropPanel.hidden) return;
-  const rect = dropPanel.getBoundingClientRect();
-  if (rect.width < 1 || rect.height < 1) return;
-  dropGeometry = clampDropGeometry({ left: rect.left, top: rect.top, width: rect.width, height: rect.height });
-  try { localStorage.setItem(LS_DROP_GEOMETRY, JSON.stringify(dropGeometry)); } catch {}
-}
-
-function setDropLayout(layout: DropLayout, persist = true): void {
-  dropLayout = layout;
-  const effectiveLayout: DropLayout = isCompactDropViewport()
-    || (layout === "dock" && window.innerWidth < DROP_DOCK_MIN_VIEWPORT)
-    ? "full"
-    : layout;
-  dropPanel.dataset.layout = effectiveLayout;
-  wrapEl.classList.toggle("drop-docked", dropOpen && effectiveLayout === "dock");
-  wrapEl.style.setProperty("--drop-dock-width", DROP_DOCK_WIDTH);
-  dropLayoutSwitch.querySelectorAll<HTMLButtonElement>("[data-drop-layout]").forEach((button) => {
-    const selected = button.dataset.dropLayout === effectiveLayout;
-    button.setAttribute("aria-checked", String(selected));
-  });
-  if (effectiveLayout === "float") {
-    dropGeometry = clampDropGeometry(dropGeometry);
-    dropPanel.style.left = `${dropGeometry.left}px`;
-    dropPanel.style.top = `${dropGeometry.top}px`;
-    dropPanel.style.width = `${dropGeometry.width}px`;
-    dropPanel.style.height = `${dropGeometry.height}px`;
-  } else {
-    dropPanel.style.removeProperty("left");
-    dropPanel.style.removeProperty("top");
-    dropPanel.style.removeProperty("width");
-    dropPanel.style.removeProperty("height");
-  }
-  footerEl.hidden = dropOpen && effectiveLayout === "full";
-  if (persist) {
-    try { localStorage.setItem(LS_DROP_LAYOUT, layout); } catch {}
-  }
-}
-
 function dropStatusText(text: string, bad = false): void {
-  dropStatus.textContent = text; dropStatus.dataset.state = bad ? "bad" : "";
+  dropNotice = text;
+  dropNoticeBad = bad;
+  if (dropOpen) renderDropNotice();
+}
+function renderDropNotice(): void {
+  dropMessagesEl.querySelector("[data-drop-notice]")?.remove();
+  if (!dropNotice) return;
+  const bubble = addMessageBubble(dropNoticeBad ? "error" : "notice", dropNotice, undefined, undefined, { target: dropMessagesEl, scroll: false });
+  bubble.dataset.dropNotice = "";
+  bubble.setAttribute("role", "status");
 }
 function dropFileSize(size: number | undefined): string {
   const value = typeof size === "number" && Number.isFinite(size) ? size : undefined;
@@ -3574,98 +3513,82 @@ function updateDropFallbackPolling(): void {
   scheduleDropFallbackRefresh();
 }
 
-function appendDropLoadOlderButton(): void {
-  if (!dropHasMore || dropBefore === null) return;
+function createDropLoadOlderButton(): HTMLButtonElement | null {
+  if (!dropHasMore || dropBefore === null) return null;
   const older = document.createElement("button");
   older.type = "button";
-  older.className = "drop-load-older";
+  older.className = "message-load-older";
   older.textContent = dropLoadingOlder ? "正在加载…" : "加载更早消息";
   older.disabled = dropLoadingOlder;
   older.setAttribute("aria-label", "加载更早消息");
   older.onclick = () => { void loadOlderDropMessages(); };
-  dropMessagesEl.append(older);
+  return older;
 }
 
-function renderDropMessages(): void {
+function renderDropMessages(options: { forceBottom?: boolean } = {}): void {
   const previousScrollTop = dropMessagesEl.scrollTop;
-  const previousScrollHeight = dropMessagesEl.scrollHeight;
-  const wasNearBottom = previousScrollHeight - (previousScrollTop + dropMessagesEl.clientHeight) < 80;
-  dropMessagesEl.replaceChildren();
+  const wasNearBottom = dropMessagesEl.scrollHeight - previousScrollTop - dropMessagesEl.clientHeight < 80;
+  const rows = [...dropMessagesEl.querySelectorAll<HTMLElement>("[data-drop-id]")];
+  const anchor = rows.find((row) => row.getBoundingClientRect().bottom > dropMessagesEl.getBoundingClientRect().top);
+  const anchorTop = anchor?.getBoundingClientRect().top;
+  const existing = new Map(rows.map((row) => [Number(row.dataset.dropId), row]));
+  const children: HTMLElement[] = [];
   if (!dropMessages.length) {
-    const empty = document.createElement("div"); empty.className = "empty-state drop-empty";
-    const icon = document.createElement("span"); icon.className = "empty-icon"; icon.setAttribute("aria-hidden", "true");
-    icon.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18M3 12h18"/><path d="m7 7 10 10M17 7 7 17"/></svg>';
-    const title = document.createElement("p"); title.className = "empty-title"; title.textContent = "还没有 Drop 内容";
-    const hint = document.createElement("p"); hint.className = "empty-hint"; hint.textContent = "把文字或文件发到这里，其他设备会立即看到。";
-    empty.append(icon, title, hint); dropMessagesEl.append(empty);
-    // Deleting the visible page can leave older pages behind. Keep the
-    // pagination affordance reachable even when the current window is empty.
-    appendDropLoadOlderButton();
-    return;
+    const empty = emptyStateTemplate.cloneNode(true) as HTMLElement;
+    empty.removeAttribute("id");
+    empty.querySelector(".empty-title")!.textContent = "还没有 Drop 内容";
+    empty.querySelector(".empty-hint")!.textContent = "把文字或文件发到这里，其他设备会立即看到。";
+    children.push(empty);
   }
-  appendDropLoadOlderButton();
+  const older = createDropLoadOlderButton();
+  if (older) children.push(older);
   for (const item of [...dropMessages].reverse()) {
-    const mine = item.device_id === dropDeviceId;
-    const row = document.createElement("div"); row.className = `msg-row drop-msg ${mine ? "user-row" : "bot-row"}`;
-    const bubble = document.createElement("div"); bubble.className = `msg drop-bubble ${mine ? "user" : "bot"}`;
-    if (item.text) { const text = document.createElement("div"); text.className = "drop-item-text"; text.textContent = item.text; bubble.append(text); }
-    if (item.kind === "file" && item.file_id) {
-      if (isDropImage(item.mime)) {
-        const shouldLoad = dropLoadedImages.has(item.file_id) || shouldAutoLoadDropImage(item.size);
-        if (shouldLoad) {
-          bubble.classList.add("has-image");
-          if (!item.text) bubble.classList.add("has-image-only");
-          const grid = document.createElement("div"); grid.className = "msg-attachments cnt-1";
-          const preview = document.createElement("button"); preview.type = "button"; preview.className = "drop-image-preview"; preview.setAttribute("aria-label", "查看图片");
-          const img = document.createElement("img"); img.className = "msg-image"; img.src = DROP_FILE_URL(item.file_id); img.alt = item.filename || "Drop 图片"; img.loading = "lazy"; attachImgErrorRetry(img);
-          preview.append(img);
-          const ref: AttachmentRef = { file_id: item.file_id, mime: item.mime || "application/octet-stream" };
-          preview.onclick = () => openLightbox([ref], 0, (attachment) => DROP_FILE_URL(attachment.file_id));
-          grid.append(preview);
-          if (item.text) {
-            const text = bubble.querySelector<HTMLElement>(".drop-item-text");
-            text?.classList.add("msg-text");
-            bubble.insertBefore(grid, text ?? null);
-          } else {
-            bubble.append(grid);
-          }
-        } else {
-          const attachment = document.createElement("div"); attachment.className = "drop-attachment";
-          const gate = document.createElement("div"); gate.className = "drop-image-gate";
-          const label = document.createElement("span"); label.textContent = `图片 · ${dropFileSize(item.size)}`;
-          const load = document.createElement("button"); load.type = "button"; load.textContent = "加载图片"; load.onclick = () => { dropLoadedImages.add(item.file_id!); renderDropMessages(); };
-          gate.append(label, load); attachment.append(gate); bubble.append(attachment);
-        }
-      } else {
-        const attachment = document.createElement("div"); attachment.className = "drop-attachment";
-        const link = document.createElement("div"); link.className = "drop-file-link";
-        const icon = document.createElement("span"); icon.className = "drop-file-icon"; icon.textContent = "FILE";
-        const details = document.createElement("span"); details.className = "drop-file-details";
-        const name = document.createElement("span"); name.className = "drop-file-name"; name.textContent = item.filename || "文件";
-        const meta = document.createElement("span"); meta.className = "drop-file-meta"; meta.textContent = dropFileSize(item.size);
-        details.append(name, meta); link.append(icon, details); attachment.append(link);
-        bubble.append(attachment);
+    const cached = existing.get(item.id);
+    if (cached) { children.push(cached); continue; }
+    const image = !!item.file_id && isDropImage(item.mime);
+    const shouldLoad = image && (dropLoadedImages.has(item.file_id!) || shouldAutoLoadDropImage(item.size));
+    const attachments = shouldLoad ? [{ file_id: item.file_id!, mime: item.mime! }] : undefined;
+    const bubble = addMessageBubble(item.device_id === dropDeviceId ? "user" : "bot", item.text, attachments, undefined, {
+      target: dropMessagesEl, dropMessage: item, scroll: false,
+    });
+    children.push(bubble.closest<HTMLElement>(".msg-row")!);
+    if (item.kind === "file" && item.file_id && !shouldLoad) {
+      const link = document.createElement("a");
+      link.className = "msg-file";
+      link.href = DROP_FILE_URL(item.file_id) + "?download=1";
+      link.download = item.filename || "download";
+      const details = document.createElement("span"); details.className = "msg-file-details";
+      const name = document.createElement("span"); name.className = "msg-file-name"; name.textContent = item.filename || "文件";
+      const meta = document.createElement("span"); meta.className = "msg-file-meta"; meta.textContent = dropFileSize(item.size);
+      details.append(name, meta); link.append(details); bubble.append(link);
+      if (image) {
+        const load = document.createElement("button"); load.type = "button"; load.className = "msg-image-load"; load.textContent = "加载图片";
+        load.onclick = () => {
+          dropLoadedImages.add(item.file_id!);
+          bubble.closest(".msg-row")?.remove();
+          renderDropMessages();
+        };
+        bubble.append(load);
       }
     }
-    row.append(bubble);
-    const actions = document.createElement("div"); actions.className = "drop-message-actions";
-    if (item.text) {
-      const copy = document.createElement("button"); copy.type = "button"; copy.className = "drop-action-btn"; copy.setAttribute("aria-label", "复制消息"); copy.title = "复制"; copy.innerHTML = ICON_COPY;
-      copy.onclick = () => { void writeClipboard(item.text).then((ok) => { if (ok) flashActionButton(copy); }); };
-      actions.append(copy);
-    }
-    if (item.kind === "file" && item.file_id) {
-      const download = document.createElement("a"); download.className = "drop-action-btn drop-download-btn"; download.href = DROP_FILE_URL(item.file_id) + "?download=1"; download.download = item.filename || "download"; download.rel = "noopener"; download.setAttribute("aria-label", "下载文件"); download.title = "下载";
-      download.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>';
-      actions.append(download);
-    }
-    const del = document.createElement("button"); del.type = "button"; del.className = "drop-action-btn drop-item-delete"; del.setAttribute("aria-label", "删除 Drop 消息"); del.title = "删除"; del.innerHTML = ICON_TRASH; del.onclick = () => { void deleteDropMessage(item.id); };
-    actions.append(del); row.append(actions); dropMessagesEl.append(row);
   }
-  if (wasNearBottom) {
+  // Keep unchanged rows mounted so live updates preserve keyboard focus,
+  // image state and touch actions while the user is reading older messages.
+  const keep = new Set(children);
+  for (const child of [...dropMessagesEl.children]) {
+    if (!keep.has(child as HTMLElement)) child.remove();
+  }
+  children.forEach((child, index) => {
+    const current = dropMessagesEl.children[index];
+    if (current !== child) dropMessagesEl.insertBefore(child, current ?? null);
+  });
+  renderDropNotice();
+  if (options.forceBottom || wasNearBottom) {
     dropMessagesEl.scrollTop = dropMessagesEl.scrollHeight;
+  } else if (anchor?.isConnected && anchorTop !== undefined) {
+    dropMessagesEl.scrollTop += anchor.getBoundingClientRect().top - anchorTop;
   } else {
-    dropMessagesEl.scrollTop = Math.max(0, previousScrollTop + (dropMessagesEl.scrollHeight - previousScrollHeight));
+    dropMessagesEl.scrollTop = previousScrollTop;
   }
 }
 interface DropListResponse {
@@ -3787,6 +3710,7 @@ async function deleteDropMessage(id: number): Promise<void> {
   dropLoadSeq += 1;
   try {
     const resp = await fetchWithTimeout(DROP_MESSAGES_URL + "/" + id, { method: "DELETE", headers: bearer(), credentials: "same-origin" }, FETCH_TIMEOUT_FAST_MS);
+    if (resp.status === 401) { handle401(); return; }
     if (!resp.ok && resp.status !== 404) throw new Error("HTTP " + resp.status);
     dropLoadSeq += 1;
     const removed = dropMessages.find((m) => m.id === id);
@@ -3799,6 +3723,7 @@ async function uploadDropFile(file: File): Promise<string> {
   if (file.size > dropMaxFileBytes) throw new Error(file.name + " 超过大小限制");
   const form = new FormData(); form.append("file", file, file.name); form.append("filename", file.name);
   const resp = await fetchWithTimeout(DROP_UPLOAD_URL, { method: "POST", headers: bearer(), credentials: "same-origin", body: form }, FETCH_TIMEOUT_CHAT_MS);
+  if (resp.status === 401) { handle401(); throw new Error("未授权"); }
   const data = await resp.json().catch(() => ({})) as Record<string, unknown>;
   if (!resp.ok || typeof data.file_id !== "string") throw new Error(typeof data.error === "string" ? data.error : "上传失败");
   return data.file_id;
@@ -3824,119 +3749,131 @@ async function discardUploadedDropFile(fileId: string): Promise<void> {
   }
 }
 
-function autosizeDropInput(): void {
-  dropTextInput.style.height = "auto";
-  dropTextInput.style.height = `${Math.min(dropTextInput.scrollHeight, 160)}px`;
+async function sendDrop(): Promise<void> {
+  const rawText = inputEl.value;
+  const text = rawText.trim();
+  const pending = dropComposerAttachments;
+  if (dropSending || dropClearing || pending.some((a) => a.state !== "ready")) return;
+  const ready = pending.filter((a) => a.file_id);
+  if (!text && !ready.length) return;
+  if ([...text].length > 16000) { dropStatusText("文本超过 16,000 字符限制", true); return; }
+  const historyVersion = dropHistoryVersion;
+  dropSending = true;
+  renderComposerAttachments();
+  updateSendButtonState();
+  updateClearButtonState();
+  dropStatusText("");
+  try {
+    const resp = await fetchWithTimeout(DROP_SEND_URL, {
+      method: "POST", headers: { ...bearer(), "Content-Type": "application/json" }, credentials: "same-origin",
+      body: JSON.stringify({ text, attachments: ready.map((a) => ({ file_id: a.file_id })), device_id: dropDeviceId, device_name: "设备" }),
+    }, FETCH_TIMEOUT_CHAT_MS);
+    if (resp.status === 401) { handle401(); return; }
+    const data = await resp.json() as DropListResponse & { error?: string };
+    if (!resp.ok) throw new Error(data.error || "HTTP " + resp.status);
+    // The shared composer may now belong to chat or contain the next draft.
+    if (dropOpen && inputEl.value === rawText) { inputEl.value = ""; autosizeInput(); }
+    if (!dropOpen && dropDraft === rawText) dropDraft = "";
+    for (const attachment of ready) URL.revokeObjectURL(attachment.preview_url);
+    dropComposerAttachments = dropComposerAttachments.filter((a) => !ready.includes(a));
+    dropLoadSeq += 1;
+    if (historyVersion === dropHistoryVersion) {
+      const merged = new Map(dropMessages.map((item) => [item.id, item]));
+      for (const item of data.messages ?? []) merged.set(item.id, item);
+      dropMessages = [...merged.values()].sort((a, b) => b.id - a.id);
+      if (dropOpen) renderDropMessages({ forceBottom: true });
+    } else {
+      await loadDropMessages({ preserveOlder: true });
+    }
+  } catch (e) {
+    dropStatusText("发送失败：" + (e as Error).message, true);
+  } finally {
+    dropSending = false;
+    renderComposerAttachments();
+    updateSendButtonState();
+    updateClearButtonState();
+  }
 }
 
-async function sendDrop(): Promise<void> {
-  const text = dropTextInput.value.trim(); const files = [...(dropFileInput.files || [])];
-  if (dropSending || (!text && !files.length)) return;
-  // 前端文本长度校验（后端限制 16,000 字符）
-  if (text.length > 16000) {
-    dropStatusText("文本超过 16,000 字符限制", true);
-    return;
-  }
-  dropSending = true;
-  dropSend.disabled = true;
-  const uploadedFileIds: string[] = [];
-  let sendAccepted = false;
-  try {
-    const refs: Array<{ file_id: string }> = [];
-    for (const file of files) {
-      dropStatusText("正在上传 " + file.name + "…");
-      const fileId = await uploadDropFile(file);
-      uploadedFileIds.push(fileId);
-      refs.push({ file_id: fileId });
-    }
-    const resp = await fetchWithTimeout(DROP_SEND_URL, { method: "POST", headers: { ...bearer(), "Content-Type": "application/json" }, credentials: "same-origin", body: JSON.stringify({ text, attachments: refs, device_id: dropDeviceId, device_name: "设备" }) }, FETCH_TIMEOUT_CHAT_MS);
-    if (!resp.ok) throw new Error("HTTP " + resp.status);
-    sendAccepted = true;
-    dropTextInput.value = ""; dropFileInput.value = ""; autosizeDropInput();
-    dropLoadSeq += 1;
-    await loadDropMessages({ preserveOlder: true });
-  } catch (e) {
-    if (!sendAccepted && uploadedFileIds.length) {
-      await Promise.allSettled(uploadedFileIds.map(discardUploadedDropFile));
-    }
-    dropStatusText("发送失败：" + (e as Error).message, true);
-  } finally { dropSending = false; dropSend.disabled = false; }
+function refreshComposerContext(): void {
+  closePlusMenu();
+  fileInputEl.value = "";
+  fileInputEl.accept = dropOpen ? "" : ALLOWED_MIME.join(",");
+  menuUpload.hidden = !dropOpen && !UPLOADS_ENABLED;
+  menuUpload.querySelector("span")!.textContent = dropOpen ? "上传文件" : "上传图片";
+  menuImage.hidden = dropOpen || !imageGenerationEnabled;
+  dropOverlayEl.querySelector(".drop-overlay-inner")!.textContent = dropOpen ? "松开以添加文件" : "松开以添加图片";
+  dropOverlayEl.hidden = true;
+  dragDepth = 0;
+  attachmentsCapNoticeShown = false;
+  refreshPlusBtnVisibility();
+  refreshImageModeState();
+  renderComposerAttachments();
+  setSendMode(chatSendMode);
+  updateSendButtonState();
+  updateClearButtonState();
+  autosizeInput();
 }
 function closeDrop(restoreFocus = true): void {
+  if (!dropOpen) return;
+  dropDraft = inputEl.value;
   dropOpen = false;
-  dropLoadSeq += 1;
-  dropLoadingOlder = false;
-  dropLoadedImages.clear();
-  dropMessagesEl.replaceChildren();
+  composerContext += 1;
+  inputEl.value = chatDraft;
   clearDropFallbackTimer();
-  dropPanel.hidden = true; dropPanel.setAttribute("aria-hidden", "true"); dropEntry.setAttribute("aria-expanded", "false");
-  wrapEl.classList.remove("drop-docked");
-  footerEl.hidden = false;
-  restoreChatHeader();
-  updateClearButtonState();
-  if (restoreFocus) dropEntry.focus();
+  dropMessagesEl.hidden = true;
+  msgs.hidden = false;
+  dropEntry.setAttribute("aria-expanded", "false");
+  refreshComposerContext();
+  renderSessionList();
+  if (restoreFocus) inputEl.focus();
 }
 function openDrop(): void {
+  if (dropOpen) { inputEl.focus(); return; }
+  chatDraft = inputEl.value;
   dropOpen = true;
-  dropMessages = [];
-  dropHasMore = false;
-  dropBefore = null;
-  dropLoadingOlder = false;
-  dropPanel.hidden = false; dropPanel.setAttribute("aria-hidden", "false"); dropEntry.setAttribute("aria-expanded", "true");
-  mountChatHeaderInDrop();
-  setDropLayout(dropLayout, false);
-  updateClearButtonState();
-  void loadDropMessages();
+  composerContext += 1;
+  inputEl.value = dropDraft;
+  msgs.hidden = true;
+  dropMessagesEl.hidden = false;
+  dropEntry.setAttribute("aria-expanded", "true");
+  cancelLongPress();
+  closeAllRevealedActions();
+  renderDropMessages({ forceBottom: true });
+  refreshComposerContext();
+  renderSessionList();
+  void loadDropMessages({ preserveOlder: true });
   updateDropFallbackPolling();
-  autosizeDropInput(); dropTextInput.focus();
+  inputEl.focus();
 }
 
-function beginDropDrag(e: PointerEvent): void {
-  if (!dropOpen || dropPanel.dataset.layout !== "float" || e.button !== 0) return;
-  const target = e.target as Element | null;
-  if (target?.closest("button, a, input, textarea, [data-drop-layout]")) return;
-  const rect = dropPanel.getBoundingClientRect();
-  dropDragState = { pointerId: e.pointerId, offsetX: e.clientX - rect.left, offsetY: e.clientY - rect.top };
-  chatHeader.setPointerCapture?.(e.pointerId);
-  chatHeader.classList.add("is-dragging");
-  e.preventDefault();
+async function clearDropHistory(): Promise<void> {
+  if (dropSending || dropClearing) return;
+  const historyVersion = dropHistoryVersion;
+  dropClearing = true;
+  updateClearButtonState();
+  updateSendButtonState();
+  try {
+    const resp = await fetchWithTimeout(`${API}/drop/clear`, { method: "POST", headers: bearer(), credentials: "same-origin" }, FETCH_TIMEOUT_FAST_MS);
+    if (resp.status === 401) { handle401(); return; }
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    if (historyVersion === dropHistoryVersion) {
+      dropHistoryVersion += 1;
+      dropLoadSeq += 1;
+      dropMessages = [];
+      dropHasMore = false;
+      dropBefore = null;
+      dropLoadedImages.clear();
+      invalidateDropUploads();
+    }
+    dropStatusText("");
+    if (dropOpen) renderDropMessages();
+  } catch (e) { dropStatusText("清空失败：" + (e as Error).message, true); }
+  finally { dropClearing = false; updateClearButtonState(); updateSendButtonState(); }
 }
-
-function moveDropDrag(e: PointerEvent): void {
-  if (!dropDragState || e.pointerId !== dropDragState.pointerId || dropPanel.dataset.layout !== "float") return;
-  dropGeometry = clampDropGeometry({
-    ...dropGeometry,
-    left: e.clientX - dropDragState.offsetX,
-    top: e.clientY - dropDragState.offsetY,
-  });
-  dropPanel.style.left = `${dropGeometry.left}px`;
-  dropPanel.style.top = `${dropGeometry.top}px`;
-}
-
-function finishDropDrag(e: PointerEvent): void {
-  if (!dropDragState || e.pointerId !== dropDragState.pointerId) return;
-  dropDragState = null;
-  chatHeader.classList.remove("is-dragging");
-  readDropGeometryFromPanel();
-  persistDropGeometry();
-}
-
-chatHeader.addEventListener("pointerdown", beginDropDrag);
-window.addEventListener("pointermove", moveDropDrag);
-window.addEventListener("pointerup", finishDropDrag);
-window.addEventListener("pointercancel", finishDropDrag);
-window.addEventListener("resize", () => {
-  if (!dropOpen) return;
-  if (dropPanel.dataset.layout === "float") {
-    dropGeometry = clampDropGeometry(dropGeometry);
-    setDropLayout("float", false);
-    persistDropGeometry();
-  } else {
-    setDropLayout(dropLayout, false);
-  }
-});
 
 function newSession(): void {
+  composerContext += 1;
   if (dropOpen) closeDrop(false);
   cancelInflightSend();
   const fresh = blankSession();
@@ -4009,6 +3946,7 @@ async function loadChatSite(): Promise<void> {
     dropEntry.hidden = !(dropConfig && dropConfig.enabled !== false);
     if (dropConfig && typeof dropConfig.max_file_size_mb === "number" && dropConfig.max_file_size_mb > 0) dropMaxFileBytes = dropConfig.max_file_size_mb * 1024 * 1024;
     const imageEnabled = !!(data.image_gen && data.image_gen.enabled);
+    imageGenerationEnabled = imageEnabled;
     // img2img (reference-image edit) capability. Only true when the server
     // both has image-gen on AND the configured model/endpoint supports the
     // edits path. Gates whether send() keeps an attachment on an /image
@@ -4026,7 +3964,7 @@ async function loadChatSite(): Promise<void> {
       menuImage.hidden = false;
     } else {
       menuImage.hidden = true;
-      if (isImageCommand(inputEl.value)) {
+      if (!dropOpen && isImageCommand(inputEl.value)) {
         inputEl.value = inputEl.value.replace(IMAGE_CMD_RE, "").replace(/^\s+/, "");
         autosizeInput();
       }
@@ -4065,7 +4003,7 @@ async function loadChatSite(): Promise<void> {
     // If neither menu item survives the gating, the plus affordance has
     // nothing to offer — hide the whole button so the input box doesn't
     // carry a dead control.
-    refreshPlusBtnVisibility();
+    refreshComposerContext();
     const name = (data.site_name || "").trim() || "WebChat Gateway";
     document.title = `${name} · Chat`;
     $("brandName").textContent = name;
@@ -4445,6 +4383,8 @@ async function resumeStream(
 }
 
 function setSendMode(mode: "send" | "stop"): void {
+  chatSendMode = mode;
+  if (dropOpen) mode = "send";
   sendBtn.dataset.mode = mode;
   sendBtn.setAttribute("aria-label", mode === "stop" ? "停止" : "发送");
 }
@@ -4452,6 +4392,42 @@ function setSendMode(mode: "send" | "stop"): void {
 // ---------- Composer attachments ----------
 
 let composerAttachments: PendingAttachment[] = [];
+function activeComposerAttachments(): PendingAttachment[] {
+  return dropOpen ? dropComposerAttachments : composerAttachments;
+}
+function composerNotice(text: string): void {
+  if (dropOpen) dropStatusText(text, true);
+  else addMessageBubble("notice", text);
+}
+function invalidateDropUploads(): void {
+  // Clearing Drop also releases unsent uploads on the server. Keep the local
+  // files available to retry instead of submitting references that no longer exist.
+  for (const attachment of dropComposerAttachments) {
+    attachment.uploadVersion = (attachment.uploadVersion ?? 0) + 1;
+    attachment.file_id = undefined;
+    attachment.state = "error";
+    attachment.error_message = "文件已随历史清空，请重试上传";
+  }
+  renderComposerAttachments();
+  updateSendButtonState();
+}
+async function uploadDropAttachment(attachment: PendingAttachment): Promise<void> {
+  const version = attachment.uploadVersion = (attachment.uploadVersion ?? 0) + 1;
+  try {
+    const fileId = await uploadDropFile(attachment.blob as File);
+    // Removing an uploading chip must not leave an orphan when its request finishes.
+    if (version !== attachment.uploadVersion || !dropComposerAttachments.includes(attachment)) {
+      await discardUploadedDropFile(fileId);
+      return;
+    }
+    attachment.file_id = fileId;
+    attachment.state = "ready";
+  } catch (e) {
+    if (version !== attachment.uploadVersion) return;
+    attachment.state = "error";
+    attachment.error_message = (e as Error).message;
+  } finally { renderComposerAttachments(); updateSendButtonState(); }
+}
 // Latch so the "exceeded 4 chips" notice only fires once per add batch even
 // if the user dropped 7 files in one go.
 let attachmentsCapNoticeShown = false;
@@ -4664,13 +4640,18 @@ function uploadErrorCopy(code: string, payload: Record<string, unknown>): string
 }
 
 function addAttachmentFiles(rawFiles: FileList | File[]): void {
+  if ((!dropOpen && !UPLOADS_ENABLED) || (dropOpen && (dropSending || dropClearing))) return;
+  const isDrop = dropOpen;
+  const queue = activeComposerAttachments();
+  const limit = isDrop ? Math.min(16, MAX_ATTACHMENTS_PER_MESSAGE) : MAX_ATTACHMENTS_PER_MESSAGE;
+  const unit = isDrop ? "个文件" : "张";
   const files = Array.from(rawFiles);
   if (!files.length) return;
-  const remaining = MAX_ATTACHMENTS_PER_MESSAGE - composerAttachments.length;
+  const remaining = limit - queue.length;
   if (remaining <= 0) {
     if (!attachmentsCapNoticeShown) {
       attachmentsCapNoticeShown = true;
-      addMessageBubble("notice", `最多 ${MAX_ATTACHMENTS_PER_MESSAGE} 张`);
+      composerNotice(`最多 ${limit} ${unit}`);
     }
     return;
   }
@@ -4681,16 +4662,16 @@ function addAttachmentFiles(rawFiles: FileList | File[]): void {
       droppedForCap += 1;
       continue;
     }
-    if (!ALLOWED_MIME_SET.has(file.type)) {
+    if (!isDrop && !ALLOWED_MIME_SET.has(file.type)) {
       addMessageBubble("notice", `不支持的图片格式: ${file.name || file.type || "?"}`);
       continue;
     }
-    if (file.size > MAX_FILE_SIZE_BYTES) {
+    if (file.size > (isDrop ? dropMaxFileBytes : MAX_FILE_SIZE_BYTES)) {
       // Cap is server-driven via /site — compute the human MB on the
       // fly so the message tracks what the server is actually
       // enforcing (operator may have set 5MB or 50MB).
-      const limitMb = Math.max(1, Math.round(MAX_FILE_SIZE_BYTES / (1024 * 1024)));
-      addMessageBubble("notice", `文件过大: ${file.name || "图片"}（上限 ${limitMb}MB）`);
+      const limitMb = Math.max(1, Math.round((isDrop ? dropMaxFileBytes : MAX_FILE_SIZE_BYTES) / (1024 * 1024)));
+      composerNotice(`文件过大: ${file.name || "图片"}（上限 ${limitMb}MB）`);
       continue;
     }
     acceptedCount += 1;
@@ -4698,10 +4679,17 @@ function addAttachmentFiles(rawFiles: FileList | File[]): void {
       local_id: genLocalId(),
       mime: file.type,
       size: file.size,
-      preview_url: URL.createObjectURL(file),
+      preview_url: isDrop && !isDropImage(file.type) ? "" : URL.createObjectURL(file),
       state: "uploading",
     };
-    composerAttachments.push(attachment);
+    queue.push(attachment);
+    if (isDrop) {
+      attachment.destination = "drop";
+      attachment.filename = file.name;
+      attachment.blob = file;
+      void uploadDropAttachment(attachment);
+      continue;
+    }
     const sid = currentSession().id;
     // Resize off-thread; chip already in DOM with the unresized preview URL
     // so the user sees a thumbnail immediately. We then upload the (possibly
@@ -4728,18 +4716,22 @@ function addAttachmentFiles(rawFiles: FileList | File[]): void {
   }
   if (droppedForCap > 0 && !attachmentsCapNoticeShown) {
     attachmentsCapNoticeShown = true;
-    addMessageBubble("notice", `最多 ${MAX_ATTACHMENTS_PER_MESSAGE} 张`);
+    composerNotice(`最多 ${limit} ${unit}`);
   }
   renderComposerAttachments();
   updateSendButtonState();
 }
 
 function removeAttachment(local_id: string): void {
-  const idx = composerAttachments.findIndex((a) => a.local_id === local_id);
+  if (dropOpen && dropSending) return;
+  const queue = activeComposerAttachments();
+  const idx = queue.findIndex((a) => a.local_id === local_id);
   if (idx < 0) return;
-  const att = composerAttachments[idx]!;
+  const att = queue[idx]!;
   try { URL.revokeObjectURL(att.preview_url); } catch {}
-  composerAttachments.splice(idx, 1);
+  queue.splice(idx, 1);
+  attachmentsCapNoticeShown = false;
+  if (att.destination === "drop" && att.file_id) void discardUploadedDropFile(att.file_id);
   renderComposerAttachments();
   updateSendButtonState();
 }
@@ -4758,18 +4750,20 @@ function clearComposerAttachments(): void {
 // retained blob so the user doesn't have to re-pick the file. No-op if the
 // chip isn't in an error state or the blob is gone (shouldn't happen).
 function retryAttachment(local_id: string): void {
-  const att = composerAttachments.find((a) => a.local_id === local_id);
+  if (dropOpen && (dropSending || dropClearing)) return;
+  const att = activeComposerAttachments().find((a) => a.local_id === local_id);
   if (!att || att.state !== "error" || !att.blob) return;
   att.state = "uploading";
   att.error_message = undefined;
   renderComposerAttachments();
   updateSendButtonState();
-  void uploadAttachment(att.blob, currentSession().id, att);
+  if (att.destination === "drop") void uploadDropAttachment(att);
+  else void uploadAttachment(att.blob, currentSession().id, att);
 }
 
 function renderComposerAttachments(): void {
   composerAttachmentsEl.replaceChildren();
-  for (const a of composerAttachments) {
+  for (const a of activeComposerAttachments()) {
     const chip = document.createElement("div");
     chip.className = "composer-chip";
     chip.dataset.state = a.state;
@@ -4780,13 +4774,28 @@ function renderComposerAttachments(): void {
       chip.title = a.error_message ? `${a.error_message}（点击重试）` : "上传失败，点击重试";
       chip.setAttribute("role", "button");
       chip.setAttribute("aria-label", "上传失败，点击重试");
+      chip.tabIndex = 0;
       chip.addEventListener("click", () => retryAttachment(a.local_id));
+      chip.addEventListener("keydown", (event) => {
+        if (event.target !== chip || (event.key !== "Enter" && event.key !== " ")) return;
+        event.preventDefault();
+        retryAttachment(a.local_id);
+      });
     }
 
-    const img = document.createElement("img");
-    img.src = a.preview_url;
-    img.alt = "";
-    chip.appendChild(img);
+    if (a.preview_url) {
+      const img = document.createElement("img");
+      img.src = a.preview_url;
+      img.alt = a.filename || "";
+      chip.appendChild(img);
+    } else {
+      chip.classList.add("file-chip");
+      const name = document.createElement("span");
+      name.className = "composer-file-name";
+      name.textContent = a.filename || "文件";
+      chip.append(name);
+    }
+    if (a.filename && a.state !== "error") chip.title = a.filename;
 
     if (a.state === "uploading") {
       const spin = document.createElement("span");
@@ -4799,6 +4808,7 @@ function renderComposerAttachments(): void {
     close.className = "composer-chip-remove";
     close.setAttribute("aria-label", "移除");
     close.textContent = "×";
+    close.disabled = dropOpen && dropSending;
     close.addEventListener("click", (e) => {
       e.preventDefault();
       e.stopPropagation();
@@ -4811,16 +4821,18 @@ function renderComposerAttachments(): void {
 }
 
 function updateSendButtonState(): void {
-  // Stop button stays enabled while a stream is in flight regardless of
-  // composer state — the user might want to abort and try again.
-  if (sync.streamAbort) {
+  // Background chat streams must not change the Drop send button. Keep the
+  // normal stop action available for both streaming replies and image generation.
+  if (!dropOpen && chatSendMode === "stop") {
     sendBtn.disabled = false;
     return;
   }
-  const hasUploading = composerAttachments.some((a) => a.state === "uploading");
-  const hasReady = composerAttachments.some((a) => a.state === "ready");
+  const pending = activeComposerAttachments();
+  const hasUploading = pending.some((a) => a.state === "uploading");
+  const hasReady = pending.some((a) => a.state === "ready");
   const hasText = inputEl.value.trim().length > 0;
-  sendBtn.disabled = hasUploading || (!hasText && !hasReady);
+  sendBtn.disabled = hasUploading || (!hasText && !hasReady)
+    || (dropOpen && (dropSending || dropClearing || pending.some((a) => a.state === "error")));
 }
 
 // ---------- Lightbox ----------
@@ -5002,6 +5014,8 @@ function notifyOffline(): void {
 }
 
 async function send(): Promise<void> {
+  if (dropOpen) { await sendDrop(); return; }
+  const context = composerContext;
   // Don't fire while uploads are still in flight — server would reject
   // unknown file_ids and the user would lose their text.
   if (composerAttachments.some((a) => a.state === "uploading")) return;
@@ -5016,6 +5030,7 @@ async function send(): Promise<void> {
   // Read the composer AFTER the gate: the connectivity probe can await for
   // a few seconds, and whatever the user typed in that window must not be
   // dropped by the clear below.
+  if (context !== composerContext) return;
   const message = inputEl.value.trim();
   let readyAttachments: AttachmentRef[] = composerAttachments
     .filter((a) => a.state === "ready" && a.file_id)
@@ -5089,7 +5104,7 @@ async function performSend(message: string, readyAttachments: AttachmentRef[]): 
     addMessageBubble("notice", "正在恢复上一次回复…");
     return;
   }
-  sendBtn.disabled = true;
+  if (!dropOpen) sendBtn.disabled = true;
   const isFirstUserMsg = !sessBefore.history.some((h) => h.role === "user");
   const eligibleForAutoTitle = isFirstUserMsg && sessBefore.titleManual !== true && message.length > 0;
 
@@ -5126,7 +5141,7 @@ async function performSend(message: string, readyAttachments: AttachmentRef[]): 
         // the user double-clicking through fallback (which would either
         // duplicate the optimistic user echo or trip server-side
         // concurrent_request).
-        sendBtn.disabled = true;
+        if (!dropOpen) sendBtn.disabled = true;
         showTyping();
         await runNonStreamingSend(sid, message, readyAttachments);
       }
@@ -5138,13 +5153,12 @@ async function performSend(message: string, readyAttachments: AttachmentRef[]): 
       // server's disconnect poll cancels the upstream call.
       if (isImageCommand(message)) {
         setSendMode("stop");
-        sendBtn.disabled = false;
+        updateSendButtonState();
       }
       await runNonStreamingSend(sid, message, readyAttachments);
     }
   } finally {
     hideTyping();
-    sendBtn.disabled = false;
     setSendMode("send");
     updateSendButtonState();
   }
@@ -5201,7 +5215,7 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
   if (kind === "post") {
     sync.streamAbort = ac;
     setSendMode("stop");
-    sendBtn.disabled = false;
+    updateSendButtonState();
   } else {
     // For resume / peer attach, register the controller in
     // activeResumeAborts so a duplicate stream_started or a session-switch
@@ -5980,7 +5994,7 @@ async function runNonStreamingSend(sid: string, message: string, attachments: At
 }
 
 clearHistoryBtn.onclick = () => {
-  if (dropOpen) void loadDropMessages({ preserveOlder: true });
+  if (dropOpen) void clearDropHistory();
   else void clearActiveHistory();
 };
 $<HTMLButtonElement>("newSessionBtn").onclick = newSession;
@@ -5998,20 +6012,13 @@ $<HTMLButtonElement>("newSessionBtn").onclick = newSession;
 // front, which is the safer pattern for irreversible actions.
 function updateClearButtonState(): void {
   const btn = clearHistoryBtn;
-  if (dropOpen) {
-    btn.textContent = "刷新";
-    btn.title = "刷新";
-    btn.setAttribute("aria-label", "刷新");
-    btn.disabled = false;
-    return;
-  }
   btn.textContent = "清空";
   btn.removeAttribute("aria-label");
   const sid = store.activeId;
-  const streaming = !!(sid && store.pendingStreams[sid]);
+  const streaming = dropOpen ? dropSending || dropClearing : !!(sid && store.pendingStreams[sid]);
   btn.disabled = streaming;
   if (streaming) {
-    btn.title = "当前正在回复，完成后再清空";
+    btn.title = dropOpen ? "正在处理，完成后再清空" : "当前正在回复，完成后再清空";
   } else {
     btn.removeAttribute("title");
   }
@@ -6062,21 +6069,6 @@ sidebarToggleBtn.addEventListener("click", () => {
 });
 sidebarBackdrop.addEventListener("click", closeMobileSidebar);
 dropEntry.addEventListener("click", () => { closeMobileSidebar(); openDrop(); });
-dropLayoutSwitch.addEventListener("click", (e) => {
-  const target = (e.target as Element | null)?.closest<HTMLButtonElement>("[data-drop-layout]");
-  if (!target) return;
-  const layout = target.dataset.dropLayout;
-  if (layout === "full" || layout === "float" || layout === "dock") setDropLayout(layout);
-});
-dropAttach.addEventListener("click", () => { dropFileInput.value = ""; dropFileInput.click(); });
-dropComposer.addEventListener("submit", (e) => { e.preventDefault(); void sendDrop(); });
-dropTextInput.addEventListener("input", autosizeDropInput);
-dropTextInput.addEventListener("keydown", (e) => {
-  if (e.key !== "Enter" || e.isComposing || e.keyCode === 229 || e.shiftKey) return;
-  if (window.matchMedia("(pointer: coarse)").matches) return;
-  e.preventDefault(); void sendDrop();
-});
-
 // Escape-to-close is owned by the sidebar's focus trap (installed in
 // openMobileSidebar). No global listener here — it would race with the
 // trap's onEscape and double-fire closeMobileSidebar.
@@ -6155,8 +6147,9 @@ menuUpload.addEventListener("click", () => {
   closePlusMenu();
   // At the per-message cap the picker would reject everything, so surface
   // the limit instead of opening it to a no-op.
-  if (composerAttachments.length >= MAX_ATTACHMENTS_PER_MESSAGE) {
-    addMessageBubble("notice", `最多 ${MAX_ATTACHMENTS_PER_MESSAGE} 张`);
+  const limit = dropOpen ? Math.min(16, MAX_ATTACHMENTS_PER_MESSAGE) : MAX_ATTACHMENTS_PER_MESSAGE;
+  if (activeComposerAttachments().length >= limit) {
+    composerNotice(`最多 ${limit} ${dropOpen ? "个文件" : "张"}`);
     return;
   }
   fileInputEl.value = "";
@@ -6283,7 +6276,7 @@ function currentImgSize(): string {
 }
 
 function refreshImageModeState(): void {
-  const armed = isImageCommand(inputEl.value);
+  const armed = !dropOpen && isImageCommand(inputEl.value);
   menuImage.setAttribute("aria-pressed", armed ? "true" : "false");
   // Tint the "+" so the operator can tell they're in image mode even
   // with the menu closed.
@@ -6293,7 +6286,7 @@ function refreshImageModeState(): void {
   imgRatioBar.hidden = !armed || IMAGE_SIZES.length === 0;
 }
 menuImage.addEventListener("click", () => {
-  if (menuImage.disabled) return;
+  if (dropOpen || menuImage.disabled) return;
   closePlusMenu();
   if (isImageCommand(inputEl.value)) {
     // Toggle off — strip the prefix + leading whitespace.
@@ -6393,7 +6386,7 @@ inputEl.addEventListener("paste", (e) => {
   if (cd.files && cd.files.length) {
     const images: File[] = [];
     for (const f of cd.files) {
-      if (f.type && f.type.startsWith("image/")) images.push(f);
+      if (dropOpen || f.type && f.type.startsWith("image/")) images.push(f);
     }
     if (images.length) {
       e.preventDefault();
@@ -6443,6 +6436,7 @@ inputEl.addEventListener("input", () => {
 autosizeInput();
 updateSendButtonState();
 sendBtn.onclick = (): void => {
+  if (dropOpen) { void sendDrop(); return; }
   // Same button doubles as stop while a stream is in flight. Click during
   // stream cancels the AbortController; the streaming path catches the
   // resulting AbortError and either keeps the partial bubble or drops it.
