@@ -109,7 +109,7 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
 .wrap {
   display: flex; flex-direction: row;
   height: 100vh; height: 100dvh;
-  width: 100%; max-width: 1920px; margin: 0 auto;
+  width: 96%; margin: 0 auto;
 }
 .main {
   flex: 1; min-width: 0;
@@ -1406,6 +1406,7 @@ body.lightbox-open { overflow: hidden; }
 
 /* ----- mobile ----- */
 @media (max-width: 719px) {
+  .wrap { width: 100%; }
   .main { padding: 0 14px calc(12px + env(safe-area-inset-bottom)); }
   header { gap: 8px; padding: 12px 14px 10px; }
   .who { display: none; }
