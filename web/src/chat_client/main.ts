@@ -318,7 +318,7 @@ const imgRatioBar = $<HTMLDivElement>("imgRatioBar");
 const composerAttachmentsEl = $("composer-attachments");
 const dropOverlayEl = $("dropOverlay");
 const footerEl = document.querySelector("footer") as HTMLElement;
-const refreshHistoryButtons = [$<HTMLButtonElement>("refreshHistory"), $<HTMLButtonElement>("dropRefresh")];
+const refreshHistoryBtn = $<HTMLButtonElement>("refreshHistory");
 const dropEntry = $<HTMLButtonElement>("dropEntry");
 const dropMessagesEl = $<HTMLDivElement>("dropMessages");
 
@@ -3469,8 +3469,7 @@ let dropComposerAttachments: PendingAttachment[] = [];
 
 const dropPanelController = new ConversationPanel({
   panel: $("dropPanel"), workspace: workspaceEl, main: mainEl,
-  chatMessages: msgs, composer: footerEl, toolbar: $("dropToolbar"),
-  moveHandle: $<HTMLButtonElement>("dropMove"), resizeHandle: $("dropResize"),
+  chatMessages: msgs, composer: footerEl, header: $("chatHeader"), resizeHandle: $("dropResize"),
   layoutSelect: $<HTMLSelectElement>("dropLayoutSelect"), closeButton: $<HTMLButtonElement>("dropClose"),
 }, { onClose: () => closeDrop(), onLayout: () => autosizeInput() });
 
@@ -6052,17 +6051,15 @@ async function refreshCurrentConversation(): Promise<void> {
   }
 }
 
-for (const button of refreshHistoryButtons) button.onclick = () => { void refreshCurrentConversation(); };
+refreshHistoryBtn.onclick = () => { void refreshCurrentConversation(); };
 $<HTMLButtonElement>("newSessionBtn").onclick = newSession;
 
 function updateRefreshButtonState(): void {
   const busy = conversationBusy();
-  for (const button of refreshHistoryButtons) {
-    button.textContent = refreshingHistory ? "刷新中…" : "刷新";
-    button.disabled = refreshingHistory || busy;
-    button.setAttribute("aria-busy", String(refreshingHistory));
-    button.title = busy ? "正在处理，完成后再刷新" : "刷新当前对话";
-  }
+  refreshHistoryBtn.textContent = refreshingHistory ? "刷新中…" : "刷新";
+  refreshHistoryBtn.disabled = refreshingHistory || busy;
+  refreshHistoryBtn.setAttribute("aria-busy", String(refreshingHistory));
+  refreshHistoryBtn.title = busy ? "正在处理，完成后再刷新" : "刷新当前对话";
 }
 updateRefreshButtonState();
 $<HTMLButtonElement>("logout").onclick = () => {

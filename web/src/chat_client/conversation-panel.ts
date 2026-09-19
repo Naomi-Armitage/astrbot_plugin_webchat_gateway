@@ -39,8 +39,7 @@ interface PanelElements {
   main: HTMLElement;
   chatMessages: HTMLElement;
   composer: HTMLElement;
-  toolbar: HTMLElement;
-  moveHandle: HTMLButtonElement;
+  header: HTMLElement;
   resizeHandle: HTMLElement;
   layoutSelect: HTMLSelectElement;
   closeButton: HTMLButtonElement;
@@ -65,6 +64,7 @@ export class ConversationPanel {
   private readonly events = new AbortController();
   private readonly panelMount = document.createComment("conversation panel");
   private readonly composerMount = document.createComment("shared composer");
+  private readonly headerMount = document.createComment("shared header");
   private preferred: PanelLayout = "full";
   private geometry: PanelGeometry;
   private layout: PanelLayout = "full";
@@ -76,6 +76,7 @@ export class ConversationPanel {
     this.options = options;
     elements.panel.before(this.panelMount);
     elements.composer.before(this.composerMount);
+    elements.header.before(this.headerMount);
     const viewport = this.viewport();
     this.geometry = fitPanelGeometry({
       width: viewport.width * .34, height: viewport.height * .75,
@@ -100,7 +101,7 @@ export class ConversationPanel {
       this.finishGesture(false);
       if (this.opened) this.render();
     }, eventOptions);
-    for (const [handle, kind] of [[elements.toolbar, "move"], [elements.resizeHandle, "resize"]] as const) {
+    for (const [handle, kind] of [[elements.header, "move"], [elements.resizeHandle, "resize"]] as const) {
       handle.addEventListener("pointerdown", (event) => this.startGesture(event, kind, handle), eventOptions);
       handle.addEventListener("pointermove", (event) => this.moveGesture(event), eventOptions);
       handle.addEventListener("pointerup", (event) => {
@@ -113,10 +114,10 @@ export class ConversationPanel {
         if (event.target === handle && event.pointerId === this.gesture?.id) this.finishGesture(true);
       }, eventOptions);
     }
-    const keyboardHandles: [HTMLElement, Gesture["kind"]][] = [[elements.moveHandle, "move"], [elements.resizeHandle, "resize"]];
+    const keyboardHandles: [HTMLElement, Gesture["kind"]][] = [[elements.header, "move"], [elements.resizeHandle, "resize"]];
     for (const [handle, kind] of keyboardHandles) {
       handle.addEventListener("keydown", (event) => {
-        if (this.layout !== "float" || !event.key.startsWith("Arrow")) return;
+        if (!this.opened || this.layout !== "float" || event.target !== handle || !event.key.startsWith("Arrow")) return;
         event.preventDefault();
         const step = event.shiftKey ? 40 : 10;
         this.adjust(kind, event.key === "ArrowRight" ? step : event.key === "ArrowLeft" ? -step : 0,
@@ -139,9 +140,13 @@ export class ConversationPanel {
   close(): void {
     this.finishGesture(false);
     this.opened = false;
-    const { panel, chatMessages, composer, workspace } = this.elements;
+    const { panel, chatMessages, composer, workspace, header, layoutSelect, closeButton } = this.elements;
     this.panelMount.after(panel);
     this.composerMount.after(composer);
+    this.headerMount.after(header);
+    this.setHeaderMovable(false);
+    layoutSelect.hidden = true;
+    closeButton.hidden = true;
     panel.hidden = true;
     chatMessages.hidden = false;
     chatMessages.inert = false;
@@ -153,6 +158,7 @@ export class ConversationPanel {
     this.events.abort();
     this.panelMount.remove();
     this.composerMount.remove();
+    this.headerMount.remove();
   }
 
   private viewport(): Viewport { return { width: window.innerWidth, height: window.innerHeight }; }
@@ -166,7 +172,7 @@ export class ConversationPanel {
 
   private render(): void {
     if (!this.opened) return;
-    const { panel, workspace, main, chatMessages, composer, layoutSelect, moveHandle, resizeHandle } = this.elements;
+    const { panel, workspace, main, chatMessages, composer, header, layoutSelect, closeButton, resizeHandle } = this.elements;
     const focused = panel.ownerDocument.activeElement as HTMLElement | null;
     const messages = panel.querySelector<HTMLElement>(".message-list");
     const scrollTop = messages?.scrollTop ?? 0;
@@ -177,21 +183,29 @@ export class ConversationPanel {
       else parent.append(panel);
     }
     if (composer.parentElement !== panel) panel.append(composer);
+    if (this.layout === "full") {
+      if (header.parentElement !== main) this.headerMount.after(header);
+    } else if (header.parentElement !== panel) panel.prepend(header);
     panel.hidden = false;
     panel.dataset.layout = this.layout;
     workspace.dataset.panelLayout = this.layout;
     panel.setAttribute("role", this.layout === "float" ? "dialog" : "region");
     layoutSelect.value = this.layout;
+    layoutSelect.hidden = window.innerWidth < 720;
+    closeButton.hidden = this.layout === "full";
     for (const option of layoutSelect.options) {
       option.disabled = effectivePanelLayout(option.value as PanelLayout, window.innerWidth) !== option.value;
     }
     chatMessages.hidden = this.layout === "full";
     chatMessages.inert = true;
-    moveHandle.disabled = this.layout !== "float";
+    this.setHeaderMovable(this.layout === "float");
     resizeHandle.hidden = this.layout !== "float";
     if (this.layout === "float") this.paintGeometry();
     else for (const name of ["left", "top", "width", "height"]) panel.style.removeProperty(name);
-    if (focused && panel.contains(focused) && focused !== panel.ownerDocument.activeElement) focused.focus({ preventScroll: true });
+    if (focused && (panel.contains(focused) || header.contains(focused))) {
+      if (focused === layoutSelect && layoutSelect.hidden) composer.querySelector("textarea")?.focus({ preventScroll: true });
+      else if (focused !== panel.ownerDocument.activeElement) focused.focus({ preventScroll: true });
+    }
     this.options.onLayout();
     if (messages) messages.scrollTop = scrollTop;
   }
@@ -202,10 +216,22 @@ export class ConversationPanel {
     for (const [name, value] of Object.entries(this.geometry)) panel.style.setProperty(name, `${value}px`);
   }
 
+  private setHeaderMovable(movable: boolean): void {
+    const { header } = this.elements;
+    header.toggleAttribute("data-panel-movable", movable);
+    if (movable) {
+      header.tabIndex = 0;
+      header.setAttribute("aria-label", "对话工具栏，可拖动或使用方向键移动浮窗");
+    } else {
+      header.removeAttribute("tabindex");
+      header.removeAttribute("aria-label");
+    }
+  }
+
   private startGesture(event: PointerEvent, kind: Gesture["kind"], target: HTMLElement): void {
     if (!this.opened || this.layout !== "float" || !event.isPrimary || event.button !== 0) return;
     const interactive = (event.target as Element).closest("button, select, a, input");
-    if (kind === "move" && interactive && interactive !== this.elements.moveHandle) return;
+    if (kind === "move" && interactive) return;
     event.preventDefault();
     this.gesture = { id: event.pointerId, target, kind, x: event.clientX, y: event.clientY, start: { ...this.geometry } };
     target.setPointerCapture(event.pointerId);

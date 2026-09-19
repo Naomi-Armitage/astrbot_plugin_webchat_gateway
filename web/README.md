@@ -68,7 +68,7 @@ npm run typecheck
 
 使用 Node.js 22.18+ 运行 `npm test`，检查窗口布局的窄屏回退、几何边界和历史配置兼容。
 Drop 的窗口状态集中在 `src/chat_client/conversation-panel.ts`，外观在同名 CSS 中；
-它只管理布局和共享输入框的挂载位置，不持有消息或发送状态。
+它只管理布局和共享顶栏、输入框的挂载位置，不持有消息或发送状态。
 
 ## 新增页面
 

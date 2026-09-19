@@ -35,7 +35,7 @@
       <div class="sidebar-backdrop" id="sidebarBackdrop" hidden></div>
 
       <div class="main">
-        <header>
+        <header id="chatHeader">
           <button id="sidebarToggle" type="button" class="sidebar-toggle"
             aria-label="切换会话列表" aria-controls="sidebar" aria-expanded="false">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
@@ -56,6 +56,11 @@
           <span id="syncStatus" class="badge sync-status" data-state="live" title="同步状态">实时</span>
           <span id="quotaBadge" class="badge">--</span>
           <div class="actions">
+            <select id="dropLayoutSelect" aria-label="Drop 窗口布局" hidden>
+              <option value="full">默认</option>
+              <option value="float">浮窗</option>
+              <option value="dock">右侧栏</option>
+            </select>
             <button id="themeToggle" type="button" class="icon-only"
               aria-label="切换深浅色" aria-pressed="false">
               <svg id="themeIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -64,25 +69,14 @@
               </svg>
             </button>
             <button id="refreshHistory" type="button" title="刷新当前对话">刷新</button>
+            <button id="dropClose" type="button" class="icon-only" aria-label="关闭 Drop，返回对话" title="返回对话" hidden>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>
+            </button>
             <button id="logout" type="button" class="danger" title="退出并清除本机保存的 token">登出</button>
           </div>
         </header>
 
         <section id="dropPanel" class="conversation-panel" data-layout="full" aria-label="Drop" hidden>
-          <div id="dropToolbar" class="conversation-panel-toolbar">
-            <button id="dropMove" class="panel-move" type="button" aria-label="移动 Drop 浮窗，方向键调整位置" title="拖动或使用方向键移动">Drop</button>
-            <div class="panel-controls">
-              <select id="dropLayoutSelect" aria-label="Drop 窗口布局">
-                <option value="full">全屏</option>
-                <option value="float">浮窗</option>
-                <option value="dock">右侧栏</option>
-              </select>
-              <button id="dropRefresh" type="button" title="刷新当前对话">刷新</button>
-              <button id="dropClose" type="button" class="panel-close" aria-label="关闭 Drop，返回对话" title="返回对话">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>
-              </button>
-            </div>
-          </div>
           <div id="dropMessages" class="message-list" role="log" aria-label="Drop" aria-live="polite" hidden></div>
           <button id="dropResize" class="panel-resize" type="button" aria-label="调整浮窗大小，使用方向键或拖动" title="拖动或使用方向键调整大小" hidden>
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" aria-hidden="true"><path d="m4 12 8-8M8 12l4-4"/></svg>
