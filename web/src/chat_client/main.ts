@@ -3063,7 +3063,123 @@ function onVisibilityChange(): void {
 
 // ---------- Sidebar render ----------
 
+const SESSION_SWIPE_WIDTH = 64;
+type SessionSwipeAction = "pin" | "delete";
+let swipedSession: HTMLElement | null = null;
+
+function settleSessionSwipe(row: HTMLElement, action: SessionSwipeAction | null): void {
+  row.classList.remove("is-swiping");
+  if (action) row.dataset.swipeOpen = action;
+  else row.removeAttribute("data-swipe-open");
+  const offset = action === "pin" ? SESSION_SWIPE_WIDTH : action === "delete" ? -SESSION_SWIPE_WIDTH : 0;
+  row.style.setProperty("--session-swipe-offset", `${offset}px`);
+  row.querySelectorAll<HTMLButtonElement>(".session-swipe-action").forEach((button) => {
+    const active = button.dataset.swipeAction === action;
+    button.disabled = !active;
+    button.setAttribute("aria-hidden", String(!active));
+  });
+  if (action) swipedSession = row;
+  else if (swipedSession === row) swipedSession = null;
+}
+
+function closeSessionSwipe(): void {
+  if (swipedSession) settleSessionSwipe(swipedSession, null);
+}
+
+function createSessionSwipeButton(action: SessionSwipeAction, label: string, icon: string, activate: () => void): HTMLButtonElement {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = `session-swipe-action session-swipe-${action}`;
+  button.dataset.swipeAction = action;
+  button.disabled = true;
+  button.setAttribute("aria-hidden", "true");
+  button.setAttribute("aria-label", action === "delete" ? "删除该会话" : label);
+  button.innerHTML = icon;
+  const text = document.createElement("span");
+  text.textContent = label;
+  button.append(text);
+  button.addEventListener("click", (event) => { event.stopPropagation(); activate(); });
+  return button;
+}
+
+function installSessionSwipe(row: HTMLElement): void {
+  let gesture: { id: number; x: number; y: number; start: number; offset: number; horizontal: boolean } | null = null;
+  let suppressClick = false;
+  row.addEventListener("pointerdown", (event) => {
+    suppressClick = false;
+    if (event.pointerType !== "touch" && event.pointerType !== "pen") return;
+    if (!event.isPrimary || !(event.target as Element).closest(".session-pick")) return;
+    const start = row.dataset.swipeOpen === "pin" ? SESSION_SWIPE_WIDTH
+      : row.dataset.swipeOpen === "delete" ? -SESSION_SWIPE_WIDTH : 0;
+    gesture = { id: event.pointerId, x: event.clientX, y: event.clientY, start, offset: start, horizontal: false };
+  });
+  row.addEventListener("pointermove", (event) => {
+    if (!gesture || event.pointerId !== gesture.id) return;
+    const dx = event.clientX - gesture.x;
+    const dy = event.clientY - gesture.y;
+    if (!gesture.horizontal) {
+      if (Math.max(Math.abs(dx), Math.abs(dy)) < 10) return;
+      // Lock to the first clear direction so scrolling the list never opens actions.
+      if (Math.abs(dy) >= Math.abs(dx)) { gesture = null; return; }
+      gesture.horizontal = true;
+      suppressClick = true;
+      row.classList.add("is-swiping");
+      row.setPointerCapture?.(event.pointerId);
+    }
+    // Reversing an open swipe closes it without exposing the opposite action
+    // in the same gesture, even when the finger travels across the whole card.
+    const min = gesture.start > 0 ? 0 : -SESSION_SWIPE_WIDTH;
+    const max = gesture.start < 0 ? 0 : SESSION_SWIPE_WIDTH;
+    gesture.offset = Math.max(min, Math.min(max, gesture.start + dx));
+    row.style.setProperty("--session-swipe-offset", `${gesture.offset}px`);
+  });
+  const finish = (event: PointerEvent): void => {
+    if (!gesture || event.pointerId !== gesture.id) return;
+    const current = gesture;
+    gesture = null;
+    if (!current.horizontal) return;
+    const offset = event.type === "pointerup" ? current.offset : current.start;
+    const action = offset >= SESSION_SWIPE_WIDTH / 2 ? "pin"
+      : offset <= -SESSION_SWIPE_WIDTH / 2 ? "delete" : null;
+    settleSessionSwipe(row, action);
+    if (row.hasPointerCapture?.(event.pointerId)) row.releasePointerCapture(event.pointerId);
+  };
+  row.addEventListener("pointerup", finish);
+  row.addEventListener("pointercancel", finish);
+  row.addEventListener("lostpointercapture", (event) => {
+    // Transferring the touch's implicit capture from the pick button to the
+    // row also emits this event on the button; only losing the row's capture cancels.
+    if (event.target === row) finish(event);
+  });
+  row.addEventListener("click", (event) => {
+    // Ignore the compatibility click after a swipe; a fresh pointerdown resets
+    // the guard. Keyboard activation (detail=0) remains available.
+    if (suppressClick && event.detail !== 0) {
+      suppressClick = false;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    } else if (row.hasAttribute("data-swipe-open") && (event.target as Element).closest(".session-pick")) {
+      settleSessionSwipe(row, null);
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }
+  }, true);
+}
+
+document.addEventListener("pointerdown", (event) => {
+  if (swipedSession && !swipedSession.contains(event.target as Node)) closeSessionSwipe();
+}, { passive: true });
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape" || !swipedSession) return;
+  const pick = swipedSession.querySelector<HTMLButtonElement>(".session-pick");
+  closeSessionSwipe();
+  pick?.focus();
+  event.preventDefault();
+  event.stopImmediatePropagation();
+}, true);
+
 function renderSessionList(): void {
+  closeSessionSwipe();
   sessionListEl.replaceChildren();
   const sorted = Object.values(store.sessions).sort((a, b) => {
     const ap = a.pinned ? 1 : 0;
@@ -3124,6 +3240,7 @@ function renderSessionList(): void {
     const pin = document.createElement("button");
     pin.className = "session-pin"; pin.type = "button";
     pin.setAttribute("aria-label", sess.pinned ? "取消置顶" : "置顶会话");
+    pin.setAttribute("aria-pressed", String(!!sess.pinned));
     pin.title = sess.pinned ? "取消置顶" : "置顶会话";
     pin.innerHTML = sess.pinned ? PINNED_SVG : PIN_SVG;
     pin.addEventListener("click", (e) => { e.stopPropagation(); void togglePinSession(sess.id); });
@@ -3134,65 +3251,22 @@ function renderSessionList(): void {
     del.innerHTML = TRASH_SVG;
     del.addEventListener("click", (e) => { e.stopPropagation(); void deleteSession(sess.id); });
 
-    li.append(pin, pick, del);
+    const actions = document.createElement("div");
+    actions.className = "session-actions";
+    actions.append(pin, del);
+    const content = document.createElement("div");
+    content.className = "session-content";
+    content.append(pick, actions);
 
-    // 移动端滑动逻辑
-    let startX = 0, currentX = 0, isDragging = false;
-    li.addEventListener("touchstart", (e) => {
-      // 重置其他所有项的滑动状态
-      sessionListEl.querySelectorAll(".session-item").forEach((item) => {
-        if (item !== li) {
-          (item as HTMLElement).style.transform = "";
-          delete (item as HTMLElement).dataset.swipe;
-        }
-      });
-      const touch = e.touches[0];
-      if (!touch) return;
-      startX = touch.clientX;
-      currentX = startX;
-      isDragging = true;
-    }, { passive: true });
-
-    li.addEventListener("touchmove", (e) => {
-      if (!isDragging) return;
-      const touch = e.touches[0];
-      if (!touch) return;
-      currentX = touch.clientX;
-      const deltaX = currentX - startX;
-      if (Math.abs(deltaX) > 10) {
-        li.style.transform = `translateX(${deltaX}px)`;
-      }
-    }, { passive: true });
-
-    li.addEventListener("touchend", () => {
-      if (!isDragging) return;
-      isDragging = false;
-      const deltaX = currentX - startX;
-      if (deltaX < -60) {
-        li.dataset.swipe = "left";
-        li.style.transform = "translateX(-80px)";
-      } else if (deltaX > 60) {
-        li.dataset.swipe = "right";
-        li.style.transform = "translateX(80px)";
-      } else {
-        delete li.dataset.swipe;
-        li.style.transform = "";
-      }
-    });
+    const swipePin = createSessionSwipeButton("pin", sess.pinned ? "取消置顶" : "置顶", sess.pinned ? PINNED_SVG : PIN_SVG, () => { void togglePinSession(sess.id); });
+    swipePin.setAttribute("aria-pressed", String(!!sess.pinned));
+    const swipeDelete = createSessionSwipeButton("delete", "删除", TRASH_SVG, () => { void deleteSession(sess.id); });
+    li.append(content, swipePin, swipeDelete);
+    installSessionSwipe(li);
 
     sessionListEl.appendChild(li);
   }
 }
-
-// 点击列表外区域重置所有滑动状态
-document.addEventListener("click", (e) => {
-  if (!sessionListEl.contains(e.target as Node)) {
-    sessionListEl.querySelectorAll(".session-item").forEach((item) => {
-      (item as HTMLElement).style.transform = "";
-      delete (item as HTMLElement).dataset.swipe;
-    });
-  }
-});
 
 function switchSession(id: string): void {
   if (!store.sessions[id]) return;
@@ -3904,6 +3978,7 @@ function openMobileSidebar(): void {
   });
 }
 function closeMobileSidebar(): void {
+  closeSessionSwipe();
   sidebarEl.classList.remove("open");
   sidebarBackdrop.hidden = true;
   sidebarToggleBtn.setAttribute("aria-expanded", "false");
