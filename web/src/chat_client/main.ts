@@ -315,7 +315,7 @@ const imgRatioBar = $<HTMLDivElement>("imgRatioBar");
 const composerAttachmentsEl = $("composer-attachments");
 const dropOverlayEl = $("dropOverlay");
 const footerEl = document.querySelector("footer") as HTMLElement;
-const clearHistoryBtn = $<HTMLButtonElement>("clearHistory");
+const refreshHistoryBtn = $<HTMLButtonElement>("refreshHistory");
 const dropEntry = $<HTMLButtonElement>("dropEntry");
 const dropMessagesEl = $<HTMLDivElement>("dropMessages");
 
@@ -2384,7 +2384,7 @@ function applyEvent(ev: ServerEvent): void {
       if (role === "assistant" && !sync.activeResumeAborts[sid] && store.pendingStreams[sid]) {
         delete store.pendingStreams[sid];
         savePendingStreams();
-        updateClearButtonState();
+        updateRefreshButtonState();
       }
       let attachments: AttachmentRef[] | undefined;
       const rawAttachments = payload["attachments"];
@@ -3300,7 +3300,7 @@ function switchSession(id: string): void {
     // Active session changed — the clear button's enabled state
     // depends on whether THIS session has a pending stream, so the
     // state must refresh here too (not just at stream start/end).
-    updateClearButtonState();
+    updateRefreshButtonState();
     void fetchConversation(id).then((detail) => {
       if (!detail) return;
       ingestConversationDetail(detail);
@@ -3355,24 +3355,6 @@ async function patchSession(sessionId: string, body: Record<string, unknown>): P
     const e = new Error(err) as Error & { status?: number };
     e.status = resp.status;
     throw e;
-  }
-}
-
-async function postClear(sessionId: string): Promise<void> {
-  const resp = await fetchWithTimeout(
-    `${CONV_URL}/${encodeURIComponent(sessionId)}/clear`,
-    {
-      method: "POST",
-      credentials: "same-origin",
-      headers: bearer(),
-    },
-    FETCH_TIMEOUT_FAST_MS,
-  );
-  if (resp.status === 401) { handle401(); throw new Error("unauthorized"); }
-  if (!resp.ok) {
-    let err = `http_${resp.status}`;
-    try { const j = await resp.json() as { error?: string }; if (j.error) err = j.error; } catch {}
-    throw new Error(err);
   }
 }
 
@@ -3453,31 +3435,6 @@ async function togglePinSession(id: string): Promise<void> {
   }
 }
 
-async function clearActiveHistory(): Promise<void> {
-  const sess = currentSession();
-  const id = sess.id;
-  const prevHistory = sess.history.slice();
-  const prevTitle = sess.title;
-  const prevManual = sess.titleManual;
-  sess.history.length = 0;
-  sess.title = "新会话";
-  sess.titleManual = false;
-  saveStore();
-  clearMsgList();
-  renderSessionList();
-  try {
-    await postClear(id);
-  } catch (e) {
-    sess.history = prevHistory;
-    sess.title = prevTitle;
-    sess.titleManual = prevManual;
-    saveStore();
-    replayActive();
-    renderSessionList();
-    addMessageBubble("error", `清空失败: ${(e as Error).message}`);
-  }
-}
-
 interface DropMessage {
   id: number; device_id: string; device_name: string; kind: "text" | "file";
   text: string; created_at: number; file_id?: string; filename?: string;
@@ -3499,7 +3456,6 @@ let dropHistoryVersion = 0;
 let dropMaxFileBytes = 100 * 1024 * 1024;
 let chatSendMode: "send" | "stop" = "send";
 let dropSending = false;
-let dropClearing = false;
 let chatDraft = "";
 let dropDraft = "";
 let composerContext = 0;
@@ -3827,7 +3783,7 @@ async function sendDrop(): Promise<void> {
   const rawText = inputEl.value;
   const text = rawText.trim();
   const pending = dropComposerAttachments;
-  if (dropSending || dropClearing || pending.some((a) => a.state !== "ready")) return;
+  if (dropSending || pending.some((a) => a.state !== "ready")) return;
   const ready = pending.filter((a) => a.file_id);
   if (!text && !ready.length) return;
   if ([...text].length > 16000) { dropStatusText("文本超过 16,000 字符限制", true); return; }
@@ -3835,7 +3791,7 @@ async function sendDrop(): Promise<void> {
   dropSending = true;
   renderComposerAttachments();
   updateSendButtonState();
-  updateClearButtonState();
+  updateRefreshButtonState();
   dropStatusText("");
   try {
     const resp = await fetchWithTimeout(DROP_SEND_URL, {
@@ -3865,7 +3821,7 @@ async function sendDrop(): Promise<void> {
     dropSending = false;
     renderComposerAttachments();
     updateSendButtonState();
-    updateClearButtonState();
+    updateRefreshButtonState();
   }
 }
 
@@ -3885,7 +3841,7 @@ function refreshComposerContext(): void {
   renderComposerAttachments();
   setSendMode(chatSendMode);
   updateSendButtonState();
-  updateClearButtonState();
+  updateRefreshButtonState();
   autosizeInput();
 }
 function closeDrop(restoreFocus = true): void {
@@ -3919,31 +3875,6 @@ function openDrop(): void {
   void loadDropMessages({ preserveOlder: true });
   updateDropFallbackPolling();
   inputEl.focus();
-}
-
-async function clearDropHistory(): Promise<void> {
-  if (dropSending || dropClearing) return;
-  const historyVersion = dropHistoryVersion;
-  dropClearing = true;
-  updateClearButtonState();
-  updateSendButtonState();
-  try {
-    const resp = await fetchWithTimeout(`${API}/drop/clear`, { method: "POST", headers: bearer(), credentials: "same-origin" }, FETCH_TIMEOUT_FAST_MS);
-    if (resp.status === 401) { handle401(); return; }
-    if (!resp.ok) throw new Error("HTTP " + resp.status);
-    if (historyVersion === dropHistoryVersion) {
-      dropHistoryVersion += 1;
-      dropLoadSeq += 1;
-      dropMessages = [];
-      dropHasMore = false;
-      dropBefore = null;
-      dropLoadedImages.clear();
-      invalidateDropUploads();
-    }
-    dropStatusText("");
-    if (dropOpen) renderDropMessages();
-  } catch (e) { dropStatusText("清空失败：" + (e as Error).message, true); }
-  finally { dropClearing = false; updateClearButtonState(); updateSendButtonState(); }
 }
 
 function newSession(): void {
@@ -4459,6 +4390,7 @@ async function resumeStream(
 
 function setSendMode(mode: "send" | "stop"): void {
   chatSendMode = mode;
+  updateRefreshButtonState();
   if (dropOpen) mode = "send";
   sendBtn.dataset.mode = mode;
   sendBtn.setAttribute("aria-label", mode === "stop" ? "停止" : "发送");
@@ -4715,7 +4647,7 @@ function uploadErrorCopy(code: string, payload: Record<string, unknown>): string
 }
 
 function addAttachmentFiles(rawFiles: FileList | File[]): void {
-  if ((!dropOpen && !UPLOADS_ENABLED) || (dropOpen && (dropSending || dropClearing))) return;
+  if ((!dropOpen && !UPLOADS_ENABLED) || (dropOpen && (dropSending))) return;
   const isDrop = dropOpen;
   const queue = activeComposerAttachments();
   const limit = isDrop ? Math.min(16, MAX_ATTACHMENTS_PER_MESSAGE) : MAX_ATTACHMENTS_PER_MESSAGE;
@@ -4825,7 +4757,7 @@ function clearComposerAttachments(): void {
 // retained blob so the user doesn't have to re-pick the file. No-op if the
 // chip isn't in an error state or the blob is gone (shouldn't happen).
 function retryAttachment(local_id: string): void {
-  if (dropOpen && (dropSending || dropClearing)) return;
+  if (dropOpen && (dropSending)) return;
   const att = activeComposerAttachments().find((a) => a.local_id === local_id);
   if (!att || att.state !== "error" || !att.blob) return;
   att.state = "uploading";
@@ -4907,7 +4839,7 @@ function updateSendButtonState(): void {
   const hasReady = pending.some((a) => a.state === "ready");
   const hasText = inputEl.value.trim().length > 0;
   sendBtn.disabled = hasUploading || (!hasText && !hasReady)
-    || (dropOpen && (dropSending || dropClearing || pending.some((a) => a.state === "error")));
+    || (dropOpen && (dropSending || pending.some((a) => a.state === "error")));
 }
 
 // ---------- Lightbox ----------
@@ -5427,13 +5359,13 @@ async function attachStreamingBubble(opts: StreamingAttachOpts): Promise<Streami
       started_at: store.pendingStreams[sid]?.started_at ?? Date.now(),
     };
     savePendingStreams();
-    updateClearButtonState();
+    updateRefreshButtonState();
   };
   const clearPending = (): void => {
     if (store.pendingStreams[sid]) {
       delete store.pendingStreams[sid];
       savePendingStreams();
-      updateClearButtonState();
+      updateRefreshButtonState();
     }
   };
 
@@ -5806,7 +5738,7 @@ async function attemptResumeOnLoad(sid: string): Promise<void> {
   if (!startedAt || Date.now() - startedAt > STALE_AFTER_MS) {
     delete store.pendingStreams[sid];
     savePendingStreams();
-    updateClearButtonState();
+    updateRefreshButtonState();
     return;
   }
   // Turn already completed (its reply is the most recent entry): the
@@ -5816,7 +5748,7 @@ async function attemptResumeOnLoad(sid: string): Promise<void> {
   if (sessionEndsWithRecentBotReply(sid)) {
     delete store.pendingStreams[sid];
     savePendingStreams();
-    updateClearButtonState();
+    updateRefreshButtonState();
     return;
   }
   await attachStreamingBubble({
@@ -6068,37 +6000,59 @@ async function runNonStreamingSend(sid: string, message: string, attachments: At
   }
 }
 
-clearHistoryBtn.onclick = () => {
-  if (dropOpen) void clearDropHistory();
-  else void clearActiveHistory();
-};
-$<HTMLButtonElement>("newSessionBtn").onclick = newSession;
+let refreshingHistory = false;
 
-// Disable the "clear history" button while a stream is in flight for
-// the active session. The backend already rejects clear_history with
-// 429 concurrent_request if a /chat/stream is mid-flight (it shares
-// the same PerTokenConcurrency lock); without the frontend gate the
-// user would just see a 429 toast and have to retry manually.
-//
-// We intentionally do NOT auto-retry on 429. Clear is a destructive
-// operation: if we wait 5s and retry, the assistant might have just
-// produced a long reply that gets wiped — confusing UX. Disabling
-// the button shows the user "wait for the message to finish" up
-// front, which is the safer pattern for irreversible actions.
-function updateClearButtonState(): void {
-  const btn = clearHistoryBtn;
-  btn.textContent = "清空";
-  btn.removeAttribute("aria-label");
-  const sid = store.activeId;
-  const streaming = dropOpen ? dropSending || dropClearing : !!(sid && store.pendingStreams[sid]);
-  btn.disabled = streaming;
-  if (streaming) {
-    btn.title = dropOpen ? "正在处理，完成后再清空" : "当前正在回复，完成后再清空";
-  } else {
-    btn.removeAttribute("title");
+function conversationBusy(): boolean {
+  return dropOpen ? dropSending : !!(sync.streamAbort || sync.sendAbort
+    || store.pendingStreams[store.activeId] || sync.activeResumeAborts[store.activeId]);
+}
+
+async function refreshCurrentConversation(): Promise<void> {
+  if (refreshingHistory || conversationBusy()) return;
+  const context = composerContext;
+  const session = currentSession();
+  const history = session.history;
+  const historyLength = history.length;
+  const pts = sync.lastPts;
+  refreshingHistory = true;
+  updateRefreshButtonState();
+  try {
+    if (dropOpen) {
+      await loadDropMessages({ preserveOlder: true });
+    } else {
+      const detail = await fetchConversation(session.id);
+      // A switched conversation, new send or live event owns the newer view.
+      // Never replace it with a response requested before that change.
+      if (context !== composerContext || conversationBusy() || pts !== sync.lastPts
+        || currentSession().history !== history || history.length !== historyLength) return;
+      if (detail) {
+        ingestConversationDetail(detail);
+        saveStore();
+        replayActive();
+        renderSessionList();
+      } else if (history.length) {
+        addMessageBubble("notice", "会话已不存在，请重新选择会话。");
+      }
+    }
+  } catch (error) {
+    if (context === composerContext) composerNotice(`刷新失败：${(error as Error).message}`);
+  } finally {
+    refreshingHistory = false;
+    updateRefreshButtonState();
   }
 }
-updateClearButtonState();
+
+refreshHistoryBtn.onclick = () => { void refreshCurrentConversation(); };
+$<HTMLButtonElement>("newSessionBtn").onclick = newSession;
+
+function updateRefreshButtonState(): void {
+  const busy = conversationBusy();
+  refreshHistoryBtn.textContent = refreshingHistory ? "刷新中…" : "刷新";
+  refreshHistoryBtn.disabled = refreshingHistory || busy;
+  refreshHistoryBtn.setAttribute("aria-busy", String(refreshingHistory));
+  refreshHistoryBtn.title = busy ? "正在处理，完成后再刷新" : "刷新当前对话";
+}
+updateRefreshButtonState();
 $<HTMLButtonElement>("logout").onclick = () => {
   if (!confirm("登出会清除本机保存的 token 与对话历史。继续？")) return;
   sync.stopped = true;
