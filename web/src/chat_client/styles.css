@@ -109,7 +109,7 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
 .wrap {
   display: flex; flex-direction: row;
   height: 100vh; height: 100dvh;
-  max-width: 1180px; margin: 0 auto;
+  width: 100%; max-width: 1920px; margin: 0 auto;
 }
 .main {
   flex: 1; min-width: 0;
