@@ -1,3 +1,5 @@
+import { ConversationPanel } from "./conversation-panel";
+import "./conversation-panel.css";
 import {
   LS_TOKEN,
   LS_FAMILY,
@@ -301,6 +303,7 @@ const badge = $("quotaBadge");
 const syncStatusEl = $("syncStatus");
 const whoEl = $("who");
 const mainEl = document.querySelector<HTMLElement>(".main")!;
+const workspaceEl = document.querySelector<HTMLElement>(".wrap")!;
 const emptyStateTemplate = $("emptyState").cloneNode(true) as HTMLElement;
 const sidebarEl = $("sidebar");
 const sidebarToggleBtn = $<HTMLButtonElement>("sidebarToggle");
@@ -315,7 +318,7 @@ const imgRatioBar = $<HTMLDivElement>("imgRatioBar");
 const composerAttachmentsEl = $("composer-attachments");
 const dropOverlayEl = $("dropOverlay");
 const footerEl = document.querySelector("footer") as HTMLElement;
-const refreshHistoryBtn = $<HTMLButtonElement>("refreshHistory");
+const refreshHistoryButtons = [$<HTMLButtonElement>("refreshHistory"), $<HTMLButtonElement>("dropRefresh")];
 const dropEntry = $<HTMLButtonElement>("dropEntry");
 const dropMessagesEl = $<HTMLDivElement>("dropMessages");
 
@@ -696,7 +699,7 @@ function showCopyToast(x: number, y: number): void {
     document.getElementById("_copyToast")?.classList.remove("show");
   }, 1100);
 }
-mainEl.addEventListener("click", (e: MouseEvent) => {
+workspaceEl.addEventListener("click", (e: MouseEvent) => {
   const target = e.target as Element | null;
   if (!target) return;
   const copyBtn = target.closest<HTMLButtonElement>(".codeblock-copy");
@@ -791,11 +794,11 @@ function cancelLongPress(): void {
   lpRow = null;
 }
 function closeAllRevealedActions(except?: Element | null): void {
-  mainEl.querySelectorAll<HTMLElement>(".msg-row.actions-revealed").forEach((r) => {
+  workspaceEl.querySelectorAll<HTMLElement>(".msg-row.actions-revealed").forEach((r) => {
     if (r !== except) r.classList.remove("actions-revealed");
   });
 }
-mainEl.addEventListener("touchstart", (e: TouchEvent) => {
+workspaceEl.addEventListener("touchstart", (e: TouchEvent) => {
   // Don't treat a tap on the action buttons themselves as a long-press
   // candidate — that would re-trigger reveal on a row that's already
   // open and feel laggy.
@@ -820,7 +823,7 @@ mainEl.addEventListener("touchstart", (e: TouchEvent) => {
     lpTimer = null;
   }, LONG_PRESS_MS);
 }, { passive: true });
-mainEl.addEventListener("touchmove", (e: TouchEvent) => {
+workspaceEl.addEventListener("touchmove", (e: TouchEvent) => {
   if (lpTimer === null || !lpStartXY) return;
   const t = e.touches[0];
   if (!t) return;
@@ -828,13 +831,13 @@ mainEl.addEventListener("touchmove", (e: TouchEvent) => {
   const dy = t.clientY - lpStartXY[1];
   if (dx * dx + dy * dy > LONG_PRESS_MOVE_TOL_SQ) cancelLongPress();
 }, { passive: true });
-mainEl.addEventListener("touchend", cancelLongPress, { passive: true });
-mainEl.addEventListener("touchcancel", cancelLongPress, { passive: true });
+workspaceEl.addEventListener("touchend", cancelLongPress, { passive: true });
+workspaceEl.addEventListener("touchcancel", cancelLongPress, { passive: true });
 document.addEventListener("pointerdown", (e: PointerEvent) => {
   // Fast path: no revealed rows means nothing to close. Skips the
   // closest() walk on every pointerdown when long-press isn't active
   // (the common case on desktop).
-  if (!mainEl.querySelector(".msg-row.actions-revealed")) return;
+  if (!workspaceEl.querySelector(".msg-row.actions-revealed")) return;
   const target = e.target as Element | null;
   if (!target) return;
   // A pointerdown inside a revealed row's actions is a button press —
@@ -3464,6 +3467,13 @@ let dropNotice = "";
 let dropNoticeBad = false;
 let dropComposerAttachments: PendingAttachment[] = [];
 
+const dropPanelController = new ConversationPanel({
+  panel: $("dropPanel"), workspace: workspaceEl, main: mainEl,
+  chatMessages: msgs, composer: footerEl, toolbar: $("dropToolbar"),
+  moveHandle: $<HTMLButtonElement>("dropMove"), resizeHandle: $("dropResize"),
+  layoutSelect: $<HTMLSelectElement>("dropLayoutSelect"), closeButton: $<HTMLButtonElement>("dropClose"),
+}, { onClose: () => closeDrop(), onLayout: () => autosizeInput() });
+
 const dropDeviceId = (() => {
   const old = localStorage.getItem(LS_DROP_DEVICE);
   if (old && /^[A-Za-z0-9_\-.:]{8,64}$/.test(old)) return old;
@@ -3852,7 +3862,7 @@ function closeDrop(restoreFocus = true): void {
   inputEl.value = chatDraft;
   clearDropFallbackTimer();
   dropMessagesEl.hidden = true;
-  msgs.hidden = false;
+  dropPanelController.close();
   dropEntry.setAttribute("aria-expanded", "false");
   refreshComposerContext();
   renderSessionList();
@@ -3864,8 +3874,8 @@ function openDrop(): void {
   dropOpen = true;
   composerContext += 1;
   inputEl.value = dropDraft;
-  msgs.hidden = true;
   dropMessagesEl.hidden = false;
+  dropPanelController.open();
   dropEntry.setAttribute("aria-expanded", "true");
   cancelLongPress();
   closeAllRevealedActions();
@@ -6042,15 +6052,17 @@ async function refreshCurrentConversation(): Promise<void> {
   }
 }
 
-refreshHistoryBtn.onclick = () => { void refreshCurrentConversation(); };
+for (const button of refreshHistoryButtons) button.onclick = () => { void refreshCurrentConversation(); };
 $<HTMLButtonElement>("newSessionBtn").onclick = newSession;
 
 function updateRefreshButtonState(): void {
   const busy = conversationBusy();
-  refreshHistoryBtn.textContent = refreshingHistory ? "刷新中…" : "刷新";
-  refreshHistoryBtn.disabled = refreshingHistory || busy;
-  refreshHistoryBtn.setAttribute("aria-busy", String(refreshingHistory));
-  refreshHistoryBtn.title = busy ? "正在处理，完成后再刷新" : "刷新当前对话";
+  for (const button of refreshHistoryButtons) {
+    button.textContent = refreshingHistory ? "刷新中…" : "刷新";
+    button.disabled = refreshingHistory || busy;
+    button.setAttribute("aria-busy", String(refreshingHistory));
+    button.title = busy ? "正在处理，完成后再刷新" : "刷新当前对话";
+  }
 }
 updateRefreshButtonState();
 $<HTMLButtonElement>("logout").onclick = () => {

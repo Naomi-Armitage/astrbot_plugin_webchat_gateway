@@ -8,7 +8,8 @@
     "dev": "vite src/landing",
     "build": "node ./scripts/build.mjs",
     "build:landing": "vite build --config vite.config.ts --mode landing",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test tests/*.test.mjs"
   },
   "devDependencies": {
     "@types/dompurify": "^3.0.5",

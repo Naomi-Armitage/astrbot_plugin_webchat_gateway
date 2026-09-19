@@ -68,7 +68,26 @@
           </div>
         </header>
 
-        <div id="dropMessages" class="message-list" role="log" aria-label="Drop" aria-live="polite" hidden></div>
+        <section id="dropPanel" class="conversation-panel" data-layout="full" aria-label="Drop" hidden>
+          <div id="dropToolbar" class="conversation-panel-toolbar">
+            <button id="dropMove" class="panel-move" type="button" aria-label="移动 Drop 浮窗，方向键调整位置" title="拖动或使用方向键移动">Drop</button>
+            <div class="panel-controls">
+              <select id="dropLayoutSelect" aria-label="Drop 窗口布局">
+                <option value="full">全屏</option>
+                <option value="float">浮窗</option>
+                <option value="dock">右侧栏</option>
+              </select>
+              <button id="dropRefresh" type="button" title="刷新当前对话">刷新</button>
+              <button id="dropClose" type="button" class="panel-close" aria-label="关闭 Drop，返回对话" title="返回对话">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>
+              </button>
+            </div>
+          </div>
+          <div id="dropMessages" class="message-list" role="log" aria-label="Drop" aria-live="polite" hidden></div>
+          <button id="dropResize" class="panel-resize" type="button" aria-label="调整浮窗大小，使用方向键或拖动" title="拖动或使用方向键调整大小" hidden>
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" aria-hidden="true"><path d="m4 12 8-8M8 12l4-4"/></svg>
+          </button>
+        </section>
         <div id="messages" class="message-list">
 
           <div id="emptyState" class="empty-state">

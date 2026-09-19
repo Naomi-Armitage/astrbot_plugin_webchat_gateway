@@ -1,0 +1,90 @@
+/* Presentation shell only; bubbles, attachments and composer use shared styles. */
+.conversation-panel {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  position: relative;
+  container: conversation / inline-size;
+}
+.conversation-panel[hidden] { display: none; }
+.conversation-panel[data-layout="full"] { flex: 1; padding-top: 72px; }
+.conversation-panel[data-layout="dock"],
+.conversation-panel[data-layout="float"] {
+  padding: 0 14px 18px;
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: 14px;
+  box-shadow: 0 8px 32px var(--shadow-strong);
+}
+.conversation-panel[data-layout="dock"] { flex: 0 0 34%; margin: 14px 0 18px 10px; }
+.conversation-panel[data-layout="float"] { position: fixed; z-index: 40; }
+.conversation-panel[data-layout="float"] footer textarea { max-height: min(120px, 20dvh); }
+.conversation-panel[data-layout="float"] #composer-attachments { max-height: 96px; overflow-y: auto; }
+.conversation-panel .message-list { padding: 12px 0 14px; }
+.conversation-panel-toolbar {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 46px;
+  border-bottom: 1px solid var(--rule);
+}
+.panel-controls { display: flex; align-items: center; gap: 6px; }
+.panel-controls button,
+.panel-controls select {
+  min-height: 30px;
+  padding: 4px 8px;
+  border: 1px solid var(--rule);
+  border-radius: 7px;
+  background: var(--card);
+  color: var(--ink-soft);
+  font: 12px var(--font-ui);
+  cursor: pointer;
+}
+.panel-controls button:hover:not(:disabled),
+.panel-controls select:hover { background: var(--accent-soft); color: var(--accent-strong); }
+.panel-controls button:disabled { opacity: .5; cursor: default; }
+.panel-controls .panel-close { display: grid; place-items: center; padding: 5px; }
+.panel-close svg { width: 16px; height: 16px; }
+.panel-move {
+  padding: 6px 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font: 600 14px var(--font-ui);
+}
+.conversation-panel[data-layout="float"] .conversation-panel-toolbar,
+.conversation-panel[data-layout="float"] .panel-move { cursor: grab; touch-action: none; }
+.conversation-panel.is-adjusting { user-select: none; }
+.conversation-panel.is-adjusting .conversation-panel-toolbar { cursor: grabbing; }
+.panel-resize {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  padding: 2px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--ink-soft);
+  cursor: nwse-resize;
+  touch-action: none;
+}
+.panel-resize[hidden] { display: none; }
+.panel-resize svg { width: 16px; height: 16px; pointer-events: none; }
+.conversation-panel button:focus-visible,
+.panel-controls select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+@container conversation (max-width: 520px) {
+  .conversation-panel .msg-row { max-width: 90%; }
+  .conversation-panel .composer-input { min-width: 0; }
+  .conversation-panel footer textarea { min-width: 0; }
+  .conversation-panel .composer-row { gap: 6px; }
+}
+@media (max-width: 719px) {
+  .conversation-panel[data-layout="full"] { padding-top: 56px; }
+}

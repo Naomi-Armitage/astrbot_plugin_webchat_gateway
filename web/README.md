@@ -64,6 +64,12 @@ npm run typecheck
 
 走 `tsc --noEmit`，strict + `noUncheckedIndexedAccess` 等都开着。
 
+## 布局回归检查
+
+使用 Node.js 22.18+ 运行 `npm test`，检查窗口布局的窄屏回退、几何边界和历史配置兼容。
+Drop 的窗口状态集中在 `src/chat_client/conversation-panel.ts`，外观在同名 CSS 中；
+它只管理布局和共享输入框的挂载位置，不持有消息或发送状态。
+
 ## 新增页面
 
 1. 在 `src/<name>/` 下新建 `index.html`、`main.ts`、`styles.css`。
