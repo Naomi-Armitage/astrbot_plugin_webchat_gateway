@@ -490,17 +490,13 @@ header h1 {
 }
 
 .msg {
+  min-width: 0;
   padding: 10px 14px;
   font: 14.5px/1.55 var(--font-display);
   white-space: pre-wrap;
-  /* `overflow-wrap: break-word` breaks at word boundaries first and only
-     breaks mid-word for genuinely unbreakable runs (long URLs, base64
-     blobs). The previous `word-break: break-word` was aggressive — it
-     split ordinary words at character boundaries, producing the
-     "怪异换行" that affected both user and bot bubbles. CJK characters
-     are individually break-eligible under `word-break: normal`, so
-     this preserves natural Chinese / Japanese line breaking too. */
-  overflow-wrap: break-word;
+  /* Include emergency breaks in intrinsic sizing so long URLs and other
+     unbroken text cannot force a flex item wider than its message row. */
+  overflow-wrap: anywhere;
   word-break: normal;
   background: var(--card);
   border: 1px solid var(--rule);
@@ -1284,7 +1280,7 @@ footer textarea:focus {
 }
 .msg .msg-text {
   white-space: pre-wrap;
-  overflow-wrap: break-word;
+  overflow-wrap: anywhere;
   word-break: normal;
 }
 
@@ -1622,6 +1618,7 @@ body.lightbox-open { overflow: hidden; }
 .msg-row {
   display: flex;
   flex-direction: column;
+  min-width: 0;
   gap: 2px;
   /* 78% of .message-list — definite percentage (since .message-list has a
      defined width from the flex layout), avoiding the circular
@@ -1645,7 +1642,12 @@ body.lightbox-open { overflow: hidden; }
 /* The bubble's own animation now lives on the row (above) so the
    inner element doesn't re-animate during a regenerate innerHTML
    swap. Bubbles wrapped in .msg-row no longer need it. */
-.msg-row > .msg { animation: none; }
+.msg-row > .msg {
+  /* The row owns the width cap. Stretch its bubble to that resolved width
+     so preformatted content scrolls inside it without widening the page. */
+  align-self: stretch;
+  animation: none;
+}
 
 .msg-actions {
   display: inline-flex;
