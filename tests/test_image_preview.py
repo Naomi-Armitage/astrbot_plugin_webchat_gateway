@@ -1,0 +1,178 @@
+"""Preview pixels, memory bounds, and authenticated HTTP delivery."""
+
+import asyncio
+from io import BytesIO
+from random import Random
+from unittest.mock import AsyncMock
+
+import pytest
+from aiohttp.test_utils import make_mocked_request
+from PIL import Image
+
+from astrbot_plugin_webchat_gateway.core.image_preview import (
+    ImagePreviewCache,
+    make_image_preview,
+)
+from test_drop_handlers import _make_harness
+
+
+def image_bytes(mode="RGB", size=(1600, 800), format="PNG", **kwargs):
+    with Image.new(mode, size) as source:
+        output = BytesIO()
+        source.save(output, format=format, **kwargs)
+        return output.getvalue()
+
+
+def test_preview_preserves_orientation_and_does_not_upscale():
+    exif = Image.Exif()
+    exif[274] = 6  # A phone photo stored sideways.
+    content = image_bytes(format="JPEG", exif=exif)
+    with Image.open(BytesIO(make_image_preview(content))) as preview:
+        assert preview.size == (320, 640)
+        assert not preview.getexif()
+    with Image.open(BytesIO(make_image_preview(image_bytes(size=(32, 16))))) as preview:
+        assert preview.size == (32, 16)
+
+
+@pytest.mark.parametrize("format", ["PNG", "WEBP", "GIF"])
+def test_transparent_images_keep_alpha(format):
+    content = image_bytes(mode="RGBA", size=(20, 10), format=format)
+    with Image.open(BytesIO(make_image_preview(content))) as preview:
+        assert preview.getpixel((0, 0))[3] == 0
+
+
+def test_pixel_limit_checked_before_decoding(monkeypatch):
+    from astrbot_plugin_webchat_gateway.core import image_preview
+
+    monkeypatch.setattr(image_preview, "PIL_MAX_PIXELS", 100)
+    with pytest.raises(ValueError, match="pixel limit"):
+        make_image_preview(image_bytes(size=(20, 20)))
+
+
+@pytest.mark.asyncio
+async def test_cache_reuses_previews_and_evicts_by_bytes():
+    content = image_bytes(size=(64, 32))
+    store = AsyncMock()
+    store.read.return_value = content
+    cache = ImagePreviewCache(max_bytes=len(make_image_preview(content)) * 2)
+    for key in ("one", "two", "one", "three", "one", "two"):
+        assert await cache.read(store, storage_key=key)
+    assert [call.kwargs["storage_key"] for call in store.read.call_args_list] == [
+        "one", "two", "three", "two",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_missing_sources_are_not_cached():
+    store = AsyncMock()
+    store.read.side_effect = [None, image_bytes(size=(32, 16))]
+    cache = ImagePreviewCache()
+    assert await cache.read(store, storage_key="missing") is None
+    assert await cache.read(store, storage_key="missing")
+
+
+@pytest.mark.asyncio
+async def test_concurrent_source_reads_are_bounded():
+    pending = active = peak = 0
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def read(**kwargs):
+        nonlocal pending, active, peak
+        active += 1
+        pending += 1
+        peak = max(peak, active)
+        if pending == 2:
+            entered.set()
+        await release.wait()
+        active -= 1
+        return None
+
+    store = AsyncMock()
+    store.read.side_effect = read
+    cache = ImagePreviewCache()
+    tasks = [asyncio.create_task(cache.read(store, storage_key=str(i))) for i in range(8)]
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        assert pending == 2
+    finally:
+        release.set()
+        await asyncio.gather(*tasks)
+    assert peak == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["drop", "chat", "r2_direct"])
+async def test_large_jpeg_preview_and_original_delivery(tmp_path, route):
+    from astrbot_plugin_webchat_gateway.core.auth import generate_token, hash_token
+    from astrbot_plugin_webchat_gateway.handlers.drop import make_drop_serve_handler
+    from astrbot_plugin_webchat_gateway.handlers.files import UploadDeps, make_serve_handler
+
+    storage, audit, _bus, guard, store, deps, headers, name = await _make_harness(tmp_path)
+    # Real, noisy JPEG over 5 MB, matching the original Drop failure.
+    with Image.frombytes("RGB", (2600, 1800), Random(0).randbytes(2600 * 1800 * 3)) as source:
+        output = BytesIO()
+        source.save(output, format="JPEG", quality=98)
+        original = output.getvalue()
+    assert len(original) > 5 * 1024 * 1024
+    file_id = "a" * 16
+    key = f"{name}/{file_id}.jpg"
+    await store.save(storage_key=key, content=original, mime="image/jpeg")
+    await storage.insert_file(
+        file_id=file_id, token_name=name, session_id="drop" if route == "drop" else "chat",
+        mime="image/jpeg", size_bytes=len(original), storage_key=key,
+        now=1, filename="photo.jpeg",
+    )
+    store.signed_url = AsyncMock(return_value="https://example.test/original.jpg")
+    if route == "drop":
+        handler = make_drop_serve_handler(deps)
+        url = f"/api/webchat/drop/files/{file_id}"
+    else:
+        handler = make_serve_handler(UploadDeps(
+            storage=storage, audit=audit, ip_guard=guard, file_store=store,
+            upload_gate=deps.upload_gate, allowed_origins={"*"}, max_file_size_mb=20,
+            per_token_storage_mb=100, allowed_mime=("image/jpeg",),
+            storage_driver="r2" if route == "r2_direct" else "local",
+            r2_serving_mode="direct", r2_direct_link_ttl_seconds=300,
+            files_serve_prefix="/api/webchat/files/", trust_forwarded_for=False,
+            allow_missing_origin=True,
+        ))
+        url = f"/api/webchat/files/{file_id}"
+    async def get(query="", auth=headers):
+        return await handler(make_mocked_request(
+            "GET", url + query, headers=auth, match_info={"file_id": file_id},
+        ))
+
+    try:
+        response = await get("?preview=1")
+        assert response.status == 200
+        assert response.headers["Content-Type"] == "image/webp"
+        assert response.headers["Content-Disposition"].startswith("inline")
+        assert response.headers["Cache-Control"].startswith("private")
+        preview = response.body
+        assert len(preview) < len(original) // 10
+        with Image.open(BytesIO(preview)) as image:
+            image.load()
+            assert max(image.size) == 640
+        store.signed_url.assert_not_called()
+
+        # Cached bytes must still require authorization on every request.
+        assert (await get("?preview=1", auth={})).status == 401
+        other = generate_token()
+        await storage.create_token(name="bob", token_hash=hash_token(other), daily_quota=10, note="", now=1)
+        assert (await get("?preview=1", auth={"Authorization": f"Bearer {other}"})).status == 404
+
+        response = await get()
+        if route == "r2_direct":
+            assert response.status == 302
+            store.signed_url.assert_awaited_once()
+        else:
+            assert response.headers["Content-Type"] == "image/jpeg"
+            assert response.body == original
+        if route == "drop":
+            response = await get("?preview=1&download=1")
+            assert response.headers["Content-Disposition"].startswith("attachment")
+            assert "photo.jpeg" in response.headers["Content-Disposition"]
+            assert response.body == original
+    finally:
+        await storage.close()

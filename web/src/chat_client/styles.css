@@ -1834,9 +1834,35 @@ body.lightbox-open { overflow: hidden; }
 .message-load-older:hover:not(:disabled) { color: var(--accent-strong); border-color: var(--accent); background: var(--accent-soft); }
 .message-load-older:disabled { opacity: .6; cursor: wait; }
 .msg-file { display: flex; align-items: center; gap: 8px; color: inherit; text-decoration: none; }
+.msg-file-icon {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 48px;
+  height: 54px;
+  padding-top: 8px;
+  box-sizing: border-box;
+  border: 1px solid var(--accent);
+  border-radius: 5px 12px 5px 5px;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font: 700 10px/1 var(--font-ui);
+  white-space: nowrap;
+}
+.msg-file-icon::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 11px;
+  height: 11px;
+  border-left: 1px solid var(--accent);
+  border-bottom: 1px solid var(--accent);
+  border-radius: 0 10px 0 3px;
+}
 .msg-file-details { display: flex; flex-direction: column; min-width: 0; }
 .msg-file-name { overflow-wrap: anywhere; }
 .msg-file-meta { font: 12px/1.5 var(--font-ui); opacity: .75; }
-.msg-image-load { margin-top: 8px; border: 1px solid var(--rule); background: var(--card); color: var(--ink); border-radius: 7px; padding: 5px 8px; cursor: pointer; font: inherit; }
 .composer-chip.file-chip { width: 150px; }
 .composer-file-name { padding: 8px 22px 8px 8px; font: 12px/1.4 var(--font-ui); overflow: hidden; overflow-wrap: anywhere; }

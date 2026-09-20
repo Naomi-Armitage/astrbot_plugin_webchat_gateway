@@ -5,6 +5,11 @@
 
 ## Unreleased
 
+### Fixed — 图片预览与文件识别
+- 聊天与 Drop 的图片气泡改用最长边 640px 的缩略图，修复大 JPEG 直接加载原图导致的预览问题；点击仍查看原图，下载保留原文件。
+- Drop 文件气泡增加后缀图标，最多显示四个字符，超出以省略号截断。
+- 图片鉴权重试保留预览参数，避免失败重试变成原图下载。
+
 ### Added — Drop 多端自传
 - 侧栏固定一个 Drop 会话：同一 token 的多端可互传文字与任意文件，**LLM 不参与、不扣每日配额、不污染 CM 历史**。原本 Drop-like 行为依赖 MS Edge；本插件提供等价功能（多端跨设备笔记/小文件传输）且符合 WebChat Gateway 的存算约束。
 - 新表 `webchat_drop_messages`（v5 → v6 迁移）：每行 `{id, token_name, device_id, device_name, kind: text|file, text, file_id?, filename, mime, size_bytes, created_at, deleted_at}`。LLM 上下文（AstrBot CM）完全不接触这些行——TECH_DEBT §1 警告的 user/assistant 配对语义污染不会发生。

@@ -44,6 +44,7 @@ from ..core.file_cookie import (
     verify as verify_file_cookie,
 )
 from ..core.file_store import FileStore, FileStoreUnavailable
+from ..core.image_preview import ImagePreviewCache, PREVIEW_MIME
 from ..core.image_util import (
     ALLOWED_MIME_TO_EXT,
     detect_image_mime_async,
@@ -444,10 +445,12 @@ def make_serve_handler(deps: UploadDeps):
     token_name MUST match `webchat_files.token_name`. Cross-token
     returns 404 (NOT 403) — no existence-by-timing leak.
 
-    R2 + direct mode → 302 to a short-lived presigned URL.
+    ?preview=1 → a cached, resized WebP, including in R2-direct mode.
+    Original images in R2 + direct mode → a short-lived presigned URL.
     Local OR R2-proxy → bytes streamed back with stored MIME and a
     24-hour private cache header.
     """
+    previews = ImagePreviewCache()
 
     async def handle(request: web.Request) -> web.StreamResponse:
         origin = extract_origin(
@@ -662,9 +665,11 @@ def make_serve_handler(deps: UploadDeps):
                 same_origin_host=same_host,
             )
 
+        preview = request.query.get("preview") == "1" and row.mime in ALLOWED_MIME_TO_EXT
         if (
             deps.storage_driver == "r2"
             and deps.r2_serving_mode == "direct"
+            and not preview
         ):
             try:
                 signed = await deps.file_store.signed_url(
@@ -689,7 +694,10 @@ def make_serve_handler(deps: UploadDeps):
             # behaviour). The PLAN allows this graceful degradation.
 
         try:
-            payload = await deps.file_store.read(storage_key=row.storage_key)
+            if preview:
+                payload = await previews.read(deps.file_store, storage_key=row.storage_key)
+            else:
+                payload = await deps.file_store.read(storage_key=row.storage_key)
         except FileStoreUnavailable:
             # Backend unreachable (R2 outage, transient network) — 503
             # so the client knows to retry rather than caching the
@@ -734,7 +742,7 @@ def make_serve_handler(deps: UploadDeps):
             status=200,
             headers={
                 **cors,
-                "Content-Type": row.mime,
+                "Content-Type": PREVIEW_MIME if preview else row.mime,
                 "Cache-Control": "private, max-age=86400",
                 # Defense in depth: lock the browser to the stored MIME
                 # so a future relax of the allowed_mime whitelist (e.g.

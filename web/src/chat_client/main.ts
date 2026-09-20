@@ -910,8 +910,9 @@ function addMessageBubble(
       const img = document.createElement("img");
       img.className = "msg-image";
       img.loading = "lazy";
+      img.decoding = "async";
       img.alt = "";
-      img.src = srcFor(a);
+      img.src = srcFor(a) + "?preview=1";
       attachImgErrorRetry(img);
       const captureIdx = i;
       img.addEventListener("click", () => openLightbox(list, captureIdx, srcFor, img.ownerDocument));
@@ -2629,7 +2630,6 @@ function applyEvent(ev: ServerEvent): void {
       dropHasMore = false;
       dropBefore = null;
       dropLoadingOlder = false;
-      dropLoadedImages.clear();
       dropHistoryVersion += 1;
       invalidateDropUploads();
       if (dropOpen) renderDropMessages();
@@ -3455,8 +3455,6 @@ let dropMessages: DropMessage[] = [];
 let dropHasMore = false;
 let dropBefore: number | null = null;
 let dropLoadingOlder = false;
-const dropLoadedImages = new Set<string>();
-const DROP_LARGE_IMAGE_BYTES = 5 * 1024 * 1024;
 const DROP_PAGE_SIZE = 50;
 const DROP_FALLBACK_REFRESH_MS = 15_000;
 // New requests, events and successful mutations invalidate older list responses.
@@ -3519,23 +3517,16 @@ function isDropImage(mime: string | undefined): boolean {
   return mime === "image/jpeg" || mime === "image/png" || mime === "image/webp" || mime === "image/gif";
 }
 
-function shouldAutoLoadDropImage(size: number | undefined): boolean {
-  const connection = (navigator as Navigator & { connection?: { type?: string; effectiveType?: string; saveData?: boolean } }).connection;
-  const constrained = connection?.saveData === true
-    || connection?.type === "cellular"
-    || connection?.effectiveType === "slow-2g"
-    || connection?.effectiveType === "2g"
-    || connection?.effectiveType === "3g";
-  // effectiveType describes speed, not transport: fast cellular can also
-  // report "4g". Only a known Wi-Fi/wired connection may auto-load large images.
-  const knownFixedNetwork = connection?.type === "wifi"
-    || connection?.type === "ethernet";
-  // Unknown sizes always require an explicit load action.
-  if (typeof size !== "number" || !Number.isFinite(size) || size < 0) {
-    return false;
-  }
-  if (size <= DROP_LARGE_IMAGE_BYTES) return true;
-  return knownFixedNetwork && !constrained;
+function createFileTypeIcon(filename: string | undefined): HTMLElement {
+  const icon = document.createElement("span");
+  icon.className = "msg-file-icon";
+  icon.setAttribute("aria-hidden", "true");
+  const dot = filename?.lastIndexOf(".") ?? -1;
+  const extension = dot > 0 ? filename!.slice(dot + 1).toUpperCase() : "";
+  const letters = Array.from(extension || "FILE");
+  icon.textContent = letters.slice(0, 4).join("") + (letters.length > 4 ? "…" : "");
+  icon.title = extension || "文件";
+  return icon;
 }
 
 function clearDropFallbackTimer(): void {
@@ -3601,13 +3592,12 @@ function renderDropMessages(options: { forceBottom?: boolean } = {}): void {
     const cached = existing.get(item.id);
     if (cached) { children.push(cached); continue; }
     const image = !!item.file_id && isDropImage(item.mime);
-    const shouldLoad = image && (dropLoadedImages.has(item.file_id!) || shouldAutoLoadDropImage(item.size));
-    const attachments = shouldLoad ? [{ file_id: item.file_id!, mime: item.mime! }] : undefined;
+    const attachments = image ? [{ file_id: item.file_id!, mime: item.mime! }] : undefined;
     const bubble = addMessageBubble(item.device_id === dropDeviceId ? "user" : "bot", item.text, attachments, undefined, {
       target: dropMessagesEl, dropMessage: item, scroll: false,
     });
     children.push(bubble.closest<HTMLElement>(".msg-row")!);
-    if (item.kind === "file" && item.file_id && !shouldLoad) {
+    if (item.kind === "file" && item.file_id && !image) {
       const link = document.createElement("a");
       link.className = "msg-file";
       link.href = DROP_FILE_URL(item.file_id) + "?download=1";
@@ -3615,16 +3605,7 @@ function renderDropMessages(options: { forceBottom?: boolean } = {}): void {
       const details = document.createElement("span"); details.className = "msg-file-details";
       const name = document.createElement("span"); name.className = "msg-file-name"; name.textContent = item.filename || "文件";
       const meta = document.createElement("span"); meta.className = "msg-file-meta"; meta.textContent = dropFileSize(item.size);
-      details.append(name, meta); link.append(details); bubble.append(link);
-      if (image) {
-        const load = document.createElement("button"); load.type = "button"; load.className = "msg-image-load"; load.textContent = "加载图片";
-        load.onclick = () => {
-          dropLoadedImages.add(item.file_id!);
-          bubble.closest(".msg-row")?.remove();
-          renderDropMessages();
-        };
-        bubble.append(load);
-      }
+      details.append(name, meta); link.append(createFileTypeIcon(item.filename), details); bubble.append(link);
     }
   }
   // Keep unchanged rows mounted so live updates preserve keyboard focus,
@@ -3768,8 +3749,6 @@ async function deleteDropMessage(id: number): Promise<void> {
     if (resp.status === 401) { handle401(); return; }
     if (!resp.ok && resp.status !== 404) throw new Error("HTTP " + resp.status);
     dropLoadSeq += 1;
-    const removed = dropMessages.find((m) => m.id === id);
-    if (removed?.file_id) dropLoadedImages.delete(removed.file_id);
     dropMessages = dropMessages.filter((m) => m.id !== id);
     if (dropOpen) renderDropMessages();
   } catch (e) { dropStatusText("删除失败：" + (e as Error).message, true); }
@@ -4483,7 +4462,9 @@ function fileServeUrl(file_id: string): string {
 const _imgRetriedAt = new Map<string, number>();
 function attachImgErrorRetry(img: HTMLImageElement): void {
   img.addEventListener("error", () => {
-    const base = img.src.split("?")[0] || img.src;
+    const retryUrl = new URL(img.src);
+    retryUrl.searchParams.delete("_r");
+    const base = retryUrl.href;
     const last = _imgRetriedAt.get(base);
     if (last !== undefined && Date.now() - last < 60_000) return;
     _imgRetriedAt.set(base, Date.now());
@@ -4491,8 +4472,12 @@ function attachImgErrorRetry(img: HTMLImageElement): void {
       // Cache-bust so the browser re-fetches even though the URL is
       // structurally identical. The new fetch carries the freshly
       // issued cookie via the same-origin path.
-      img.src = "";
-      img.src = base + "?_r=" + Date.now();
+      // A lightbox may have moved to another attachment during the probe.
+      const currentUrl = new URL(img.src);
+      currentUrl.searchParams.delete("_r");
+      if (currentUrl.href !== base) return;
+      retryUrl.searchParams.set("_r", String(Date.now()));
+      img.src = retryUrl.href;
     }).catch(() => {});
   });
 }

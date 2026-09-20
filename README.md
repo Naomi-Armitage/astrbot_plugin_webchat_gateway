@@ -306,6 +306,8 @@ MIME 通过 Pillow `verify()` 检测（不信任客户端 Content-Type），允�
 
 Drop 是聊天页左侧固定的虚拟会话（session_id 留字面量 `drop`）。同一 token 的多端可互传文字与任意文件 ——LLM 不参与，不扣每日配额，文件与图片上传共用 `uploads.per_token_storage_mb`。所有写端点 `drop.enabled=false` 时返回 `403 drop_disabled`；服务路由始终存活以便旧链接仍可下载。所有端点 bearer 鉴权（Cookie 路径同 `/files/{id}`），事件复用 `{prefix}/events` 长轮询（事件类型 `drop_message_added` / `drop_message_deleted` / `drop_history_cleared`）。
 
+聊天和 Drop 的图片消息自动加载 `?preview=1` 缩略图（最长边 640px，WebP；动图取首帧），点击后查看原图。该参数适用于 `/files/{file_id}` 和 `/drop/files/{file_id}`，沿用原文件鉴权；预览在后台线程按需生成，并使用有容量上限的内存缓存，不修改原文件。Drop 的 `?download=1` 始终下载原文件。文件气泡带后缀图标，后缀最多显示四个字符，超出显示省略号。
+
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `{prefix}/drop/send` | body `{text?, attachments?, device_id, device_name}`：文字 + 文件附件（file_id 必须是本 token 已上传到 `/drop/upload` 的）。返回 `{messages:[{id, device_id, device_name, kind: "text"|"file", text, file_id?, filename?, mime?, size?, created_at}, ...]}`。`device_id` 服务端不存，仅按 `^[A-Za-z0-9_\-.:]{8,64}$` 校验；`device_name` 走 UA 推导 + 客户端 localStorage 覆盖。失败码：`invalid_payload` / `invalid_device_id` / `invalid_attachment` / `text_too_long` / `storage_quota_exceeded` / `drop_disabled`。 |

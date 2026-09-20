@@ -53,6 +53,7 @@ from ..core.file_lifecycle import (
     release_files_safely,
 )
 from ..core.file_store import FileStore, FileStoreUnavailable
+from ..core.image_preview import ImagePreviewCache, PREVIEW_MIME
 from ..core.image_util import detect_image_mime_async, ext_for_mime
 from ..core.ip_guard import IpGuard
 from ..core.ratelimit import PerTokenUploadGate
@@ -1311,6 +1312,7 @@ def make_drop_serve_handler(deps: DropDeps):
         FILE_AUTH_COOKIE_NAME,
         verify as verify_file_cookie,
     )
+    previews = ImagePreviewCache()
 
     async def handle(request: web.Request) -> web.StreamResponse:
         origin = extract_origin(
@@ -1463,8 +1465,15 @@ def make_drop_serve_handler(deps: DropDeps):
                 same_origin_host=same_host,
             )
 
+        normalized_mime = (row.mime or "").split(";", 1)[0].strip().lower()
+        force_download = request.query.get("download", "") == "1"
+        is_image = normalized_mime in _INLINE_DROP_MIME and not force_download
+        preview = is_image and request.query.get("preview") == "1"
         try:
-            payload = await deps.file_store.read(storage_key=row.storage_key)
+            if preview:
+                payload = await previews.read(deps.file_store, storage_key=row.storage_key)
+            else:
+                payload = await deps.file_store.read(storage_key=row.storage_key)
         except FileStoreUnavailable:
             logger.exception(
                 "[WebChatGateway] drop file_store.read backend unavailable"
@@ -1489,12 +1498,9 @@ def make_drop_serve_handler(deps: DropDeps):
                 same_origin_host=same_host,
             )
 
-        normalized_mime = (row.mime or "").split(";", 1)[0].strip().lower()
         # Images remain inline for the Drop thumbnail path by default. A
         # caller can explicitly request a download (the adjacent client
         # download button) without fetching the response into JS memory.
-        force_download = request.query.get("download", "") == "1"
-        is_image = normalized_mime in _INLINE_DROP_MIME and not force_download
         cors = build_cors_headers(origin, allowed, same_origin_host=same_host)
         if is_image:
             disposition = 'inline'
@@ -1525,7 +1531,9 @@ def make_drop_serve_handler(deps: DropDeps):
             status=200,
             headers={
                 **cors,
-                "Content-Type": normalized_mime or "application/octet-stream",
+                "Content-Type": (
+                    PREVIEW_MIME if preview else normalized_mime or "application/octet-stream"
+                ),
                 "Cache-Control": "private, max-age=86400",
                 "X-Content-Type-Options": "nosniff",
                 "Content-Disposition": disposition_value,
