@@ -169,10 +169,12 @@ export class ConversationPanel {
 
   get externalVisible(): boolean { return !!this.picture.window && !this.picture.window.document.hidden; }
 
-  open(): void {
+  open(requestPictureWindow = true): void {
     this.opened = true;
     this.render();
-    if (this.layout === "float") void this.openPictureWindow();
+    // Reload restoration has no user activation; keep the float in-page until
+    // the user selects the floating layout to request a native window again.
+    if (requestPictureWindow && this.layout === "float") void this.openPictureWindow();
   }
 
   private async openPictureWindow(): Promise<void> {

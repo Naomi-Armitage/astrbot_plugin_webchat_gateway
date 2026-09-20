@@ -61,6 +61,8 @@ const DROP_UPLOAD_URL = API + "/drop/upload";
 const DROP_MESSAGES_URL = API + "/drop/messages";
 const DROP_FILE_URL = (id: string): string => API + "/drop/files/" + encodeURIComponent(id);
 const LS_DROP_DEVICE = "wcg.drop.device_id";
+// Per-tab view state survives a reload without changing other tabs' views.
+const SS_DROP_OPEN = "wcg.drop.open";
 // Per-message action endpoints. `sid` and `index` are URL-segments — the
 // server's path layout matches cfg.conversations_message_path and
 // cfg.conversations_regenerate_path.
@@ -3281,7 +3283,7 @@ function renderSessionList(): void {
 function switchSession(id: string): void {
   if (!store.sessions[id]) return;
   composerContext += 1;
-  if (dropOpen && dropPanelController.isExclusive) closeDrop(false);
+  if (!dropOpen || dropPanelController.isExclusive) closeDrop(false);
   if (id !== store.activeId) {
     // Leaving this session abandons any non-streaming send started under it;
     // cancel it so it can't hold the connection (streaming sends self-recover
@@ -3905,7 +3907,15 @@ function refreshComposerContext(): void {
   autosizeInput();
   autosizeComposer(dropComposer);
 }
+function rememberDropOpen(open: boolean): void {
+  try {
+    if (open) sessionStorage.setItem(SS_DROP_OPEN, "1");
+    else sessionStorage.removeItem(SS_DROP_OPEN);
+  } catch { /* The panel still works when storage is unavailable. */ }
+}
 function closeDrop(restoreFocus = true): void {
+  // Also cancel a pending restore if the user picks a chat before /site loads.
+  rememberDropOpen(false);
   if (!dropOpen) return;
   dropOpen = false;
   clearDropFallbackTimer();
@@ -3916,11 +3926,12 @@ function closeDrop(restoreFocus = true): void {
   updateRefreshButtonState();
   if (restoreFocus) inputEl.focus();
 }
-function openDrop(): void {
+function openDrop(restoring = false): void {
   if (dropOpen) { dropComposer.inputEl.focus(); return; }
   dropOpen = true;
+  rememberDropOpen(true);
   dropMessagesEl.hidden = false;
-  dropPanelController.open();
+  dropPanelController.open(!restoring);
   dropEntry.setAttribute("aria-expanded", "true");
   cancelLongPress();
   closeAllRevealedActions();
@@ -3929,12 +3940,12 @@ function openDrop(): void {
   renderSessionList();
   void loadDropMessages({ preserveOlder: true });
   updateDropFallbackPolling();
-  dropComposer.inputEl.focus();
+  if (!restoring) dropComposer.inputEl.focus();
 }
 
 function newSession(): void {
   composerContext += 1;
-  if (dropOpen && dropPanelController.isExclusive) closeDrop(false);
+  if (!dropOpen || dropPanelController.isExclusive) closeDrop(false);
   cancelInflightSend();
   const fresh = blankSession();
   store.sessions[fresh.id] = fresh;
@@ -4006,6 +4017,12 @@ async function loadChatSite(): Promise<void> {
     const dropConfig = data.drop as { enabled?: boolean; max_file_size_mb?: number } | undefined;
     dropEntry.hidden = !(dropConfig && dropConfig.enabled !== false);
     if (dropConfig && typeof dropConfig.max_file_size_mb === "number" && dropConfig.max_file_size_mb > 0) dropMaxFileBytes = dropConfig.max_file_size_mb * 1024 * 1024;
+    if (dropEntry.hidden) rememberDropOpen(false);
+    else {
+      let restoreDrop = false;
+      try { restoreDrop = sessionStorage.getItem(SS_DROP_OPEN) === "1"; } catch {}
+      if (restoreDrop) openDrop(true);
+    }
     const imageEnabled = !!(data.image_gen && data.image_gen.enabled);
     imageGenerationEnabled = imageEnabled;
     // img2img (reference-image edit) capability. Only true when the server
@@ -6137,6 +6154,7 @@ $<HTMLButtonElement>("logout").onclick = () => {
   clearTimer("probeTimer");
   clearTimer("retryTimer");
   clearDropFallbackTimer();
+  rememberDropOpen(false);
   // Server-clear the wcg_file cookie + record server-side logout. The
   // cookie is HttpOnly so JS can't touch it directly; the response's
   // Set-Cookie header is what the browser commits. We POST under the
