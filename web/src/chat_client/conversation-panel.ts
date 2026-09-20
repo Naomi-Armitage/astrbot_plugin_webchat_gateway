@@ -43,7 +43,7 @@ interface PanelElements {
   composer: HTMLElement;
   header: HTMLElement;
   resizeHandle: HTMLElement;
-  layoutSelect: HTMLSelectElement;
+  layoutSwitch: HTMLElement;
   closeButton: HTMLButtonElement;
 }
 interface PanelOptions {
@@ -84,7 +84,7 @@ export class ConversationPanel {
       options.onExternalChange();
     }, options.onDocument);
     elements.panel.before(this.panelMount);
-    elements.layoutSelect.before(this.layoutMount);
+    elements.layoutSwitch.before(this.layoutMount);
     const viewport = this.viewport();
     this.geometry = fitPanelGeometry({
       width: viewport.width * .34, height: viewport.height * .75,
@@ -96,16 +96,25 @@ export class ConversationPanel {
       this.geometry = parsePanelGeometry(localStorage.getItem(GEOMETRY_KEY)) ?? this.geometry;
     } catch { /* Storage may be unavailable in private browsing. */ }
     const eventOptions = { signal: this.events.signal };
-    elements.layoutSelect.addEventListener("change", () => {
-      const layout = elements.layoutSelect.value;
-      if (layout !== "full" && layout !== "float" && layout !== "dock") return;
-      this.finishGesture(false);
-      this.preferred = layout;
-      this.persist();
-      if (layout !== "float") this.picture.close();
-      this.render();
-      if (this.layout === "float") void this.openPictureWindow();
-      options.onExternalChange();
+    elements.layoutSwitch.addEventListener("click", (event) => {
+      const button = (event.target as Element).closest<HTMLButtonElement>("button[data-layout]");
+      if (!button || button.disabled) return;
+      const layout = button.dataset.layout;
+      if (layout === "full" || layout === "float" || layout === "dock") this.selectLayout(layout);
+    }, eventOptions);
+    elements.layoutSwitch.addEventListener("keydown", (event) => {
+      const buttons = [...elements.layoutSwitch.querySelectorAll<HTMLButtonElement>("button:not(:disabled)")];
+      const current = buttons.indexOf(elements.layoutSwitch.ownerDocument.activeElement as HTMLButtonElement);
+      if (current < 0) return;
+      let next: number;
+      if (event.key === "ArrowRight" || event.key === "ArrowDown") next = (current + 1) % buttons.length;
+      else if (event.key === "ArrowLeft" || event.key === "ArrowUp") next = (current - 1 + buttons.length) % buttons.length;
+      else if (event.key === "Home") next = 0;
+      else if (event.key === "End") next = buttons.length - 1;
+      else return;
+      event.preventDefault();
+      buttons[next]!.click();
+      buttons[next]!.focus();
     }, eventOptions);
     elements.closeButton.addEventListener("click", options.onClose, eventOptions);
     window.addEventListener("resize", () => {
@@ -146,6 +155,16 @@ export class ConversationPanel {
     }, eventOptions);
   }
 
+  private selectLayout(layout: PanelLayout): void {
+    this.finishGesture(false);
+    this.preferred = layout;
+    this.persist();
+    if (layout !== "float") this.picture.close();
+    this.render();
+    if (this.layout === "float") void this.openPictureWindow();
+    this.options.onExternalChange();
+  }
+
   get isExclusive(): boolean { return this.opened && this.layout === "full"; }
 
   get externalVisible(): boolean { return !!this.picture.window && !this.picture.window.document.hidden; }
@@ -172,12 +191,12 @@ export class ConversationPanel {
     this.finishGesture(false);
     this.opened = false;
     this.picture.close();
-    const { panel, chatMessages, chatComposer, workspace, layoutSelect, closeButton } = this.elements;
+    const { panel, chatMessages, chatComposer, workspace, layoutSwitch, closeButton } = this.elements;
     this.panelMount.after(panel);
     chatComposer.hidden = false;
-    this.layoutMount.after(layoutSelect);
+    this.layoutMount.after(layoutSwitch);
     this.setHeaderMovable(false);
-    layoutSelect.hidden = true;
+    layoutSwitch.hidden = true;
     closeButton.hidden = true;
     panel.hidden = true;
     chatMessages.hidden = false;
@@ -203,7 +222,7 @@ export class ConversationPanel {
 
   private render(): void {
     if (!this.opened) return;
-    const { panel, workspace, main, chatMessages, chatComposer, composer, header, layoutSelect, closeButton, resizeHandle } = this.elements;
+    const { panel, workspace, main, chatMessages, chatComposer, composer, header, layoutSwitch, closeButton, resizeHandle } = this.elements;
     const focused = panel.ownerDocument.activeElement as HTMLElement | null;
     const messages = panel.querySelector<HTMLElement>(".message-list");
     const scrollTop = messages?.scrollTop ?? 0;
@@ -215,17 +234,23 @@ export class ConversationPanel {
     }
     if (composer.parentElement !== panel) panel.append(composer);
     header.hidden = this.layout === "full";
-    if (this.layout === "full") this.layoutMount.after(layoutSelect);
-    else header.querySelector(".actions")!.prepend(layoutSelect);
+    if (this.layout === "full") this.layoutMount.after(layoutSwitch);
+    else header.querySelector(".actions")!.prepend(layoutSwitch);
     panel.hidden = false;
     panel.dataset.layout = this.layout;
     workspace.dataset.panelLayout = this.layout;
     panel.setAttribute("role", this.layout === "float" ? "dialog" : "region");
-    layoutSelect.value = this.layout;
-    layoutSelect.hidden = !this.picture.window && window.innerWidth < 720;
+    layoutSwitch.hidden = !this.picture.window && window.innerWidth < 720;
     closeButton.hidden = this.layout === "full";
-    for (const option of layoutSelect.options) {
-      option.disabled = option.value !== "float" && effectivePanelLayout(option.value as PanelLayout, window.innerWidth) !== option.value;
+    for (const button of layoutSwitch.querySelectorAll<HTMLButtonElement>("button[data-layout]")) {
+      const mode = button.dataset.layout as PanelLayout;
+      const selected = mode === this.layout;
+      button.setAttribute("aria-checked", String(selected));
+      button.tabIndex = selected ? 0 : -1;
+      button.disabled = mode !== "float" && effectivePanelLayout(mode, window.innerWidth) !== mode;
+      if (mode === "float") button.title = window.documentPictureInPicture
+        ? "浮窗：悬浮在其他窗口上方" : "浮窗：当前浏览器仅支持页内悬浮";
+      if (mode === "dock") button.title = button.disabled ? "右侧栏：需要更宽的窗口" : "右侧栏";
     }
     chatMessages.hidden = this.layout === "full";
     chatMessages.inert = false;
@@ -236,7 +261,7 @@ export class ConversationPanel {
     if (inPageFloat) this.paintGeometry();
     else for (const name of ["left", "top", "width", "height"]) panel.style.removeProperty(name);
     if (focused && (panel.contains(focused) || header.contains(focused))) {
-      if (focused === layoutSelect && layoutSelect.hidden) composer.querySelector("textarea")?.focus({ preventScroll: true });
+      if (layoutSwitch.contains(focused) && layoutSwitch.hidden) composer.querySelector("textarea")?.focus({ preventScroll: true });
       else if (focused !== panel.ownerDocument.activeElement) focused.focus({ preventScroll: true });
     }
     this.options.onLayout();

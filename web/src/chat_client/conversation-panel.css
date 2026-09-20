@@ -8,6 +8,37 @@
   container: conversation / inline-size;
 }
 .conversation-panel[hidden] { display: none; }
+.actions .layout-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--rule);
+  border-radius: 9px;
+  background: var(--paper-deep);
+}
+.actions .layout-switch[hidden] { display: none; }
+.actions .layout-switch button {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 26px;
+  padding: 4px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink-soft);
+}
+.actions .layout-switch svg { width: 16px; height: 16px; pointer-events: none; stroke-linecap: round; stroke-linejoin: round; }
+.actions .layout-switch button:hover:not(:disabled) { background: var(--accent-soft); color: var(--accent); }
+.actions .layout-switch button[aria-checked="true"] {
+  color: var(--accent-strong);
+  background: var(--card);
+  box-shadow: 0 1px 3px var(--shadow-strong);
+}
+.actions .layout-switch button:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
+.actions .layout-switch button:disabled { opacity: .35; cursor: default; }
+.conversation-panel header h1 { display: block; }
 .conversation-panel[data-layout="full"] { flex: 1; }
 .conversation-panel[data-layout="dock"],
 .conversation-panel[data-layout="float"] {

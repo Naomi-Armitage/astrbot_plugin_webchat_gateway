@@ -325,7 +325,7 @@ $("dropPanel").append(dropComposer.root);
 const composerView = (target: ComposerTarget) => target === "drop" ? dropComposer : chatComposer;
 const dropHeader = $("chatHeader").cloneNode(true) as HTMLElement;
 dropHeader.id = "dropHeader";
-for (const selector of ["#sidebarToggle", ".brand", "#who", "#syncStatus", "#quotaBadge", "#themeToggle", "#logout", "#dropLayoutSelect"]) {
+for (const selector of ["#sidebarToggle", ".brand", "#who", "#syncStatus", "#quotaBadge", "#themeToggle", "#logout", "#dropLayoutSwitch"]) {
   dropHeader.querySelector(selector)?.remove();
 }
 for (const element of dropHeader.querySelectorAll<HTMLElement>("[id]")) element.id = `drop-${element.id}`;
@@ -3474,7 +3474,7 @@ let dropComposerAttachments: PendingAttachment[] = [];
 const dropPanelController = new ConversationPanel({
   panel: $("dropPanel"), workspace: workspaceEl, main: mainEl,
   chatMessages: msgs, chatComposer: footerEl, composer: dropComposer.root, header: dropHeader, resizeHandle: $("dropResize"),
-  layoutSelect: $<HTMLSelectElement>("dropLayoutSelect"), closeButton: dropCloseBtn,
+  layoutSwitch: $("dropLayoutSwitch"), closeButton: dropCloseBtn,
 }, {
   onClose: () => closeDrop(),
   onLayout: () => { autosizeInput(); autosizeComposer(dropComposer); renderSessionList(); updateRefreshButtonState(); },

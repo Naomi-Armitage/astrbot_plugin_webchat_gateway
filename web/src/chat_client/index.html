@@ -56,11 +56,17 @@
           <span id="syncStatus" class="badge sync-status" data-state="live" title="同步状态">实时</span>
           <span id="quotaBadge" class="badge">--</span>
           <div class="actions">
-            <select id="dropLayoutSelect" aria-label="Drop 窗口布局" hidden>
-              <option value="full">默认</option>
-              <option value="float">浮窗</option>
-              <option value="dock">右侧栏</option>
-            </select>
+            <div id="dropLayoutSwitch" class="layout-switch" role="radiogroup" aria-label="Drop 窗口布局" hidden>
+              <button type="button" data-layout="full" role="radio" aria-checked="true" aria-label="默认" title="默认">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/></svg>
+              </button>
+              <button type="button" data-layout="float" role="radio" aria-checked="false" aria-label="浮窗" title="浮窗" tabindex="-1">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M8 20H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v3"/><rect x="10" y="11" width="11" height="9" rx="1.5"/></svg>
+              </button>
+              <button type="button" data-layout="dock" role="radio" aria-checked="false" aria-label="右侧栏" title="右侧栏" tabindex="-1">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M14 4v16"/><path d="M17.5 8v8" stroke-opacity=".45"/></svg>
+              </button>
+            </div>
             <button id="themeToggle" type="button" class="icon-only"
               aria-label="切换深浅色" aria-pressed="false">
               <svg id="themeIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor"

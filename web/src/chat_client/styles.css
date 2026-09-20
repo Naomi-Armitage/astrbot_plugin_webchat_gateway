@@ -374,6 +374,10 @@ header h1 {
 @container chathead (max-width: 520px) {
   header h1 { display: none; }
   header .badge { margin-left: auto; }
+  #chatHeader .sync-status { display: none; }
+}
+@container chathead (max-width: 640px) {
+  #chatHeader .who { display: none; }
 }
 
 .badge {
@@ -419,7 +423,7 @@ header h1 {
 }
 
 .actions { display: flex; gap: 6px; }
-.actions a, .actions button, .actions select {
+.actions a, .actions button {
   font: inherit;
   background: transparent;
   border: 1px solid var(--rule);
@@ -432,7 +436,7 @@ header h1 {
   text-decoration: none !important;
   transition: color .15s ease, border-color .15s ease, background .15s ease;
 }
-.actions a:hover, .actions button:hover, .actions select:hover {
+.actions a:hover, .actions button:hover {
   color: var(--ink);
   border-color: color-mix(in oklab, var(--ink-soft) 50%, var(--rule));
   background: var(--paper-deep);
@@ -450,7 +454,7 @@ header h1 {
 .actions .icon-only svg { width: 15px; height: 15px; }
 .actions [hidden] { display: none; }
 @media (max-width: 719px) {
-  html:not([data-pip]) #dropLayoutSelect { display: none; }
+  html:not([data-pip]) #dropLayoutSwitch { display: none; }
 }
 
 .who {
