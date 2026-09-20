@@ -1,3 +1,4 @@
+import { createComposer, autosizeComposer, type ComposerTarget } from "./composer";
 import { ConversationPanel } from "./conversation-panel";
 import "./conversation-panel.css";
 import {
@@ -310,17 +311,30 @@ const sidebarToggleBtn = $<HTMLButtonElement>("sidebarToggle");
 const sidebarBackdrop = $("sidebarBackdrop");
 const sessionListEl = $<HTMLUListElement>("sessionList");
 const plusBtn = $<HTMLButtonElement>("plusBtn");
-const plusMenu = $<HTMLDivElement>("plusMenu");
 const menuUpload = $<HTMLButtonElement>("menuUpload");
 const menuImage = $<HTMLButtonElement>("menuImage");
 const fileInputEl = $<HTMLInputElement>("fileInput");
 const imgRatioBar = $<HTMLDivElement>("imgRatioBar");
-const composerAttachmentsEl = $("composer-attachments");
-const dropOverlayEl = $("dropOverlay");
 const footerEl = document.querySelector("footer") as HTMLElement;
 const refreshHistoryBtn = $<HTMLButtonElement>("refreshHistory");
 const dropEntry = $<HTMLButtonElement>("dropEntry");
 const dropMessagesEl = $<HTMLDivElement>("dropMessages");
+const chatComposer = createComposer(footerEl, "chat");
+const dropComposer = createComposer(footerEl, "drop");
+$("dropPanel").append(dropComposer.root);
+const composerView = (target: ComposerTarget) => target === "drop" ? dropComposer : chatComposer;
+const dropHeader = $("chatHeader").cloneNode(true) as HTMLElement;
+dropHeader.id = "dropHeader";
+for (const selector of ["#sidebarToggle", ".brand", "#who", "#syncStatus", "#quotaBadge", "#themeToggle", "#logout", "#dropLayoutSelect"]) {
+  dropHeader.querySelector(selector)?.remove();
+}
+for (const element of dropHeader.querySelectorAll<HTMLElement>("[id]")) element.id = `drop-${element.id}`;
+dropHeader.querySelector("h1")!.textContent = "Drop";
+const dropRefreshBtn = dropHeader.querySelector<HTMLButtonElement>("#drop-refreshHistory")!;
+const dropCloseBtn = dropHeader.querySelector<HTMLButtonElement>("#drop-dropClose")!;
+$("dropClose").remove();
+$("dropPanel").prepend(dropHeader);
+
 
 const username = (localStorage.getItem(LS_USERNAME) || "Friend").trim() || "Friend";
 const strong = document.createElement("strong");
@@ -3195,7 +3209,7 @@ function renderSessionList(): void {
     li.className = "session-item";
     li.setAttribute("role", "listitem");
     li.dataset.sessionId = sess.id;
-    if (!dropOpen && sess.id === store.activeId) li.setAttribute("aria-current", "page");
+    if ((!dropOpen || !dropPanelController.isExclusive) && sess.id === store.activeId) li.setAttribute("aria-current", "page");
     const isEditing = editingSessionId === sess.id;
     if (isEditing) li.dataset.editing = "true";
 
@@ -3274,7 +3288,7 @@ function renderSessionList(): void {
 function switchSession(id: string): void {
   if (!store.sessions[id]) return;
   composerContext += 1;
-  if (dropOpen) closeDrop(false);
+  if (dropOpen && dropPanelController.isExclusive) closeDrop(false);
   if (id !== store.activeId) {
     // Leaving this session abandons any non-streaming send started under it;
     // cancel it so it can't hold the connection (streaming sends self-recover
@@ -3459,8 +3473,6 @@ let dropHistoryVersion = 0;
 let dropMaxFileBytes = 100 * 1024 * 1024;
 let chatSendMode: "send" | "stop" = "send";
 let dropSending = false;
-let chatDraft = "";
-let dropDraft = "";
 let composerContext = 0;
 let imageGenerationEnabled = false;
 let dropNotice = "";
@@ -3469,9 +3481,9 @@ let dropComposerAttachments: PendingAttachment[] = [];
 
 const dropPanelController = new ConversationPanel({
   panel: $("dropPanel"), workspace: workspaceEl, main: mainEl,
-  chatMessages: msgs, composer: footerEl, header: $("chatHeader"), resizeHandle: $("dropResize"),
-  layoutSelect: $<HTMLSelectElement>("dropLayoutSelect"), closeButton: $<HTMLButtonElement>("dropClose"),
-}, { onClose: () => closeDrop(), onLayout: () => autosizeInput() });
+  chatMessages: msgs, chatComposer: footerEl, composer: dropComposer.root, header: dropHeader, resizeHandle: $("dropResize"),
+  layoutSelect: $<HTMLSelectElement>("dropLayoutSelect"), closeButton: dropCloseBtn,
+}, { onClose: () => closeDrop(), onLayout: () => { autosizeInput(); autosizeComposer(dropComposer); renderSessionList(); updateRefreshButtonState(); } });
 
 const dropDeviceId = (() => {
   const old = localStorage.getItem(LS_DROP_DEVICE);
@@ -3789,7 +3801,7 @@ async function discardUploadedDropFile(fileId: string): Promise<void> {
 }
 
 async function sendDrop(): Promise<void> {
-  const rawText = inputEl.value;
+  const rawText = dropComposer.inputEl.value;
   const text = rawText.trim();
   const pending = dropComposerAttachments;
   if (dropSending || pending.some((a) => a.state !== "ready")) return;
@@ -3810,9 +3822,10 @@ async function sendDrop(): Promise<void> {
     if (resp.status === 401) { handle401(); return; }
     const data = await resp.json() as DropListResponse & { error?: string };
     if (!resp.ok) throw new Error(data.error || "HTTP " + resp.status);
-    // The shared composer may now belong to chat or contain the next draft.
-    if (dropOpen && inputEl.value === rawText) { inputEl.value = ""; autosizeInput(); }
-    if (!dropOpen && dropDraft === rawText) dropDraft = "";
+    if (dropComposer.inputEl.value === rawText) {
+      dropComposer.inputEl.value = "";
+      autosizeComposer(dropComposer);
+    }
     for (const attachment of ready) URL.revokeObjectURL(attachment.preview_url);
     dropComposerAttachments = dropComposerAttachments.filter((a) => !ready.includes(a));
     dropLoadSeq += 1;
@@ -3835,44 +3848,31 @@ async function sendDrop(): Promise<void> {
 }
 
 function refreshComposerContext(): void {
-  closePlusMenu();
-  fileInputEl.value = "";
-  fileInputEl.accept = dropOpen ? "" : ALLOWED_MIME.join(",");
-  menuUpload.hidden = !dropOpen && !UPLOADS_ENABLED;
-  menuUpload.querySelector("span")!.textContent = dropOpen ? "上传文件" : "上传图片";
-  menuImage.hidden = dropOpen || !imageGenerationEnabled;
-  dropOverlayEl.querySelector(".drop-overlay-inner")!.textContent = dropOpen ? "松开以添加文件" : "松开以添加图片";
-  dropOverlayEl.hidden = true;
-  dragDepth = 0;
-  attachmentsCapNoticeShown = false;
+  fileInputEl.accept = ALLOWED_MIME.join(",");
+  menuUpload.hidden = !UPLOADS_ENABLED;
+  menuImage.hidden = !imageGenerationEnabled;
   refreshPlusBtnVisibility();
   refreshImageModeState();
   renderComposerAttachments();
-  setSendMode(chatSendMode);
   updateSendButtonState();
   updateRefreshButtonState();
   autosizeInput();
+  autosizeComposer(dropComposer);
 }
 function closeDrop(restoreFocus = true): void {
   if (!dropOpen) return;
-  dropDraft = inputEl.value;
   dropOpen = false;
-  composerContext += 1;
-  inputEl.value = chatDraft;
   clearDropFallbackTimer();
   dropMessagesEl.hidden = true;
   dropPanelController.close();
   dropEntry.setAttribute("aria-expanded", "false");
-  refreshComposerContext();
   renderSessionList();
+  updateRefreshButtonState();
   if (restoreFocus) inputEl.focus();
 }
 function openDrop(): void {
-  if (dropOpen) { inputEl.focus(); return; }
-  chatDraft = inputEl.value;
+  if (dropOpen) { dropComposer.inputEl.focus(); return; }
   dropOpen = true;
-  composerContext += 1;
-  inputEl.value = dropDraft;
   dropMessagesEl.hidden = false;
   dropPanelController.open();
   dropEntry.setAttribute("aria-expanded", "true");
@@ -3883,12 +3883,12 @@ function openDrop(): void {
   renderSessionList();
   void loadDropMessages({ preserveOlder: true });
   updateDropFallbackPolling();
-  inputEl.focus();
+  dropComposer.inputEl.focus();
 }
 
 function newSession(): void {
   composerContext += 1;
-  if (dropOpen) closeDrop(false);
+  if (dropOpen && dropPanelController.isExclusive) closeDrop(false);
   cancelInflightSend();
   const fresh = blankSession();
   store.sessions[fresh.id] = fresh;
@@ -3979,7 +3979,7 @@ async function loadChatSite(): Promise<void> {
       menuImage.hidden = false;
     } else {
       menuImage.hidden = true;
-      if (!dropOpen && isImageCommand(inputEl.value)) {
+      if (isImageCommand(inputEl.value)) {
         inputEl.value = inputEl.value.replace(IMAGE_CMD_RE, "").replace(/^\s+/, "");
         autosizeInput();
       }
@@ -4400,7 +4400,6 @@ async function resumeStream(
 function setSendMode(mode: "send" | "stop"): void {
   chatSendMode = mode;
   updateRefreshButtonState();
-  if (dropOpen) mode = "send";
   sendBtn.dataset.mode = mode;
   sendBtn.setAttribute("aria-label", mode === "stop" ? "停止" : "发送");
 }
@@ -4408,11 +4407,11 @@ function setSendMode(mode: "send" | "stop"): void {
 // ---------- Composer attachments ----------
 
 let composerAttachments: PendingAttachment[] = [];
-function activeComposerAttachments(): PendingAttachment[] {
-  return dropOpen ? dropComposerAttachments : composerAttachments;
+function activeComposerAttachments(target: ComposerTarget = "chat"): PendingAttachment[] {
+  return target === "drop" ? dropComposerAttachments : composerAttachments;
 }
-function composerNotice(text: string): void {
-  if (dropOpen) dropStatusText(text, true);
+function composerNotice(text: string, target: ComposerTarget = "chat"): void {
+  if (target === "drop") dropStatusText(text, true);
   else addMessageBubble("notice", text);
 }
 function invalidateDropUploads(): void {
@@ -4446,7 +4445,7 @@ async function uploadDropAttachment(attachment: PendingAttachment): Promise<void
 }
 // Latch so the "exceeded 4 chips" notice only fires once per add batch even
 // if the user dropped 7 files in one go.
-let attachmentsCapNoticeShown = false;
+const attachmentsCapNoticeShown: Record<ComposerTarget, boolean> = { chat: false, drop: false };
 
 let ALLOWED_MIME_SET: ReadonlySet<string> = new Set(ALLOWED_MIME);
 
@@ -4655,19 +4654,19 @@ function uploadErrorCopy(code: string, payload: Record<string, unknown>): string
   return typeof payload.detail === "string" ? `${code}: ${payload.detail}` : code;
 }
 
-function addAttachmentFiles(rawFiles: FileList | File[]): void {
-  if ((!dropOpen && !UPLOADS_ENABLED) || (dropOpen && (dropSending))) return;
-  const isDrop = dropOpen;
-  const queue = activeComposerAttachments();
+function addAttachmentFiles(rawFiles: FileList | File[], target: ComposerTarget = "chat"): void {
+  if ((target === "chat" && !UPLOADS_ENABLED) || (target === "drop" && dropSending)) return;
+  const isDrop = target === "drop";
+  const queue = activeComposerAttachments(target);
   const limit = isDrop ? Math.min(16, MAX_ATTACHMENTS_PER_MESSAGE) : MAX_ATTACHMENTS_PER_MESSAGE;
   const unit = isDrop ? "个文件" : "张";
   const files = Array.from(rawFiles);
   if (!files.length) return;
   const remaining = limit - queue.length;
   if (remaining <= 0) {
-    if (!attachmentsCapNoticeShown) {
-      attachmentsCapNoticeShown = true;
-      composerNotice(`最多 ${limit} ${unit}`);
+    if (!attachmentsCapNoticeShown[target]) {
+      attachmentsCapNoticeShown[target] = true;
+      composerNotice(`最多 ${limit} ${unit}`, target);
     }
     return;
   }
@@ -4687,7 +4686,7 @@ function addAttachmentFiles(rawFiles: FileList | File[]): void {
       // fly so the message tracks what the server is actually
       // enforcing (operator may have set 5MB or 50MB).
       const limitMb = Math.max(1, Math.round((isDrop ? dropMaxFileBytes : MAX_FILE_SIZE_BYTES) / (1024 * 1024)));
-      composerNotice(`文件过大: ${file.name || "图片"}（上限 ${limitMb}MB）`);
+      composerNotice(`文件过大: ${file.name || "图片"}（上限 ${limitMb}MB）`, target);
       continue;
     }
     acceptedCount += 1;
@@ -4730,34 +4729,35 @@ function addAttachmentFiles(rawFiles: FileList | File[]): void {
       await uploadAttachment(blob, sid, attachment);
     })();
   }
-  if (droppedForCap > 0 && !attachmentsCapNoticeShown) {
-    attachmentsCapNoticeShown = true;
-    composerNotice(`最多 ${limit} ${unit}`);
+  if (droppedForCap > 0 && !attachmentsCapNoticeShown[target]) {
+    attachmentsCapNoticeShown[target] = true;
+    composerNotice(`最多 ${limit} ${unit}`, target);
   }
   renderComposerAttachments();
   updateSendButtonState();
 }
 
-function removeAttachment(local_id: string): void {
-  if (dropOpen && dropSending) return;
-  const queue = activeComposerAttachments();
+function removeAttachment(local_id: string, target: ComposerTarget = "chat"): void {
+  if (target === "drop" && dropSending) return;
+  const queue = activeComposerAttachments(target);
   const idx = queue.findIndex((a) => a.local_id === local_id);
   if (idx < 0) return;
   const att = queue[idx]!;
   try { URL.revokeObjectURL(att.preview_url); } catch {}
   queue.splice(idx, 1);
-  attachmentsCapNoticeShown = false;
+  attachmentsCapNoticeShown[target] = false;
   if (att.destination === "drop" && att.file_id) void discardUploadedDropFile(att.file_id);
   renderComposerAttachments();
   updateSendButtonState();
 }
 
 function clearComposerAttachments(): void {
+  const target = "chat";
   for (const a of composerAttachments) {
     try { URL.revokeObjectURL(a.preview_url); } catch {}
   }
   composerAttachments = [];
-  attachmentsCapNoticeShown = false;
+  attachmentsCapNoticeShown[target] = false;
   renderComposerAttachments();
   updateSendButtonState();
 }
@@ -4765,9 +4765,9 @@ function clearComposerAttachments(): void {
 // Retry a failed upload in place (tap the errored chip). Reuses the
 // retained blob so the user doesn't have to re-pick the file. No-op if the
 // chip isn't in an error state or the blob is gone (shouldn't happen).
-function retryAttachment(local_id: string): void {
-  if (dropOpen && (dropSending)) return;
-  const att = activeComposerAttachments().find((a) => a.local_id === local_id);
+function retryAttachment(local_id: string, target: ComposerTarget = "chat"): void {
+  if (target === "drop" && dropSending) return;
+  const att = activeComposerAttachments(target).find((a) => a.local_id === local_id);
   if (!att || att.state !== "error" || !att.blob) return;
   att.state = "uploading";
   att.error_message = undefined;
@@ -4778,8 +4778,13 @@ function retryAttachment(local_id: string): void {
 }
 
 function renderComposerAttachments(): void {
+  renderComposerAttachmentList("chat");
+  renderComposerAttachmentList("drop");
+}
+function renderComposerAttachmentList(target: ComposerTarget): void {
+  const { composerAttachmentsEl } = composerView(target);
   composerAttachmentsEl.replaceChildren();
-  for (const a of activeComposerAttachments()) {
+  for (const a of activeComposerAttachments(target)) {
     const chip = document.createElement("div");
     chip.className = "composer-chip";
     chip.dataset.state = a.state;
@@ -4791,11 +4796,11 @@ function renderComposerAttachments(): void {
       chip.setAttribute("role", "button");
       chip.setAttribute("aria-label", "上传失败，点击重试");
       chip.tabIndex = 0;
-      chip.addEventListener("click", () => retryAttachment(a.local_id));
+      chip.addEventListener("click", () => retryAttachment(a.local_id, target));
       chip.addEventListener("keydown", (event) => {
         if (event.target !== chip || (event.key !== "Enter" && event.key !== " ")) return;
         event.preventDefault();
-        retryAttachment(a.local_id);
+        retryAttachment(a.local_id, target);
       });
     }
 
@@ -4824,11 +4829,11 @@ function renderComposerAttachments(): void {
     close.className = "composer-chip-remove";
     close.setAttribute("aria-label", "移除");
     close.textContent = "×";
-    close.disabled = dropOpen && dropSending;
+    close.disabled = target === "drop" && dropSending;
     close.addEventListener("click", (e) => {
       e.preventDefault();
       e.stopPropagation();
-      removeAttachment(a.local_id);
+      removeAttachment(a.local_id, target);
     });
     chip.appendChild(close);
 
@@ -4837,18 +4842,14 @@ function renderComposerAttachments(): void {
 }
 
 function updateSendButtonState(): void {
-  // Background chat streams must not change the Drop send button. Keep the
-  // normal stop action available for both streaming replies and image generation.
-  if (!dropOpen && chatSendMode === "stop") {
-    sendBtn.disabled = false;
-    return;
+  for (const target of ["chat", "drop"] as const) {
+    const { inputEl, sendBtn } = composerView(target);
+    if (target === "chat" && chatSendMode === "stop") { sendBtn.disabled = false; continue; }
+    const pending = activeComposerAttachments(target);
+    sendBtn.disabled = pending.some((a) => a.state === "uploading")
+      || (!inputEl.value.trim() && !pending.some((a) => a.state === "ready"))
+      || (target === "drop" && (dropSending || pending.some((a) => a.state === "error")));
   }
-  const pending = activeComposerAttachments();
-  const hasUploading = pending.some((a) => a.state === "uploading");
-  const hasReady = pending.some((a) => a.state === "ready");
-  const hasText = inputEl.value.trim().length > 0;
-  sendBtn.disabled = hasUploading || (!hasText && !hasReady)
-    || (dropOpen && (dropSending || pending.some((a) => a.state === "error")));
 }
 
 // ---------- Lightbox ----------
@@ -5030,7 +5031,6 @@ function notifyOffline(): void {
 }
 
 async function send(): Promise<void> {
-  if (dropOpen) { await sendDrop(); return; }
   const context = composerContext;
   // Don't fire while uploads are still in flight — server would reject
   // unknown file_ids and the user would lose their text.
@@ -5120,7 +5120,7 @@ async function performSend(message: string, readyAttachments: AttachmentRef[]): 
     addMessageBubble("notice", "正在恢复上一次回复…");
     return;
   }
-  if (!dropOpen) sendBtn.disabled = true;
+  sendBtn.disabled = true;
   const isFirstUserMsg = !sessBefore.history.some((h) => h.role === "user");
   const eligibleForAutoTitle = isFirstUserMsg && sessBefore.titleManual !== true && message.length > 0;
 
@@ -5157,7 +5157,7 @@ async function performSend(message: string, readyAttachments: AttachmentRef[]): 
         // the user double-clicking through fallback (which would either
         // duplicate the optimistic user echo or trip server-side
         // concurrent_request).
-        if (!dropOpen) sendBtn.disabled = true;
+        sendBtn.disabled = true;
         showTyping();
         await runNonStreamingSend(sid, message, readyAttachments);
       }
@@ -6009,30 +6009,30 @@ async function runNonStreamingSend(sid: string, message: string, attachments: At
   }
 }
 
-let refreshingHistory = false;
+const refreshingHistory: Record<ComposerTarget, boolean> = { chat: false, drop: false };
 
-function conversationBusy(): boolean {
-  return dropOpen ? dropSending : !!(sync.streamAbort || sync.sendAbort
+function conversationBusy(target: ComposerTarget): boolean {
+  return target === "drop" ? dropSending : !!(sync.streamAbort || sync.sendAbort
     || store.pendingStreams[store.activeId] || sync.activeResumeAborts[store.activeId]);
 }
 
-async function refreshCurrentConversation(): Promise<void> {
-  if (refreshingHistory || conversationBusy()) return;
+async function refreshCurrentConversation(target: ComposerTarget): Promise<void> {
+  if (refreshingHistory[target] || conversationBusy(target)) return;
   const context = composerContext;
   const session = currentSession();
   const history = session.history;
   const historyLength = history.length;
   const pts = sync.lastPts;
-  refreshingHistory = true;
+  refreshingHistory[target] = true;
   updateRefreshButtonState();
   try {
-    if (dropOpen) {
+    if (target === "drop") {
       await loadDropMessages({ preserveOlder: true });
     } else {
       const detail = await fetchConversation(session.id);
       // A switched conversation, new send or live event owns the newer view.
       // Never replace it with a response requested before that change.
-      if (context !== composerContext || conversationBusy() || pts !== sync.lastPts
+      if (context !== composerContext || conversationBusy(target) || pts !== sync.lastPts
         || currentSession().history !== history || history.length !== historyLength) return;
       if (detail) {
         ingestConversationDetail(detail);
@@ -6044,22 +6044,28 @@ async function refreshCurrentConversation(): Promise<void> {
       }
     }
   } catch (error) {
-    if (context === composerContext) composerNotice(`刷新失败：${(error as Error).message}`);
+    if (context === composerContext) composerNotice(`刷新失败：${(error as Error).message}`, target);
   } finally {
-    refreshingHistory = false;
+    refreshingHistory[target] = false;
     updateRefreshButtonState();
   }
 }
 
-refreshHistoryBtn.onclick = () => { void refreshCurrentConversation(); };
+function mainRefreshTarget(): ComposerTarget {
+  return dropOpen && dropPanelController.isExclusive ? "drop" : "chat";
+}
+refreshHistoryBtn.onclick = () => { void refreshCurrentConversation(mainRefreshTarget()); };
+dropRefreshBtn.onclick = () => { void refreshCurrentConversation("drop"); };
 $<HTMLButtonElement>("newSessionBtn").onclick = newSession;
 
 function updateRefreshButtonState(): void {
-  const busy = conversationBusy();
-  refreshHistoryBtn.textContent = refreshingHistory ? "刷新中…" : "刷新";
-  refreshHistoryBtn.disabled = refreshingHistory || busy;
-  refreshHistoryBtn.setAttribute("aria-busy", String(refreshingHistory));
-  refreshHistoryBtn.title = busy ? "正在处理，完成后再刷新" : "刷新当前对话";
+  for (const [button, target] of [[refreshHistoryBtn, mainRefreshTarget()], [dropRefreshBtn, "drop"]] as const) {
+    const busy = conversationBusy(target);
+    button.textContent = refreshingHistory[target] ? "刷新中…" : "刷新";
+    button.disabled = refreshingHistory[target] || busy;
+    button.setAttribute("aria-busy", String(refreshingHistory[target]));
+    button.title = busy ? "正在处理，完成后再刷新" : "刷新当前对话";
+  }
 }
 updateRefreshButtonState();
 $<HTMLButtonElement>("logout").onclick = () => {
@@ -6111,88 +6117,42 @@ dropEntry.addEventListener("click", () => { closeMobileSidebar(); openDrop(); })
 // openMobileSidebar). No global listener here — it would race with the
 // trap's onEscape and double-fire closeMobileSidebar.
 
-inputEl.addEventListener("keydown", (e) => {
-  if (e.key !== "Enter" || e.isComposing || e.keyCode === 229) return;
-  // Touch-primary devices (phones / tablets): the on-screen keyboard's
-  // Enter inserts a newline and sending is button-only — the native
-  // messaging-app convention. Pointer-fine devices (desktop): Enter
-  // sends, Shift+Enter inserts a newline. Evaluated per-keystroke so a
-  // device that gains/loses a fine pointer (e.g. tablet + keyboard
-  // dock) picks up the right behaviour without a reload.
-  const touchPrimary = window.matchMedia("(pointer: coarse)").matches;
-  if (touchPrimary) return; // let Enter fall through to a newline
-  if (!e.shiftKey) {
-    e.preventDefault();
-    void send();
-  }
-});
-
 // ---------- Plus menu (upload + image-gen affordances) ----------
 // Both composer actions now live behind a single "+" inside the input
 // box. The menu pops upward; selecting an item runs the action and
 // closes. Visibility of each item is gated by server config (handled
 // in the /site fetch); the "+" itself hides when neither survives.
 
-function isPlusMenuOpen(): boolean {
+function isPlusMenuOpen(target: ComposerTarget = "chat"): boolean {
+  const { plusMenu } = composerView(target);
   return !plusMenu.hidden;
 }
-function openPlusMenu(): void {
+function openPlusMenu(target: ComposerTarget = "chat"): void {
+  const { plusBtn, plusMenu } = composerView(target);
   if (plusBtn.disabled || plusBtn.hidden) return;
   plusMenu.hidden = false;
   plusBtn.setAttribute("aria-expanded", "true");
 }
-function closePlusMenu(): void {
+function closePlusMenu(target: ComposerTarget = "chat"): void {
+  const { plusBtn, plusMenu } = composerView(target);
   if (plusMenu.hidden) return;
   plusMenu.hidden = true;
   plusBtn.setAttribute("aria-expanded", "false");
 }
-function togglePlusMenu(): void {
-  if (isPlusMenuOpen()) closePlusMenu();
-  else openPlusMenu();
+function togglePlusMenu(target: ComposerTarget = "chat"): void {
+  if (isPlusMenuOpen(target)) closePlusMenu(target);
+  else openPlusMenu(target);
 }
 // Hide the whole "+" when neither menu item is available — an empty
 // menu is worse than no button. Called after the server-config gating
 // flips menuUpload / menuImage hidden flags.
-function refreshPlusBtnVisibility(): void {
+function refreshPlusBtnVisibility(target: ComposerTarget = "chat"): void {
+  const { menuUpload, menuImage, plusBtn } = composerView(target);
   const anyItem = !menuUpload.hidden || !menuImage.hidden;
   plusBtn.hidden = !anyItem;
-  if (!anyItem) closePlusMenu();
+  if (!anyItem) closePlusMenu(target);
 }
 
-plusBtn.addEventListener("click", (e) => {
-  e.stopPropagation();
-  togglePlusMenu();
-});
-// Outside-click closes. Pointerdown (not click) so it fires before the
-// textarea steals focus, and we ignore clicks within the menu/button.
-document.addEventListener("pointerdown", (e) => {
-  if (!isPlusMenuOpen()) return;
-  const t = e.target as Node;
-  if (plusMenu.contains(t) || plusBtn.contains(t)) return;
-  closePlusMenu();
-});
-document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && isPlusMenuOpen()) {
-    closePlusMenu();
-    plusBtn.focus();
-  }
-});
-
-// Upload → file picker. Reset .value after each open so the change
-// handler fires even when the user re-selects the same file (the browser
-// suppresses change events on identical selections otherwise).
-menuUpload.addEventListener("click", () => {
-  closePlusMenu();
-  // At the per-message cap the picker would reject everything, so surface
-  // the limit instead of opening it to a no-op.
-  const limit = dropOpen ? Math.min(16, MAX_ATTACHMENTS_PER_MESSAGE) : MAX_ATTACHMENTS_PER_MESSAGE;
-  if (activeComposerAttachments().length >= limit) {
-    composerNotice(`最多 ${limit} ${dropOpen ? "个文件" : "张"}`);
-    return;
-  }
-  fileInputEl.value = "";
-  fileInputEl.click();
-});
 // 生成图片. Prepends "/image " to the textarea if the prefix isn't
 // already there; selecting again with the prefix present removes it
 // (toggle behaviour). Mirrors how operators can also just type the
@@ -6314,7 +6274,7 @@ function currentImgSize(): string {
 }
 
 function refreshImageModeState(): void {
-  const armed = !dropOpen && isImageCommand(inputEl.value);
+  const armed = isImageCommand(inputEl.value);
   menuImage.setAttribute("aria-pressed", armed ? "true" : "false");
   // Tint the "+" so the operator can tell they're in image mode even
   // with the menu closed.
@@ -6324,7 +6284,7 @@ function refreshImageModeState(): void {
   imgRatioBar.hidden = !armed || IMAGE_SIZES.length === 0;
 }
 menuImage.addEventListener("click", () => {
-  if (dropOpen || menuImage.disabled) return;
+  if (menuImage.disabled) return;
   closePlusMenu();
   if (isImageCommand(inputEl.value)) {
     // Toggle off — strip the prefix + leading whitespace.
@@ -6341,48 +6301,6 @@ menuImage.addEventListener("click", () => {
 });
 inputEl.addEventListener("input", refreshImageModeState);
 refreshImageModeState();
-fileInputEl.addEventListener("change", () => {
-  if (fileInputEl.files && fileInputEl.files.length) {
-    addAttachmentFiles(fileInputEl.files);
-  }
-  fileInputEl.value = "";
-});
-
-// Drag-and-drop on the composer footer. Track enter/leave depth so child
-// transitions don't flicker the overlay off. We only show the overlay if
-// the drag contains files (matches `Files` in dataTransfer.types).
-let dragDepth = 0;
-function dragHasFiles(e: DragEvent): boolean {
-  const dt = e.dataTransfer;
-  if (!dt) return false;
-  for (const t of dt.types) if (t === "Files") return true;
-  return false;
-}
-footerEl.addEventListener("dragenter", (e) => {
-  if (!dragHasFiles(e)) return;
-  e.preventDefault();
-  dragDepth += 1;
-  dropOverlayEl.hidden = false;
-});
-footerEl.addEventListener("dragover", (e) => {
-  if (!dragHasFiles(e)) return;
-  e.preventDefault();
-  if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
-});
-footerEl.addEventListener("dragleave", (e) => {
-  if (!dragHasFiles(e)) return;
-  dragDepth = Math.max(0, dragDepth - 1);
-  if (dragDepth === 0) dropOverlayEl.hidden = true;
-});
-footerEl.addEventListener("drop", (e) => {
-  if (!dragHasFiles(e)) return;
-  e.preventDefault();
-  dragDepth = 0;
-  dropOverlayEl.hidden = true;
-  const files = e.dataTransfer?.files;
-  if (files && files.length) addAttachmentFiles(files);
-});
-
 // Paste handler. Two concerns:
 //
 // 1) Image paste (clipboardData.files is populated for raw image paste on
@@ -6417,45 +6335,6 @@ function normalizePastedText(s: string): string {
     .filter((p) => p.length > 0)
     .join("\n\n");
 }
-inputEl.addEventListener("paste", (e) => {
-  const cd = e.clipboardData;
-  if (!cd) return;
-  // Image branch first — keep existing behavior intact.
-  if (cd.files && cd.files.length) {
-    const images: File[] = [];
-    for (const f of cd.files) {
-      if (dropOpen || f.type && f.type.startsWith("image/")) images.push(f);
-    }
-    if (images.length) {
-      e.preventDefault();
-      addAttachmentFiles(images);
-      return;
-    }
-  }
-  // Text branch — only intercept when normalization would actually
-  // change anything. Skipping the preventDefault on a no-op paste keeps
-  // the native browser path (and its undo entry) intact.
-  const raw = cd.getData("text/plain");
-  if (!raw) return;
-  const normalized = normalizePastedText(raw);
-  if (normalized === raw) return;
-  e.preventDefault();
-  // execCommand("insertText") preserves the textarea's native undo
-  // stack — replacing the value directly wipes undo history, which the
-  // user notices the moment they hit Ctrl+Z after a paste. Fall back to
-  // a manual splice only if the browser refused the command (Firefox
-  // ESR with certain hardening configs, mostly).
-  if (!document.execCommand("insertText", false, normalized)) {
-    const start = inputEl.selectionStart ?? inputEl.value.length;
-    const end = inputEl.selectionEnd ?? inputEl.value.length;
-    inputEl.value = inputEl.value.slice(0, start) + normalized + inputEl.value.slice(end);
-    const caret = start + normalized.length;
-    inputEl.selectionStart = inputEl.selectionEnd = caret;
-  }
-  autosizeInput();
-  updateSendButtonState();
-});
-
 // Telegram-style auto-grow: the textarea expands as the user types and
 // shrinks back when text is deleted. CSS min-height / max-height cap both
 // ends; once scrollHeight exceeds max-height the browser falls back to
@@ -6466,15 +6345,155 @@ function autosizeInput(): void {
   inputEl.style.height = "auto";
   inputEl.style.height = inputEl.scrollHeight + "px";
 }
-inputEl.addEventListener("input", () => {
-  autosizeInput();
-  updateSendButtonState();
-});
-// Reset to one line on initial render and any external value clear.
+function bindComposerEvents(target: ComposerTarget): void {
+  const view = composerView(target);
+  const { inputEl, fileInputEl, plusBtn, plusMenu, menuUpload, dropOverlayEl, root: footerEl } = view;
+  inputEl.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" || e.isComposing || e.keyCode === 229) return;
+    // Touch-primary devices (phones / tablets): the on-screen keyboard's
+    // Enter inserts a newline and sending is button-only — the native
+    // messaging-app convention. Pointer-fine devices (desktop): Enter
+    // sends, Shift+Enter inserts a newline. Evaluated per-keystroke so a
+    // device that gains/loses a fine pointer (e.g. tablet + keyboard
+    // dock) picks up the right behaviour without a reload.
+    const touchPrimary = window.matchMedia("(pointer: coarse)").matches;
+    if (touchPrimary) return; // let Enter fall through to a newline
+    if (!e.shiftKey) {
+      e.preventDefault();
+      void (target === "drop" ? sendDrop() : send());
+    }
+  });
+
+
+  plusBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    togglePlusMenu(target);
+  });
+  // Outside-click closes. Pointerdown (not click) so it fires before the
+  // textarea steals focus, and we ignore clicks within the menu/button.
+  document.addEventListener("pointerdown", (e) => {
+    if (!isPlusMenuOpen(target)) return;
+    const t = e.target as Node;
+    if (plusMenu.contains(t) || plusBtn.contains(t)) return;
+    closePlusMenu(target);
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && isPlusMenuOpen(target)) {
+      e.preventDefault();
+      e.stopPropagation();
+      closePlusMenu(target);
+      plusBtn.focus();
+    }
+  });
+
+  // Upload → file picker. Reset .value after each open so the change
+  // handler fires even when the user re-selects the same file (the browser
+  // suppresses change events on identical selections otherwise).
+  menuUpload.addEventListener("click", () => {
+    closePlusMenu(target);
+    // At the per-message cap the picker would reject everything, so surface
+    // the limit instead of opening it to a no-op.
+    const limit = (target === "drop") ? Math.min(16, MAX_ATTACHMENTS_PER_MESSAGE) : MAX_ATTACHMENTS_PER_MESSAGE;
+    if (activeComposerAttachments(target).length >= limit) {
+      composerNotice(`最多 ${limit} ${target === "drop" ? "个文件" : "张"}`, target);
+      return;
+    }
+    fileInputEl.value = "";
+    fileInputEl.click();
+  });
+
+  fileInputEl.addEventListener("change", () => {
+    if (fileInputEl.files && fileInputEl.files.length) {
+      addAttachmentFiles(fileInputEl.files, target);
+    }
+    fileInputEl.value = "";
+  });
+
+  // Drag-and-drop on the composer footer. Track enter/leave depth so child
+  // transitions don't flicker the overlay off. We only show the overlay if
+  // the drag contains files (matches `Files` in dataTransfer.types).
+  let dragDepth = 0;
+  function dragHasFiles(e: DragEvent): boolean {
+    const dt = e.dataTransfer;
+    if (!dt) return false;
+    for (const t of dt.types) if (t === "Files") return true;
+    return false;
+  }
+  footerEl.addEventListener("dragenter", (e) => {
+    if (!dragHasFiles(e)) return;
+    e.preventDefault();
+    dragDepth += 1;
+    dropOverlayEl.hidden = false;
+  });
+  footerEl.addEventListener("dragover", (e) => {
+    if (!dragHasFiles(e)) return;
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+  });
+  footerEl.addEventListener("dragleave", (e) => {
+    if (!dragHasFiles(e)) return;
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0) dropOverlayEl.hidden = true;
+  });
+  footerEl.addEventListener("drop", (e) => {
+    if (!dragHasFiles(e)) return;
+    e.preventDefault();
+    dragDepth = 0;
+    dropOverlayEl.hidden = true;
+    const files = e.dataTransfer?.files;
+    if (files && files.length) addAttachmentFiles(files, target);
+  });
+
+
+  inputEl.addEventListener("paste", (e) => {
+    const cd = e.clipboardData;
+    if (!cd) return;
+    // Image branch first — keep existing behavior intact.
+    if (cd.files && cd.files.length) {
+      const images: File[] = [];
+      for (const f of cd.files) {
+        if ((target === "drop") || f.type && f.type.startsWith("image/")) images.push(f);
+      }
+      if (images.length) {
+        e.preventDefault();
+        addAttachmentFiles(images, target);
+        return;
+      }
+    }
+    // Text branch — only intercept when normalization would actually
+    // change anything. Skipping the preventDefault on a no-op paste keeps
+    // the native browser path (and its undo entry) intact.
+    const raw = cd.getData("text/plain");
+    if (!raw) return;
+    const normalized = normalizePastedText(raw);
+    if (normalized === raw) return;
+    e.preventDefault();
+    // execCommand("insertText") preserves the textarea's native undo
+    // stack — replacing the value directly wipes undo history, which the
+    // user notices the moment they hit Ctrl+Z after a paste. Fall back to
+    // a manual splice only if the browser refused the command (Firefox
+    // ESR with certain hardening configs, mostly).
+    if (!inputEl.ownerDocument.execCommand?.("insertText", false, normalized)) {
+      const start = inputEl.selectionStart ?? inputEl.value.length;
+      const end = inputEl.selectionEnd ?? inputEl.value.length;
+      inputEl.value = inputEl.value.slice(0, start) + normalized + inputEl.value.slice(end);
+      const caret = start + normalized.length;
+      inputEl.selectionStart = inputEl.selectionEnd = caret;
+    }
+    autosizeComposer(view);
+    updateSendButtonState();
+  });
+
+
+  inputEl.addEventListener("input", () => { autosizeComposer(view); updateSendButtonState(); });
+  if (target === "drop") view.sendBtn.onclick = () => { void sendDrop(); };
+}
+bindComposerEvents("chat");
+bindComposerEvents("drop");
 autosizeInput();
+autosizeComposer(dropComposer);
 updateSendButtonState();
 sendBtn.onclick = (): void => {
-  if (dropOpen) { void sendDrop(); return; }
   // Same button doubles as stop while a stream is in flight. Click during
   // stream cancels the AbortController; the streaming path catches the
   // resulting AbortError and either keeps the partial bubble or drops it.

@@ -20,14 +20,13 @@
 .conversation-panel[data-layout="dock"] { flex: 0 0 34%; margin: 14px 0 18px 10px; }
 .conversation-panel[data-layout="float"] { position: fixed; z-index: 40; }
 .conversation-panel[data-layout="float"] footer textarea { max-height: min(120px, 20dvh); }
-.conversation-panel[data-layout="float"] #composer-attachments { max-height: 96px; overflow-y: auto; }
+.conversation-panel[data-layout="float"] .composer-attachments { max-height: 96px; overflow-y: auto; }
 header[data-panel-movable] { cursor: grab; touch-action: none; }
 header[data-panel-movable]:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .conversation-panel.is-adjusting { user-select: none; }
 .conversation-panel.is-adjusting header { cursor: grabbing; }
 .conversation-panel header { border-radius: 13px 13px 0 0; }
-.wrap[data-panel-layout="dock"] .main > .message-list,
-.wrap[data-panel-layout="float"] .main > .message-list { padding-top: 18px; }
+
 @container chathead (max-width: 520px) {
   .conversation-panel header .who,
   .conversation-panel header .sync-status { display: none; }

@@ -842,6 +842,7 @@ header h1 {
 .message-list:has(.msg) .empty-state { display: none; }
 
 /* ----- footer / composer ----- */
+footer[hidden], header[hidden] { display: none; }
 footer {
   display: flex;
   flex-direction: column;
@@ -856,7 +857,7 @@ footer {
 }
 /* Image aspect-ratio picker — a single-select radiogroup of ratio chips
    shown above the composer row in image mode. Replaces the old unstyled
-   native <select>; chips reuse the same tokens as .plus-menu-item / #send
+   native <select>; chips reuse the same tokens as .plus-menu-item / .composer-send
    so the composer reads as one designed surface. */
 .ratio-bar {
   display: flex;
@@ -962,14 +963,14 @@ footer textarea:focus {
   outline: none;
   box-shadow: none;
 }
-/* Send-button styling is scoped to #send, NOT `footer button`. The footer
+/* Send-button styling is scoped to .composer-send, NOT `footer button`. The footer
    holds several other buttons (the "+" menu trigger, its menu items, the
    per-chip remove ×), and a broad `footer button` rule leaked the send
    button's fill + 38px min-height onto every one of them — each then needed
    its own reset (the recurring "tall vertical bar" / inflated-input bugs).
-   Keeping this on #send stops the leak at the source; other footer buttons
+   Keeping this on .composer-send stops the leak at the source; other footer buttons
    define their own appearance. */
-#send {
+.composer-send {
   padding: 0 14px;
   /* Match the input box's 38px min-height so the send button aligns
      top-and-bottom with .composer-input instead of sitting as a short
@@ -993,27 +994,27 @@ footer textarea:focus {
   gap: 7px;
   transition: background .15s ease, transform .12s ease;
 }
-#send svg { width: 14px; height: 14px; }
-#send:hover:not(:disabled) {
+.composer-send svg { width: 14px; height: 14px; }
+.composer-send:hover:not(:disabled) {
   background: var(--accent-strong);
   border-color: var(--accent-strong);
 }
-#send:active:not(:disabled) { transform: translateY(1px); }
-#send:disabled { opacity: .5; cursor: not-allowed; }
+.composer-send:active:not(:disabled) { transform: translateY(1px); }
+.composer-send:disabled { opacity: .5; cursor: not-allowed; }
 
 /* Send/Stop mode switch on the composer button. The button has two child
    spans; CSS shows exactly one based on data-mode. Stop mode flips the
    button to a muted/danger fill so it reads as "interrupt" not "submit". */
-#send .send-mode,
-#send .stop-mode { display: inline-flex; align-items: center; gap: 7px; }
-#send[data-mode="send"] .stop-mode,
-#send[data-mode="stop"] .send-mode { display: none; }
-#send[data-mode="stop"] {
+.composer-send .send-mode,
+.composer-send .stop-mode { display: inline-flex; align-items: center; gap: 7px; }
+.composer-send[data-mode="send"] .stop-mode,
+.composer-send[data-mode="stop"] .send-mode { display: none; }
+.composer-send[data-mode="stop"] {
   background: var(--card);
   color: var(--bad);
   border-color: color-mix(in oklab, var(--bad) 40%, var(--rule));
 }
-#send[data-mode="stop"]:hover:not(:disabled) {
+.composer-send[data-mode="stop"]:hover:not(:disabled) {
   background: color-mix(in oklab, var(--bad) 10%, var(--card));
   border-color: var(--bad);
   color: var(--bad);
@@ -1062,13 +1063,13 @@ footer textarea:focus {
 }
 
 /* ----- composer attachments ----- */
-#composer-attachments {
+.composer-attachments {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
   padding: 4px 0 2px;
 }
-#composer-attachments:empty { display: none; }
+.composer-attachments:empty { display: none; }
 .composer-chip {
   position: relative;
   width: 56px;
@@ -1446,7 +1447,7 @@ body.lightbox-open { overflow: hidden; }
     font-size: 16px; /* prevent iOS Safari auto-zoom on focus */
     resize: none;
   }
-  footer button#send { padding: 0 12px; font-size: 14px; min-height: 40px; }
+  footer button.composer-send { padding: 0 12px; font-size: 14px; min-height: 40px; }
   .plus-btn { width: 36px; height: 36px; flex-basis: 36px; }
   .plus-menu-item { padding: 11px 12px; }  /* roomier touch targets */
   .ratio-chip { min-height: 34px; padding: 6px 12px; font-size: 14px; }

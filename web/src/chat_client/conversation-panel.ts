@@ -38,6 +38,7 @@ interface PanelElements {
   workspace: HTMLElement;
   main: HTMLElement;
   chatMessages: HTMLElement;
+  chatComposer: HTMLElement;
   composer: HTMLElement;
   header: HTMLElement;
   resizeHandle: HTMLElement;
@@ -63,8 +64,7 @@ export class ConversationPanel {
   private readonly options: PanelOptions;
   private readonly events = new AbortController();
   private readonly panelMount = document.createComment("conversation panel");
-  private readonly composerMount = document.createComment("shared composer");
-  private readonly headerMount = document.createComment("shared header");
+  private readonly layoutMount = document.createComment("Drop layout controls");
   private preferred: PanelLayout = "full";
   private geometry: PanelGeometry;
   private layout: PanelLayout = "full";
@@ -75,8 +75,7 @@ export class ConversationPanel {
     this.elements = elements;
     this.options = options;
     elements.panel.before(this.panelMount);
-    elements.composer.before(this.composerMount);
-    elements.header.before(this.headerMount);
+    elements.layoutSelect.before(this.layoutMount);
     const viewport = this.viewport();
     this.geometry = fitPanelGeometry({
       width: viewport.width * .34, height: viewport.height * .75,
@@ -135,15 +134,17 @@ export class ConversationPanel {
     }, eventOptions);
   }
 
+  get isExclusive(): boolean { return this.opened && this.layout === "full"; }
+
   open(): void { this.opened = true; this.render(); }
 
   close(): void {
     this.finishGesture(false);
     this.opened = false;
-    const { panel, chatMessages, composer, workspace, header, layoutSelect, closeButton } = this.elements;
+    const { panel, chatMessages, chatComposer, workspace, layoutSelect, closeButton } = this.elements;
     this.panelMount.after(panel);
-    this.composerMount.after(composer);
-    this.headerMount.after(header);
+    chatComposer.hidden = false;
+    this.layoutMount.after(layoutSelect);
     this.setHeaderMovable(false);
     layoutSelect.hidden = true;
     closeButton.hidden = true;
@@ -157,8 +158,7 @@ export class ConversationPanel {
     this.close();
     this.events.abort();
     this.panelMount.remove();
-    this.composerMount.remove();
-    this.headerMount.remove();
+    this.layoutMount.remove();
   }
 
   private viewport(): Viewport { return { width: window.innerWidth, height: window.innerHeight }; }
@@ -172,7 +172,7 @@ export class ConversationPanel {
 
   private render(): void {
     if (!this.opened) return;
-    const { panel, workspace, main, chatMessages, composer, header, layoutSelect, closeButton, resizeHandle } = this.elements;
+    const { panel, workspace, main, chatMessages, chatComposer, composer, header, layoutSelect, closeButton, resizeHandle } = this.elements;
     const focused = panel.ownerDocument.activeElement as HTMLElement | null;
     const messages = panel.querySelector<HTMLElement>(".message-list");
     const scrollTop = messages?.scrollTop ?? 0;
@@ -183,9 +183,9 @@ export class ConversationPanel {
       else parent.append(panel);
     }
     if (composer.parentElement !== panel) panel.append(composer);
-    if (this.layout === "full") {
-      if (header.parentElement !== main) this.headerMount.after(header);
-    } else if (header.parentElement !== panel) panel.prepend(header);
+    header.hidden = this.layout === "full";
+    if (this.layout === "full") this.layoutMount.after(layoutSelect);
+    else header.querySelector(".actions")!.prepend(layoutSelect);
     panel.hidden = false;
     panel.dataset.layout = this.layout;
     workspace.dataset.panelLayout = this.layout;
@@ -197,7 +197,8 @@ export class ConversationPanel {
       option.disabled = effectivePanelLayout(option.value as PanelLayout, window.innerWidth) !== option.value;
     }
     chatMessages.hidden = this.layout === "full";
-    chatMessages.inert = true;
+    chatMessages.inert = false;
+    chatComposer.hidden = this.layout === "full";
     this.setHeaderMovable(this.layout === "float");
     resizeHandle.hidden = this.layout !== "float";
     if (this.layout === "float") this.paintGeometry();
