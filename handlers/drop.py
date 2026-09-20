@@ -1484,9 +1484,14 @@ def make_drop_serve_handler(deps: DropDeps):
                     and normalized_mime not in _INLINE_DROP_MIME
                 ):
                     normalized_mime = await _resolve_drop_mime(payload, normalized_mime)
-        except InvalidImagePreview:
+        except InvalidImagePreview as exc:
+            logger.warning(
+                "[WebChatGateway] drop preview rejected file_id=%s reason=%s detail=%s",
+                file_id, exc.reason, exc.detail,
+                exc_info=True,
+            )
             return json_response(
-                {"error": "unsupported_preview"}, status=415,
+                {"error": "unsupported_preview", "reason": exc.reason, "detail": exc.detail}, status=415,
                 origin=origin, allowed_origins=allowed,
                 same_origin_host=same_host,
             )

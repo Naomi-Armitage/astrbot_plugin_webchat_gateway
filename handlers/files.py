@@ -44,7 +44,7 @@ from ..core.file_cookie import (
     verify as verify_file_cookie,
 )
 from ..core.file_store import FileStore, FileStoreUnavailable
-from ..core.image_preview import ImagePreviewCache, PREVIEW_MIME
+from ..core.image_preview import ImagePreviewCache, InvalidImagePreview, PREVIEW_MIME
 from ..core.image_util import (
     ALLOWED_MIME_TO_EXT,
     detect_image_mime_async,
@@ -698,6 +698,16 @@ def make_serve_handler(deps: UploadDeps):
                 payload = await previews.read(deps.file_store, storage_key=row.storage_key)
             else:
                 payload = await deps.file_store.read(storage_key=row.storage_key)
+        except InvalidImagePreview as exc:
+            logger.warning(
+                "[WebChatGateway] image preview rejected file_id=%s reason=%s detail=%s",
+                file_id, exc.reason, exc.detail,
+                exc_info=True,
+            )
+            return json_response(
+                {"error": "unsupported_preview", "reason": exc.reason, "detail": exc.detail}, status=415,
+                origin=origin, allowed_origins=allowed, same_origin_host=same_host,
+            )
         except FileStoreUnavailable:
             # Backend unreachable (R2 outage, transient network) — 503
             # so the client knows to retry rather than caching the

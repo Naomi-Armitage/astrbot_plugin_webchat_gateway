@@ -86,6 +86,8 @@ def _scoped_max_pixels(target: int):
 # returns (uppercase letters, no slash) so we don't double-map.
 _FORMAT_TO_MIME: dict[str, str] = {
     "JPEG": "image/jpeg",
+    # MPF JPEGs (phone HDR/depth photos) remain browser-readable JPEG files.
+    "MPO":  "image/jpeg",
     "PNG":  "image/png",
     "WEBP": "image/webp",
     "GIF":  "image/gif",

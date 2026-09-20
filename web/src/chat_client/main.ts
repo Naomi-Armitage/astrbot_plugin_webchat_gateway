@@ -3580,6 +3580,53 @@ function appendDropFileLink(bubble: HTMLElement, item: DropMessage): void {
   details.append(name, meta); link.append(createFileTypeIcon(item.filename), details); bubble.append(link);
 }
 
+function appendDropPreviewFailure(bubble: HTMLElement, item: DropMessage): void {
+  appendDropFileLink(bubble, item);
+  if (!item.file_id || bubble.querySelector(".msg-preview-error")) return;
+  const failure = document.createElement("div");
+  failure.className = "msg-preview-error";
+  const status = document.createElement("span");
+  status.setAttribute("role", "status");
+  status.textContent = "图片预览加载失败";
+  const retry = document.createElement("button");
+  retry.type = "button";
+  retry.textContent = "重试预览";
+  const url = new URL(DROP_FILE_URL(item.file_id) + "?preview=1", location.href);
+  retry.onclick = () => {
+    _imgRetriedAt.delete(url.href);
+    bubble.closest(".msg-row")?.remove();
+    renderDropMessages();
+    const img = dropMessagesEl.querySelector<HTMLImageElement>(`[data-drop-id="${item.id}"] .msg-image`);
+    if (img) {
+      const fresh = new URL(url);
+      fresh.searchParams.set("_r", String(Date.now()));
+      img.src = fresh.href;
+    }
+  };
+  failure.append(status, retry);
+  bubble.append(failure);
+  // <img> cannot expose an HTTP error body. A single authenticated probe
+  // makes a server-side preview rejection visible instead of hiding it.
+  void fetchWithTimeout(url.href, {
+    headers: bearer(), credentials: "same-origin", cache: "no-store",
+  }, FETCH_TIMEOUT_FAST_MS).then(async (resp) => {
+    if (resp.ok) { await resp.body?.cancel(); return; }
+    const data = await resp.json().catch(() => ({})) as { detail?: unknown };
+    if (!status.isConnected) return;
+    if (resp.status === 415) {
+      status.textContent = typeof data.detail === "string" ? data.detail : "此图片暂时无法生成预览";
+    } else if (resp.status === 401 || resp.status === 403) {
+      status.textContent = "没有权限查看这张图片";
+    } else if (resp.status === 404) {
+      status.textContent = "原图片已不存在";
+    } else {
+      status.textContent = "图片预览服务暂时不可用，请重试";
+    }
+  }).catch(() => {
+    if (status.isConnected) status.textContent = "无法连接图片预览服务，请重试";
+  });
+}
+
 function renderDropMessages(options: { forceBottom?: boolean } = {}): void {
   const previousScrollTop = dropMessagesEl.scrollTop;
   const wasNearBottom = dropMessagesEl.scrollHeight - previousScrollTop - dropMessagesEl.clientHeight < 80;
@@ -3609,7 +3656,7 @@ function renderDropMessages(options: { forceBottom?: boolean } = {}): void {
         // Keep the original downloadable if validation or the retry fails.
         bubble.querySelector(".msg-attachments")?.remove();
         bubble.classList.remove("has-image", "has-image-only");
-        appendDropFileLink(bubble, item);
+        appendDropPreviewFailure(bubble, item);
       },
     });
     children.push(bubble.closest<HTMLElement>(".msg-row")!);

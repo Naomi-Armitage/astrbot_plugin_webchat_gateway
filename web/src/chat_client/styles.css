@@ -1864,5 +1864,7 @@ body.lightbox-open { overflow: hidden; }
 .msg-file-details { display: flex; flex-direction: column; min-width: 0; }
 .msg-file-name { overflow-wrap: anywhere; }
 .msg-file-meta { font: 12px/1.5 var(--font-ui); opacity: .75; }
+.msg-preview-error { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 8px; color: var(--ink-soft); font: 12px/1.5 var(--font-ui); }
+.msg-preview-error button { border: 1px solid var(--rule); border-radius: 6px; padding: 3px 7px; background: var(--card); color: var(--ink); cursor: pointer; font: inherit; }
 .composer-chip.file-chip { width: 150px; }
 .composer-file-name { padding: 8px 22px 8px 8px; font: 12px/1.4 var(--font-ui); overflow: hidden; overflow-wrap: anywhere; }

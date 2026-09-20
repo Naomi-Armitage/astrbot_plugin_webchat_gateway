@@ -1,6 +1,7 @@
 """Preview pixels, memory bounds, and authenticated HTTP delivery."""
 
 import asyncio
+import json
 from io import BytesIO
 from random import Random
 from unittest.mock import AsyncMock
@@ -45,8 +46,52 @@ def test_pixel_limit_checked_before_decoding(monkeypatch):
     from astrbot_plugin_webchat_gateway.core import image_preview
 
     monkeypatch.setattr(image_preview, "PIL_MAX_PIXELS", 100)
-    with pytest.raises(ValueError, match="pixel limit"):
+    with pytest.raises(ValueError, match="分辨率超出预览上限"):
         make_image_preview(image_bytes(size=(20, 20)))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("photo_kind", ["mpo", "high_resolution"])
+async def test_phone_jpeg_previews_from_legacy_drop_files(tmp_path, photo_kind):
+    from astrbot_plugin_webchat_gateway.core.image_util import detect_image_mime
+    from astrbot_plugin_webchat_gateway.handlers.drop import make_drop_serve_handler
+
+    output = BytesIO()
+    if photo_kind == "mpo":
+        # Phone HDR/depth JPEGs can contain an MPF marker and a second frame.
+        # Pillow calls this MPO even though the filename is still .jpeg.
+        with Image.new("RGB", (5712, 4248), "blue") as photo, Image.new("RGB", (400, 300), "red") as extra:
+            photo.save(output, format="MPO", save_all=True, append_images=[extra])
+        content = output.getvalue()
+        with Image.open(BytesIO(content)) as image:
+            assert image.format == "MPO"
+        assert detect_image_mime(content) == "image/jpeg"
+    else:
+        # This photo is under 1 MB on disk, but just over 50 million pixels.
+        with Image.new("RGB", (8192, 6144), "blue") as photo:
+            photo.save(output, format="JPEG", quality=90)
+        content = output.getvalue()
+
+    storage, _audit, _bus, _guard, store, deps, headers, name = await _make_harness(tmp_path)
+    file_id = "c" * 16
+    await store.save(storage_key="phone.bin", content=content, mime="application/octet-stream")
+    await storage.insert_file(
+        file_id=file_id, token_name=name, session_id="drop", mime="application/octet-stream",
+        size_bytes=len(content), storage_key="phone.bin", now=1, filename="IMG_5918.jpeg",
+    )
+    handler = make_drop_serve_handler(deps)
+    try:
+        response = await handler(make_mocked_request(
+            "GET", f"/api/webchat/drop/files/{file_id}?preview=1", headers=headers,
+            match_info={"file_id": file_id},
+        ))
+        assert response.status == 200, response.text
+        with Image.open(BytesIO(response.body)) as preview:
+            assert preview.size == ((640, 476) if photo_kind == "mpo" else (640, 480))
+            red, _, blue = preview.getpixel((320, 240))[:3]
+            assert blue > 200 and red < 30  # Main photo, not the auxiliary frame.
+    finally:
+        await storage.close()
 
 
 @pytest.mark.asyncio
@@ -216,7 +261,11 @@ async def test_non_images_with_jpeg_filenames_stay_downloadable(tmp_path, conten
         ))
 
     try:
-        assert (await get("?preview=1")).status == 415
+        response = await get("?preview=1")
+        assert response.status == 415
+        error = json.loads(response.text)
+        assert error["reason"] == "decode_failed"
+        assert error["detail"] == "图片数据不完整或无法解码"
         for query in ("", "?download=1", "?preview=1&download=1"):
             response = await get(query)
             assert response.status == 200

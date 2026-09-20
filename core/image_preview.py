@@ -19,16 +19,28 @@ PREVIEW_MIME = "image/webp"
 class InvalidImagePreview(ValueError):
     """The source is not a supported, decodable raster image."""
 
+    def __init__(self, detail: str, *, reason: str = "decode_failed") -> None:
+        super().__init__(detail)
+        self.detail = detail
+        self.reason = reason
+
 
 def make_image_preview(content: bytes) -> bytes:
     """Decode one frame off-thread, respecting orientation and transparency."""
     with Image.open(BytesIO(content)) as source:
-        if source.format not in {"JPEG", "PNG", "WEBP", "GIF"}:
-            raise InvalidImagePreview("Unsupported preview format")
-        if source.width * source.height > PIL_MAX_PIXELS:
-            raise ValueError("Image exceeds preview pixel limit")
+        if source.format not in {"JPEG", "MPO", "PNG", "WEBP", "GIF"}:
+            raise InvalidImagePreview(
+                f"暂不支持 {source.format or '未知'} 格式的图片预览", reason="unsupported_format",
+            )
         # JPEG can downsample during decoding, saving memory for camera photos.
+        # Apply the allocation limit AFTER draft: a 50 MP camera JPEG needs
+        # less than 1 MP of decoded pixels at its 1/8 decoder scale. MPO uses
+        # the same decoder and opens on the main photo, not the extra frame.
         source.draft("RGB", (PREVIEW_MAX_EDGE, PREVIEW_MAX_EDGE))
+        if source.width * source.height > PIL_MAX_PIXELS:
+            raise InvalidImagePreview(
+                "图片分辨率超出预览上限", reason="pixel_limit",
+            )
         source.thumbnail((PREVIEW_MAX_EDGE, PREVIEW_MAX_EDGE), Image.Resampling.LANCZOS)
         ImageOps.exif_transpose(source, in_place=True)
         mode = "RGBA" if "A" in source.getbands() or "transparency" in source.info else "RGB"
@@ -65,8 +77,12 @@ class ImagePreviewCache:
                 return None
             try:
                 preview = await asyncio.to_thread(make_image_preview, content)
-            except (OSError, ValueError, SyntaxError, Image.DecompressionBombError) as exc:
-                raise InvalidImagePreview("Cannot decode image preview") from exc
+            except InvalidImagePreview:
+                raise
+            except Image.DecompressionBombError as exc:
+                raise InvalidImagePreview("图片分辨率超出预览上限", reason="pixel_limit") from exc
+            except (OSError, ValueError, SyntaxError) as exc:
+                raise InvalidImagePreview("图片数据不完整或无法解码") from exc
             if len(preview) <= self._max_bytes:
                 # Another request may have finished the same preview meanwhile.
                 previous = self._cache.pop(storage_key, None)
