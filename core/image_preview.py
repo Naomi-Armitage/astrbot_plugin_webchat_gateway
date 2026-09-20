@@ -16,9 +16,15 @@ PREVIEW_MAX_EDGE = 640
 PREVIEW_MIME = "image/webp"
 
 
+class InvalidImagePreview(ValueError):
+    """The source is not a supported, decodable raster image."""
+
+
 def make_image_preview(content: bytes) -> bytes:
     """Decode one frame off-thread, respecting orientation and transparency."""
     with Image.open(BytesIO(content)) as source:
+        if source.format not in {"JPEG", "PNG", "WEBP", "GIF"}:
+            raise InvalidImagePreview("Unsupported preview format")
         if source.width * source.height > PIL_MAX_PIXELS:
             raise ValueError("Image exceeds preview pixel limit")
         # JPEG can downsample during decoding, saving memory for camera photos.
@@ -57,7 +63,10 @@ class ImagePreviewCache:
             content = await store.read(storage_key=storage_key)
             if content is None:
                 return None
-            preview = await asyncio.to_thread(make_image_preview, content)
+            try:
+                preview = await asyncio.to_thread(make_image_preview, content)
+            except (OSError, ValueError, SyntaxError, Image.DecompressionBombError) as exc:
+                raise InvalidImagePreview("Cannot decode image preview") from exc
             if len(preview) <= self._max_bytes:
                 # Another request may have finished the same preview meanwhile.
                 previous = self._cache.pop(storage_key, None)

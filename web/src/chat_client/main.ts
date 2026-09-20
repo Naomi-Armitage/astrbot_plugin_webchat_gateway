@@ -1,5 +1,6 @@
 import { createComposer, autosizeComposer, type ComposerTarget } from "./composer";
 import { ConversationPanel } from "./conversation-panel";
+import { isDropImage } from "./drop-image";
 import "./conversation-panel.css";
 import {
   LS_TOKEN,
@@ -868,7 +869,7 @@ function addMessageBubble(
   text: string,
   attachments?: AttachmentRef[],
   failure?: { reason: FailureReason },
-  options: { target?: HTMLElement; dropMessage?: DropMessage; scroll?: boolean } = {},
+  options: { target?: HTMLElement; dropMessage?: DropMessage; scroll?: boolean; onImageError?: () => void } = {},
 ): HTMLDivElement {
   const target = options.target ?? msgs;
   const dropMessage = options.dropMessage;
@@ -913,7 +914,7 @@ function addMessageBubble(
       img.decoding = "async";
       img.alt = "";
       img.src = srcFor(a) + "?preview=1";
-      attachImgErrorRetry(img);
+      attachImgErrorRetry(img, options.onImageError);
       const captureIdx = i;
       img.addEventListener("click", () => openLightbox(list, captureIdx, srcFor, img.ownerDocument));
       img.tabIndex = 0;
@@ -3513,10 +3514,6 @@ function dropFileSize(size: number | undefined): string {
   return `${(value / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function isDropImage(mime: string | undefined): boolean {
-  return mime === "image/jpeg" || mime === "image/png" || mime === "image/webp" || mime === "image/gif";
-}
-
 function createFileTypeIcon(filename: string | undefined): HTMLElement {
   const icon = document.createElement("span");
   icon.className = "msg-file-icon";
@@ -3571,6 +3568,18 @@ function createDropLoadOlderButton(): HTMLButtonElement | null {
   return older;
 }
 
+function appendDropFileLink(bubble: HTMLElement, item: DropMessage): void {
+  if (!item.file_id || bubble.querySelector(".msg-file")) return;
+  const link = document.createElement("a");
+  link.className = "msg-file";
+  link.href = DROP_FILE_URL(item.file_id) + "?download=1";
+  link.download = item.filename || "download";
+  const details = document.createElement("span"); details.className = "msg-file-details";
+  const name = document.createElement("span"); name.className = "msg-file-name"; name.textContent = item.filename || "文件";
+  const meta = document.createElement("span"); meta.className = "msg-file-meta"; meta.textContent = dropFileSize(item.size);
+  details.append(name, meta); link.append(createFileTypeIcon(item.filename), details); bubble.append(link);
+}
+
 function renderDropMessages(options: { forceBottom?: boolean } = {}): void {
   const previousScrollTop = dropMessagesEl.scrollTop;
   const wasNearBottom = dropMessagesEl.scrollHeight - previousScrollTop - dropMessagesEl.clientHeight < 80;
@@ -3591,21 +3600,21 @@ function renderDropMessages(options: { forceBottom?: boolean } = {}): void {
   for (const item of [...dropMessages].reverse()) {
     const cached = existing.get(item.id);
     if (cached) { children.push(cached); continue; }
-    const image = !!item.file_id && isDropImage(item.mime);
-    const attachments = image ? [{ file_id: item.file_id!, mime: item.mime! }] : undefined;
+    const image = !!item.file_id && isDropImage(item.mime, item.filename);
+    const attachments = image ? [{ file_id: item.file_id!, mime: item.mime || "application/octet-stream" }] : undefined;
     const bubble = addMessageBubble(item.device_id === dropDeviceId ? "user" : "bot", item.text, attachments, undefined, {
       target: dropMessagesEl, dropMessage: item, scroll: false,
+      onImageError: () => {
+        // A .jpg filename may belong to a non-image or a damaged file.
+        // Keep the original downloadable if validation or the retry fails.
+        bubble.querySelector(".msg-attachments")?.remove();
+        bubble.classList.remove("has-image", "has-image-only");
+        appendDropFileLink(bubble, item);
+      },
     });
     children.push(bubble.closest<HTMLElement>(".msg-row")!);
     if (item.kind === "file" && item.file_id && !image) {
-      const link = document.createElement("a");
-      link.className = "msg-file";
-      link.href = DROP_FILE_URL(item.file_id) + "?download=1";
-      link.download = item.filename || "download";
-      const details = document.createElement("span"); details.className = "msg-file-details";
-      const name = document.createElement("span"); name.className = "msg-file-name"; name.textContent = item.filename || "文件";
-      const meta = document.createElement("span"); meta.className = "msg-file-meta"; meta.textContent = dropFileSize(item.size);
-      details.append(name, meta); link.append(createFileTypeIcon(item.filename), details); bubble.append(link);
+      appendDropFileLink(bubble, item);
     }
   }
   // Keep unchanged rows mounted so live updates preserve keyboard focus,
@@ -4460,13 +4469,13 @@ function fileServeUrl(file_id: string): string {
 // a 60s cooldown — defends against an auth-loop with a permanently
 // bad token, while still recovering from transient failures.
 const _imgRetriedAt = new Map<string, number>();
-function attachImgErrorRetry(img: HTMLImageElement): void {
+function attachImgErrorRetry(img: HTMLImageElement, onFailure?: () => void): void {
   img.addEventListener("error", () => {
     const retryUrl = new URL(img.src);
     retryUrl.searchParams.delete("_r");
     const base = retryUrl.href;
     const last = _imgRetriedAt.get(base);
-    if (last !== undefined && Date.now() - last < 60_000) return;
+    if (last !== undefined && Date.now() - last < 60_000) { onFailure?.(); return; }
     _imgRetriedAt.set(base, Date.now());
     void probeQuota().then(() => {
       // Cache-bust so the browser re-fetches even though the URL is
@@ -4478,7 +4487,7 @@ function attachImgErrorRetry(img: HTMLImageElement): void {
       if (currentUrl.href !== base) return;
       retryUrl.searchParams.set("_r", String(Date.now()));
       img.src = retryUrl.href;
-    }).catch(() => {});
+    }).catch(() => onFailure?.());
   });
 }
 
@@ -4683,7 +4692,7 @@ function addAttachmentFiles(rawFiles: FileList | File[], target: ComposerTarget 
       local_id: genLocalId(),
       mime: file.type,
       size: file.size,
-      preview_url: isDrop && !isDropImage(file.type) ? "" : URL.createObjectURL(file),
+      preview_url: isDrop && !isDropImage(file.type, file.name) ? "" : URL.createObjectURL(file),
       state: "uploading",
     };
     queue.push(attachment);

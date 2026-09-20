@@ -53,7 +53,7 @@ from ..core.file_lifecycle import (
     release_files_safely,
 )
 from ..core.file_store import FileStore, FileStoreUnavailable
-from ..core.image_preview import ImagePreviewCache, PREVIEW_MIME
+from ..core.image_preview import ImagePreviewCache, InvalidImagePreview, PREVIEW_MIME
 from ..core.image_util import detect_image_mime_async, ext_for_mime
 from ..core.ip_guard import IpGuard
 from ..core.ratelimit import PerTokenUploadGate
@@ -250,8 +250,9 @@ def _is_blocked_drop_extension(filename: str) -> bool:
 def _guess_drop_mime(content: bytes, declared: str) -> str:
     """Authoritative MIME for a NON-image Drop upload.
 
-    Image declarations never reach here — `_resolve_drop_mime` routes
-    them through the PIL sniff. Non-images trust the declared type only
+    Image declarations and raster signatures never reach here —
+    `_resolve_drop_mime` routes them through the PIL sniff.
+    Non-images trust the declared type only
     when it's not one of the executable set; anything undeclared or
     suspicious becomes application/octet-stream (which always
     downloads, never renders).
@@ -272,10 +273,12 @@ def _guess_drop_mime(content: bytes, declared: str) -> str:
 
 
 async def _resolve_drop_mime(content: bytes, declared: str) -> str:
-    """Async MIME resolution — off-thread PIL for images, sync policy
-    for everything else. Returns the authoritative stored MIME."""
+    """Recognize raster bytes even when the browser omits the file type."""
     declared_norm = (declared or "").split(";", 1)[0].strip().lower()
-    if declared_norm.startswith("image/"):
+    raster_header = content.startswith((
+        b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n", b"GIF87a", b"GIF89a",
+    )) or (content.startswith(b"RIFF") and content[8:12] == b"WEBP")
+    if declared_norm.startswith("image/") or raster_header:
         # Content-sniff: a mislabeled non-image must not land in an
         # <img>-renderable slot. Returns the canonical image MIME or
         # None (→ caller 415s / falls back to octet-stream).
@@ -1467,13 +1470,26 @@ def make_drop_serve_handler(deps: DropDeps):
 
         normalized_mime = (row.mime or "").split(";", 1)[0].strip().lower()
         force_download = request.query.get("download", "") == "1"
-        is_image = normalized_mime in _INLINE_DROP_MIME and not force_download
-        preview = is_image and request.query.get("preview") == "1"
+        # Legacy uploads may contain JPEG bytes but carry octet-stream MIME.
+        # Preview generation validates the actual format before rendering.
+        preview = request.query.get("preview") == "1" and not force_download
         try:
             if preview:
                 payload = await previews.read(deps.file_store, storage_key=row.storage_key)
             else:
                 payload = await deps.file_store.read(storage_key=row.storage_key)
+                if (
+                    payload is not None
+                    and not force_download
+                    and normalized_mime not in _INLINE_DROP_MIME
+                ):
+                    normalized_mime = await _resolve_drop_mime(payload, normalized_mime)
+        except InvalidImagePreview:
+            return json_response(
+                {"error": "unsupported_preview"}, status=415,
+                origin=origin, allowed_origins=allowed,
+                same_origin_host=same_host,
+            )
         except FileStoreUnavailable:
             logger.exception(
                 "[WebChatGateway] drop file_store.read backend unavailable"
@@ -1501,6 +1517,7 @@ def make_drop_serve_handler(deps: DropDeps):
         # Images remain inline for the Drop thumbnail path by default. A
         # caller can explicitly request a download (the adjacent client
         # download button) without fetching the response into JS memory.
+        is_image = not force_download and (preview or normalized_mime in _INLINE_DROP_MIME)
         cors = build_cors_headers(origin, allowed, same_origin_host=same_host)
         if is_image:
             disposition = 'inline'

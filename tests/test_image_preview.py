@@ -102,7 +102,7 @@ async def test_concurrent_source_reads_are_bounded():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("route", ["drop", "chat", "r2_direct"])
+@pytest.mark.parametrize("route", ["drop", "drop_legacy", "chat", "r2_direct"])
 async def test_large_jpeg_preview_and_original_delivery(tmp_path, route):
     from astrbot_plugin_webchat_gateway.core.auth import generate_token, hash_token
     from astrbot_plugin_webchat_gateway.handlers.drop import make_drop_serve_handler
@@ -115,16 +115,18 @@ async def test_large_jpeg_preview_and_original_delivery(tmp_path, route):
         source.save(output, format="JPEG", quality=98)
         original = output.getvalue()
     assert len(original) > 5 * 1024 * 1024
+    is_drop = route.startswith("drop")
     file_id = "a" * 16
     key = f"{name}/{file_id}.jpg"
     await store.save(storage_key=key, content=original, mime="image/jpeg")
     await storage.insert_file(
-        file_id=file_id, token_name=name, session_id="drop" if route == "drop" else "chat",
-        mime="image/jpeg", size_bytes=len(original), storage_key=key,
+        file_id=file_id, token_name=name, session_id="drop" if is_drop else "chat",
+        mime="application/octet-stream" if route == "drop_legacy" else "image/jpeg",
+        size_bytes=len(original), storage_key=key,
         now=1, filename="photo.jpeg",
     )
     store.signed_url = AsyncMock(return_value="https://example.test/original.jpg")
-    if route == "drop":
+    if is_drop:
         handler = make_drop_serve_handler(deps)
         url = f"/api/webchat/drop/files/{file_id}"
     else:
@@ -169,10 +171,56 @@ async def test_large_jpeg_preview_and_original_delivery(tmp_path, route):
         else:
             assert response.headers["Content-Type"] == "image/jpeg"
             assert response.body == original
-        if route == "drop":
+        if is_drop:
             response = await get("?preview=1&download=1")
             assert response.headers["Content-Disposition"].startswith("attachment")
             assert "photo.jpeg" in response.headers["Content-Disposition"]
             assert response.body == original
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("declared", ["", "application/octet-stream", "image/jpg", "text/plain"])
+@pytest.mark.parametrize("format,mime", [
+    ("JPEG", "image/jpeg"), ("PNG", "image/png"),
+    ("GIF", "image/gif"), ("WEBP", "image/webp"),
+])
+async def test_drop_upload_recognizes_image_bytes_without_browser_mime(declared, format, mime):
+    from astrbot_plugin_webchat_gateway.handlers.drop import _resolve_drop_mime
+
+    assert await _resolve_drop_mime(image_bytes(format=format), declared) == mime
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", [b"<html>not an image</html>", b"\xff\xd8\xffbroken jpeg"])
+async def test_non_images_with_jpeg_filenames_stay_downloadable(tmp_path, content):
+    from astrbot_plugin_webchat_gateway.handlers.drop import (
+        _resolve_drop_mime, make_drop_serve_handler,
+    )
+
+    assert await _resolve_drop_mime(content, "application/octet-stream") == "application/octet-stream"
+    storage, _audit, _bus, _guard, store, deps, headers, name = await _make_harness(tmp_path)
+    file_id = "b" * 16
+    await store.save(storage_key="fake.jpg", content=content, mime="application/octet-stream")
+    await storage.insert_file(
+        file_id=file_id, token_name=name, session_id="drop", mime="application/octet-stream",
+        size_bytes=len(content), storage_key="fake.jpg", now=1, filename="fake.jpeg",
+    )
+    handler = make_drop_serve_handler(deps)
+
+    async def get(query):
+        return await handler(make_mocked_request(
+            "GET", f"/api/webchat/drop/files/{file_id}{query}",
+            headers=headers, match_info={"file_id": file_id},
+        ))
+
+    try:
+        assert (await get("?preview=1")).status == 415
+        for query in ("", "?download=1", "?preview=1&download=1"):
+            response = await get(query)
+            assert response.status == 200
+            assert response.headers["Content-Disposition"].startswith("attachment")
+            assert response.body == content
     finally:
         await storage.close()
