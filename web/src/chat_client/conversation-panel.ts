@@ -1,3 +1,4 @@
+import { PictureWindow } from "./picture-window.ts";
 export type PanelLayout = "full" | "float" | "dock";
 export interface PanelGeometry { left: number; top: number; width: number; height: number }
 interface Viewport { width: number; height: number }
@@ -48,6 +49,9 @@ interface PanelElements {
 interface PanelOptions {
   onClose: () => void;
   onLayout: () => void;
+  onDocument: (doc: Document) => void;
+  onExternalChange: () => void;
+  onNotice: (message: string) => void;
 }
 interface Gesture {
   id: number;
@@ -70,10 +74,15 @@ export class ConversationPanel {
   private layout: PanelLayout = "full";
   private opened = false;
   private gesture: Gesture | null = null;
+  private readonly picture: PictureWindow;
 
   constructor(elements: PanelElements, options: PanelOptions) {
     this.elements = elements;
     this.options = options;
+    this.picture = new PictureWindow(() => {
+      options.onClose();
+      options.onExternalChange();
+    }, options.onDocument);
     elements.panel.before(this.panelMount);
     elements.layoutSelect.before(this.layoutMount);
     const viewport = this.viewport();
@@ -93,7 +102,10 @@ export class ConversationPanel {
       this.finishGesture(false);
       this.preferred = layout;
       this.persist();
+      if (layout !== "float") this.picture.close();
       this.render();
+      if (this.layout === "float") void this.openPictureWindow();
+      options.onExternalChange();
     }, eventOptions);
     elements.closeButton.addEventListener("click", options.onClose, eventOptions);
     window.addEventListener("resize", () => {
@@ -116,7 +128,7 @@ export class ConversationPanel {
     const keyboardHandles: [HTMLElement, Gesture["kind"]][] = [[elements.header, "move"], [elements.resizeHandle, "resize"]];
     for (const [handle, kind] of keyboardHandles) {
       handle.addEventListener("keydown", (event) => {
-        if (!this.opened || this.layout !== "float" || event.target !== handle || !event.key.startsWith("Arrow")) return;
+        if (!this.opened || this.picture.window || this.layout !== "float" || event.target !== handle || !event.key.startsWith("Arrow")) return;
         event.preventDefault();
         const step = event.shiftKey ? 40 : 10;
         this.adjust(kind, event.key === "ArrowRight" ? step : event.key === "ArrowLeft" ? -step : 0,
@@ -136,11 +148,30 @@ export class ConversationPanel {
 
   get isExclusive(): boolean { return this.opened && this.layout === "full"; }
 
-  open(): void { this.opened = true; this.render(); }
+  get externalVisible(): boolean { return !!this.picture.window && !this.picture.window.document.hidden; }
+
+  open(): void {
+    this.opened = true;
+    this.render();
+    if (this.layout === "float") void this.openPictureWindow();
+  }
+
+  private async openPictureWindow(): Promise<void> {
+    const opened = await this.picture.open(this.elements.panel, this.geometry);
+    if (!this.opened || this.preferred !== "float") return;
+    if (opened) {
+      this.render();
+      this.options.onExternalChange();
+      this.elements.composer.querySelector("textarea")?.focus();
+    } else {
+      this.options.onNotice("当前浏览器未能打开画中画窗口，已使用页内浮窗。");
+    }
+  }
 
   close(): void {
     this.finishGesture(false);
     this.opened = false;
+    this.picture.close();
     const { panel, chatMessages, chatComposer, workspace, layoutSelect, closeButton } = this.elements;
     this.panelMount.after(panel);
     chatComposer.hidden = false;
@@ -176,8 +207,8 @@ export class ConversationPanel {
     const focused = panel.ownerDocument.activeElement as HTMLElement | null;
     const messages = panel.querySelector<HTMLElement>(".message-list");
     const scrollTop = messages?.scrollTop ?? 0;
-    this.layout = effectivePanelLayout(this.preferred, window.innerWidth);
-    const parent = this.layout === "full" ? main : workspace;
+    this.layout = this.picture.window ? "float" : effectivePanelLayout(this.preferred, window.innerWidth);
+    const parent = this.picture.window?.document.body ?? (this.layout === "full" ? main : workspace);
     if (panel.parentElement !== parent) {
       if (this.layout === "full") this.panelMount.after(panel);
       else parent.append(panel);
@@ -191,17 +222,18 @@ export class ConversationPanel {
     workspace.dataset.panelLayout = this.layout;
     panel.setAttribute("role", this.layout === "float" ? "dialog" : "region");
     layoutSelect.value = this.layout;
-    layoutSelect.hidden = window.innerWidth < 720;
+    layoutSelect.hidden = !this.picture.window && window.innerWidth < 720;
     closeButton.hidden = this.layout === "full";
     for (const option of layoutSelect.options) {
-      option.disabled = effectivePanelLayout(option.value as PanelLayout, window.innerWidth) !== option.value;
+      option.disabled = option.value !== "float" && effectivePanelLayout(option.value as PanelLayout, window.innerWidth) !== option.value;
     }
     chatMessages.hidden = this.layout === "full";
     chatMessages.inert = false;
     chatComposer.hidden = this.layout === "full";
-    this.setHeaderMovable(this.layout === "float");
-    resizeHandle.hidden = this.layout !== "float";
-    if (this.layout === "float") this.paintGeometry();
+    const inPageFloat = this.layout === "float" && !this.picture.window;
+    this.setHeaderMovable(inPageFloat);
+    resizeHandle.hidden = !inPageFloat;
+    if (inPageFloat) this.paintGeometry();
     else for (const name of ["left", "top", "width", "height"]) panel.style.removeProperty(name);
     if (focused && (panel.contains(focused) || header.contains(focused))) {
       if (focused === layoutSelect && layoutSelect.hidden) composer.querySelector("textarea")?.focus({ preventScroll: true });
@@ -230,7 +262,7 @@ export class ConversationPanel {
   }
 
   private startGesture(event: PointerEvent, kind: Gesture["kind"], target: HTMLElement): void {
-    if (!this.opened || this.layout !== "float" || !event.isPrimary || event.button !== 0) return;
+    if (!this.opened || this.picture.window || this.layout !== "float" || !event.isPrimary || event.button !== 0) return;
     const interactive = (event.target as Element).closest("button, select, a, input");
     if (kind === "move" && interactive) return;
     event.preventDefault();

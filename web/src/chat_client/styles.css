@@ -450,7 +450,7 @@ header h1 {
 .actions .icon-only svg { width: 15px; height: 15px; }
 .actions [hidden] { display: none; }
 @media (max-width: 719px) {
-  #dropLayoutSelect { display: none; }
+  html:not([data-pip]) #dropLayoutSelect { display: none; }
 }
 
 .who {

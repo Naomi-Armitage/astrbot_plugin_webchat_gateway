@@ -652,20 +652,21 @@ function renderMarkdown(text: string): string {
 // plain-HTTP intranet deployments fall back to a hidden textarea +
 // document.execCommand. Returns true on success so callers can branch on
 // visual feedback (button flash, line flash).
-async function writeClipboard(text: string): Promise<boolean> {
-  if (navigator.clipboard?.writeText) {
-    try { await navigator.clipboard.writeText(text); return true; } catch {}
+async function writeClipboard(text: string, doc: Document = document): Promise<boolean> {
+  const clipboard = (doc.defaultView?.navigator ?? navigator).clipboard;
+  if (typeof clipboard?.writeText === "function") {
+    try { await clipboard.writeText(text); return true; } catch {}
   }
   try {
-    const ta = document.createElement("textarea");
+    const ta = doc.createElement("textarea");
     ta.value = text;
     ta.setAttribute("readonly", "");
     ta.style.position = "fixed";
     ta.style.opacity = "0";
-    document.body.appendChild(ta);
+    doc.body.appendChild(ta);
     ta.select();
-    const ok = document.execCommand("copy");
-    document.body.removeChild(ta);
+    const ok = doc.execCommand("copy");
+    doc.body.removeChild(ta);
     return ok;
   } catch {
     return false;
@@ -684,43 +685,43 @@ function gatherBlockText(block: Element): string {
 // on a code line — so this gives one consistent, explicit confirmation.
 // A single reusable node, anchored above the pointer (or the activated
 // element's rect for keyboard activation, where click coords are 0,0).
-let copyToastTimer = 0;
+const copyToastTimers = new WeakMap<Document, number>();
 function copyToastAnchor(e: MouseEvent, el: Element): { x: number; y: number } {
   if (e.clientX || e.clientY) return { x: e.clientX, y: e.clientY };
   const r = el.getBoundingClientRect();
   return { x: r.left + r.width / 2, y: r.top };
 }
-function showCopyToast(x: number, y: number): void {
-  let toast = document.getElementById("_copyToast");
+function showCopyToast(x: number, y: number, doc: Document = document): void {
+  let toast = doc.getElementById("_copyToast");
   if (!toast) {
-    toast = document.createElement("div");
+    toast = doc.createElement("div");
     toast.id = "_copyToast";
     toast.className = "copy-toast";
     toast.setAttribute("role", "status");
     toast.setAttribute("aria-live", "polite");
-    document.body.appendChild(toast);
+    doc.body.appendChild(toast);
   }
   toast.textContent = "已复制";
   // Clamp so the hint never clips off the top/sides of the viewport.
-  toast.style.left = `${Math.min(Math.max(44, x), window.innerWidth - 44)}px`;
+  toast.style.left = `${Math.min(Math.max(44, x), (doc.defaultView ?? window).innerWidth - 44)}px`;
   toast.style.top = `${Math.max(30, y - 10)}px`;
   // Re-trigger the show transition even on rapid repeat copies.
   toast.classList.remove("show");
   void toast.offsetWidth;
   toast.classList.add("show");
-  window.clearTimeout(copyToastTimer);
-  copyToastTimer = window.setTimeout(() => {
-    document.getElementById("_copyToast")?.classList.remove("show");
-  }, 1100);
+  window.clearTimeout(copyToastTimers.get(doc));
+  copyToastTimers.set(doc, window.setTimeout(() => {
+    doc.getElementById("_copyToast")?.classList.remove("show");
+  }, 1100));
 }
-workspaceEl.addEventListener("click", (e: MouseEvent) => {
+for (const root of [msgs, dropMessagesEl]) root.addEventListener("click", (e: MouseEvent) => {
   const target = e.target as Element | null;
   if (!target) return;
   const copyBtn = target.closest<HTMLButtonElement>(".codeblock-copy");
   if (copyBtn) {
     const block = copyBtn.closest(".codeblock");
     if (!block) return;
-    void writeClipboard(gatherBlockText(block)).then((ok) => {
+    void writeClipboard(gatherBlockText(block), copyBtn.ownerDocument).then((ok) => {
       if (!ok) return;
       const orig = copyBtn.textContent ?? "复制";
       copyBtn.textContent = "已复制";
@@ -730,18 +731,18 @@ workspaceEl.addEventListener("click", (e: MouseEvent) => {
         copyBtn.classList.remove("copied");
       }, 1200);
       const a = copyToastAnchor(e, copyBtn);
-      showCopyToast(a.x, a.y);
+      showCopyToast(a.x, a.y, (e.target as Node).ownerDocument ?? document);
     });
     return;
   }
   const line = target.closest<HTMLElement>(".codeblock-line");
   if (line) {
-    void writeClipboard(line.textContent ?? "").then((ok) => {
+    void writeClipboard(line.textContent ?? "", line.ownerDocument).then((ok) => {
       if (!ok) return;
       line.classList.add("copied");
       window.setTimeout(() => { line.classList.remove("copied"); }, 600);
       const a = copyToastAnchor(e, line);
-      showCopyToast(a.x, a.y);
+      showCopyToast(a.x, a.y, (e.target as Node).ownerDocument ?? document);
     });
     return;
   }
@@ -760,7 +761,7 @@ workspaceEl.addEventListener("click", (e: MouseEvent) => {
     if (!item) return;
     if (actionBtn.dataset.action === "copy") {
       const anchor = copyToastAnchor(e, actionBtn);
-      void copyMessage(item.text, actionBtn).then((ok) => { if (ok) showCopyToast(anchor.x, anchor.y); });
+      void copyMessage(item.text, actionBtn).then((ok) => { if (ok) showCopyToast(anchor.x, anchor.y, actionBtn.ownerDocument); });
     } else if (actionBtn.dataset.action === "delete") {
       void deleteDropMessage(item.id);
     }
@@ -774,7 +775,7 @@ workspaceEl.addEventListener("click", (e: MouseEvent) => {
         ? sess.history[idx]!.text
         : bubble.textContent ?? "";
       const a = copyToastAnchor(e, actionBtn);
-      void copyMessage(text, actionBtn).then((ok) => { if (ok) showCopyToast(a.x, a.y); });
+      void copyMessage(text, actionBtn).then((ok) => { if (ok) showCopyToast(a.x, a.y, (e.target as Node).ownerDocument ?? document); });
       return;
     }
     case "delete":
@@ -808,11 +809,11 @@ function cancelLongPress(): void {
   lpRow = null;
 }
 function closeAllRevealedActions(except?: Element | null): void {
-  workspaceEl.querySelectorAll<HTMLElement>(".msg-row.actions-revealed").forEach((r) => {
+  [...msgs.querySelectorAll<HTMLElement>(".msg-row.actions-revealed"), ...dropMessagesEl.querySelectorAll<HTMLElement>(".msg-row.actions-revealed")].forEach((r) => {
     if (r !== except) r.classList.remove("actions-revealed");
   });
 }
-workspaceEl.addEventListener("touchstart", (e: TouchEvent) => {
+for (const root of [msgs, dropMessagesEl]) root.addEventListener("touchstart", (e: TouchEvent) => {
   // Don't treat a tap on the action buttons themselves as a long-press
   // candidate — that would re-trigger reveal on a row that's already
   // open and feel laggy.
@@ -837,7 +838,7 @@ workspaceEl.addEventListener("touchstart", (e: TouchEvent) => {
     lpTimer = null;
   }, LONG_PRESS_MS);
 }, { passive: true });
-workspaceEl.addEventListener("touchmove", (e: TouchEvent) => {
+for (const root of [msgs, dropMessagesEl]) root.addEventListener("touchmove", (e: TouchEvent) => {
   if (lpTimer === null || !lpStartXY) return;
   const t = e.touches[0];
   if (!t) return;
@@ -845,22 +846,9 @@ workspaceEl.addEventListener("touchmove", (e: TouchEvent) => {
   const dy = t.clientY - lpStartXY[1];
   if (dx * dx + dy * dy > LONG_PRESS_MOVE_TOL_SQ) cancelLongPress();
 }, { passive: true });
-workspaceEl.addEventListener("touchend", cancelLongPress, { passive: true });
-workspaceEl.addEventListener("touchcancel", cancelLongPress, { passive: true });
-document.addEventListener("pointerdown", (e: PointerEvent) => {
-  // Fast path: no revealed rows means nothing to close. Skips the
-  // closest() walk on every pointerdown when long-press isn't active
-  // (the common case on desktop).
-  if (!workspaceEl.querySelector(".msg-row.actions-revealed")) return;
-  const target = e.target as Element | null;
-  if (!target) return;
-  // A pointerdown inside a revealed row's actions is a button press —
-  // let the click resolve, don't pre-emptively close. Anywhere else
-  // dismisses all revealed rows.
-  if (target.closest(".msg-action-btn")) return;
-  const insideRevealed = target.closest(".msg-row.actions-revealed");
-  closeAllRevealedActions(insideRevealed);
-}, { passive: true });
+for (const root of [msgs, dropMessagesEl]) root.addEventListener("touchend", cancelLongPress, { passive: true });
+for (const root of [msgs, dropMessagesEl]) root.addEventListener("touchcancel", cancelLongPress, { passive: true });
+
 
 // Append a chat bubble. `text` is the raw content as stored in history;
 // for the bot role we render markdown (sanitized), everything else stays
@@ -926,14 +914,14 @@ function addMessageBubble(
       img.src = srcFor(a);
       attachImgErrorRetry(img);
       const captureIdx = i;
-      img.addEventListener("click", () => openLightbox(list, captureIdx, srcFor));
+      img.addEventListener("click", () => openLightbox(list, captureIdx, srcFor, img.ownerDocument));
       img.tabIndex = 0;
       img.setAttribute("role", "button");
       img.setAttribute("aria-label", "查看图片");
       img.addEventListener("keydown", (event) => {
         if (event.key !== "Enter" && event.key !== " ") return;
         event.preventDefault();
-        openLightbox(list, captureIdx, srcFor);
+        openLightbox(list, captureIdx, srcFor, img.ownerDocument);
       });
       grid.appendChild(img);
     }
@@ -1872,7 +1860,7 @@ function flashActionButton(btn: HTMLButtonElement): void {
 
 async function copyMessage(text: string, btn: HTMLButtonElement): Promise<boolean> {
   if (!text) return false;
-  if (await writeClipboard(text)) {
+  if (await writeClipboard(text, btn.ownerDocument)) {
     flashActionButton(btn);
     return true;
   }
@@ -2917,7 +2905,7 @@ async function runLongPoll(): Promise<void> {
   sync.loopRunning = true;
   setSyncStatus("live");
   try {
-    while (!sync.stopped && sync.transport === "live" && !document.hidden) {
+    while (!sync.stopped && sync.transport === "live" && !isChatHidden()) {
       const ac = new AbortController();
       sync.longPollAbort = ac;
       try {
@@ -3016,7 +3004,7 @@ function startProbeTimer(): void {
 // timeout-empty), promote back to long_poll. If it fails, stay short_poll
 // and rearm the probe timer for another 5 min.
 async function probeLongPoll(): Promise<void> {
-  if (sync.stopped || sync.transport !== "polling" || document.hidden) {
+  if (sync.stopped || sync.transport !== "polling" || isChatHidden()) {
     startProbeTimer();
     return;
   }
@@ -3044,8 +3032,12 @@ async function probeLongPoll(): Promise<void> {
   }
 }
 
+let appHidden = document.hidden;
 function onVisibilityChange(): void {
-  if (document.hidden) {
+  const hidden = isChatHidden();
+  if (hidden === appHidden) return;
+  appHidden = hidden;
+  if (hidden) {
     abortInflightLongPoll();
     clearDropFallbackTimer();
     // Also abort any active SSE stream. When the page is backgrounded,
@@ -3483,7 +3475,19 @@ const dropPanelController = new ConversationPanel({
   panel: $("dropPanel"), workspace: workspaceEl, main: mainEl,
   chatMessages: msgs, chatComposer: footerEl, composer: dropComposer.root, header: dropHeader, resizeHandle: $("dropResize"),
   layoutSelect: $<HTMLSelectElement>("dropLayoutSelect"), closeButton: dropCloseBtn,
-}, { onClose: () => closeDrop(), onLayout: () => { autosizeInput(); autosizeComposer(dropComposer); renderSessionList(); updateRefreshButtonState(); } });
+}, {
+  onClose: () => closeDrop(),
+  onLayout: () => { autosizeInput(); autosizeComposer(dropComposer); renderSessionList(); updateRefreshButtonState(); },
+  onDocument: (doc) => {
+    bindConversationDocument(doc);
+    doc.addEventListener("visibilitychange", onVisibilityChange);
+    doc.defaultView?.addEventListener("resize", () => autosizeComposer(dropComposer));
+  },
+  onExternalChange: onVisibilityChange,
+  onNotice: (message) => dropStatusText(message),
+});
+
+function isChatHidden(): boolean { return document.hidden && !dropPanelController.externalVisible; }
 
 const dropDeviceId = (() => {
   const old = localStorage.getItem(LS_DROP_DEVICE);
@@ -3546,10 +3550,10 @@ function scheduleDropFallbackRefresh(): void {
   // The event channel is authoritative while live. A full history refresh is
   // only a degraded-transport safety net, so healthy SSE/long-poll sessions do
   // not issue a duplicate request every 15 seconds.
-  if (sync.stopped || !dropOpen || document.hidden || sync.transport === "live") return;
+  if (sync.stopped || !dropOpen || isChatHidden() || sync.transport === "live") return;
   dropFallbackTimer = setTimeout(() => {
     dropFallbackTimer = null;
-    if (sync.stopped || !dropOpen || document.hidden || sync.transport === "live") return;
+    if (sync.stopped || !dropOpen || isChatHidden() || sync.transport === "live") return;
     void loadDropMessages({ preserveOlder: true }).finally(() => {
       scheduleDropFallbackRefresh();
     });
@@ -3557,7 +3561,7 @@ function scheduleDropFallbackRefresh(): void {
 }
 
 function updateDropFallbackPolling(): void {
-  if (sync.stopped || !dropOpen || document.hidden || sync.transport === "live") {
+  if (sync.stopped || !dropOpen || isChatHidden() || sync.transport === "live") {
     clearDropFallbackTimer();
     return;
   }
@@ -4854,45 +4858,46 @@ function updateSendButtonState(): void {
 
 // ---------- Lightbox ----------
 
-let lightboxKeydown: ((e: KeyboardEvent) => void) | null = null;
-let lightboxFocusTrap: FocusTrap | null = null;
 function openLightbox(
   attachments: AttachmentRef[],
   startIndex: number,
   srcFor: (attachment: AttachmentRef) => string = (attachment) => fileServeUrl(attachment.file_id),
+  doc: Document = document,
 ): void {
+  let lightboxKeydown: ((e: KeyboardEvent) => void) | null = null;
+  let lightboxFocusTrap: FocusTrap | null = null;
   if (!attachments.length) return;
   let idx = Math.max(0, Math.min(startIndex, attachments.length - 1));
-  const overlay = document.createElement("div");
+  const overlay = doc.createElement("div");
   overlay.className = "lightbox";
   overlay.setAttribute("role", "dialog");
   overlay.setAttribute("aria-modal", "true");
   overlay.setAttribute("aria-label", "图片查看");
 
-  const img = document.createElement("img");
+  const img = doc.createElement("img");
   img.className = "lightbox-img";
   img.alt = "";
   attachImgErrorRetry(img);
 
-  const close = document.createElement("button");
+  const close = doc.createElement("button");
   close.type = "button";
   close.className = "lightbox-close";
   close.setAttribute("aria-label", "关闭");
   close.textContent = "×";
 
-  const prev = document.createElement("button");
+  const prev = doc.createElement("button");
   prev.type = "button";
   prev.className = "lightbox-nav lightbox-nav-prev";
   prev.setAttribute("aria-label", "上一张");
   prev.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="15 18 9 12 15 6"/></svg>';
 
-  const next = document.createElement("button");
+  const next = doc.createElement("button");
   next.type = "button";
   next.className = "lightbox-nav lightbox-nav-next";
   next.setAttribute("aria-label", "下一张");
   next.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>';
 
-  const counter = document.createElement("div");
+  const counter = doc.createElement("div");
   counter.className = "lightbox-counter";
 
   const showSingle = attachments.length === 1;
@@ -4911,13 +4916,13 @@ function openLightbox(
 
   const closeOverlay = (): void => {
     if (lightboxKeydown) {
-      document.removeEventListener("keydown", lightboxKeydown);
+      doc.removeEventListener("keydown", lightboxKeydown);
       lightboxKeydown = null;
     }
     lightboxFocusTrap?.release();
     lightboxFocusTrap = null;
     overlay.remove();
-    document.body.classList.remove("lightbox-open");
+    doc.body.classList.remove("lightbox-open");
   };
   const goPrev = (): void => {
     idx = (idx - 1 + attachments.length) % attachments.length;
@@ -4940,11 +4945,11 @@ function openLightbox(
     if (e.key === "ArrowLeft" && !showSingle) { e.preventDefault(); goPrev(); }
     else if (e.key === "ArrowRight" && !showSingle) { e.preventDefault(); goNext(); }
   };
-  document.addEventListener("keydown", lightboxKeydown);
+  doc.addEventListener("keydown", lightboxKeydown);
 
   overlay.append(img, close, prev, next, counter);
-  document.body.appendChild(overlay);
-  document.body.classList.add("lightbox-open");
+  doc.body.appendChild(overlay);
+  doc.body.classList.add("lightbox-open");
   // Trap focus inside the lightbox so Tab can't escape into the chat
   // page underneath. Initial focus on the close button — most common
   // first action and avoids a confusing focus ring on the arrow nav.
@@ -6347,7 +6352,7 @@ function autosizeInput(): void {
 }
 function bindComposerEvents(target: ComposerTarget): void {
   const view = composerView(target);
-  const { inputEl, fileInputEl, plusBtn, plusMenu, menuUpload, dropOverlayEl, root: footerEl } = view;
+  const { inputEl, fileInputEl, plusBtn, menuUpload, dropOverlayEl, root: footerEl } = view;
   inputEl.addEventListener("keydown", (e) => {
     if (e.key !== "Enter" || e.isComposing || e.keyCode === 229) return;
     // Touch-primary devices (phones / tablets): the on-screen keyboard's
@@ -6369,23 +6374,6 @@ function bindComposerEvents(target: ComposerTarget): void {
     e.stopPropagation();
     togglePlusMenu(target);
   });
-  // Outside-click closes. Pointerdown (not click) so it fires before the
-  // textarea steals focus, and we ignore clicks within the menu/button.
-  document.addEventListener("pointerdown", (e) => {
-    if (!isPlusMenuOpen(target)) return;
-    const t = e.target as Node;
-    if (plusMenu.contains(t) || plusBtn.contains(t)) return;
-    closePlusMenu(target);
-  });
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && isPlusMenuOpen(target)) {
-      e.preventDefault();
-      e.stopPropagation();
-      closePlusMenu(target);
-      plusBtn.focus();
-    }
-  });
-
   // Upload → file picker. Reset .value after each open so the change
   // handler fires even when the user re-selects the same file (the browser
   // suppresses change events on identical selections otherwise).
@@ -6488,6 +6476,32 @@ function bindComposerEvents(target: ComposerTarget): void {
   inputEl.addEventListener("input", () => { autosizeComposer(view); updateSendButtonState(); });
   if (target === "drop") view.sendBtn.onclick = () => { void sendDrop(); };
 }
+const boundConversationDocuments = new WeakSet<Document>();
+function bindConversationDocument(doc: Document): void {
+  if (boundConversationDocuments.has(doc)) return;
+  boundConversationDocuments.add(doc);
+  doc.addEventListener("pointerdown", (event) => {
+    const target = event.target as Element | null;
+    if (!target || target.closest(".msg-action-btn")) return;
+    closeAllRevealedActions(target.closest(".msg-row.actions-revealed"));
+    for (const conversation of ["chat", "drop"] as const) {
+      const { plusBtn, plusMenu } = composerView(conversation);
+      if (!plusMenu.contains(target) && !plusBtn.contains(target)) closePlusMenu(conversation);
+    }
+  }, { passive: true });
+  doc.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    for (const conversation of ["chat", "drop"] as const) {
+      const { plusBtn, plusMenu } = composerView(conversation);
+      if (plusMenu.ownerDocument !== doc || !isPlusMenuOpen(conversation)) continue;
+      event.preventDefault();
+      event.stopPropagation();
+      closePlusMenu(conversation);
+      plusBtn.focus();
+    }
+  });
+}
+bindConversationDocument(document);
 bindComposerEvents("chat");
 bindComposerEvents("drop");
 autosizeInput();
@@ -6535,7 +6549,7 @@ sendBtn.onclick = (): void => {
 document.addEventListener("visibilitychange", onVisibilityChange);
 // Regaining connectivity (phone leaves a tunnel / returns from background) is
 // the fastest, most reliable moment to drain the session-delete outbox — the
-// long-poll loop is gated on !document.hidden and may be sitting in backoff.
+// long-poll loop is gated on !isChatHidden() and may be sitting in backoff.
 window.addEventListener("online", () => { void flushSessionDeletes(); });
 
 // Cold boot: paint cache, then refetch authoritative state, then start sync.

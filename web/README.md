@@ -83,3 +83,11 @@ Drop 的窗口状态集中在 `src/chat_client/conversation-panel.ts`，外观�
 保持**字面量内联脚本**（不要 `type="module"`，不要 import）。
 `vite-plugin-singlefile` 会内联模块脚本，但模块脚本是 defer 的，会在样式
 应用之后才跑，导致 FOUC。原生 `<script>` 块同步执行，首帧主题就对。
+
+## 跨窗口浮窗
+
+Drop 的浮窗优先使用 Document Picture-in-Picture API（支持该 API 的桌面 Chromium 浏览器，
+HTTPS 或 localhost）。普通会话留在主窗口，小窗关闭后保留 Drop 草稿。
+不支持或拒绝该 API 时使用页内浮窗，页内浮窗不能覆盖其他应用窗口。
+`picture-window.ts` 管理窗口生命周期、主题同步和 DOM 归还；消息、输入、复制和图片预览
+使用元素所属的 document，避免操作错误窗口。原生窗口行为仍需在支持的浏览器中验证。

@@ -45,6 +45,7 @@ export function installFocusTrap(
   container: HTMLElement,
   opts: { onEscape?: () => void; initialFocus?: HTMLElement | null } = {},
 ): FocusTrap {
+  const document = container.ownerDocument;
   const prevFocus = document.activeElement as HTMLElement | null;
 
   const onKeyDown = (e: KeyboardEvent): void => {

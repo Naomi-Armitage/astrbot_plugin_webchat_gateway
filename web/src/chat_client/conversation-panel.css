@@ -61,3 +61,16 @@ header[data-panel-movable]:focus-visible { outline: 2px solid var(--accent); out
   .conversation-panel footer textarea { min-width: 0; }
   .conversation-panel .composer-row { gap: 6px; }
 }
+
+body.pip-window { display: flex; height: 100dvh; }
+.pip-window .conversation-panel {
+  position: relative;
+  flex: 1;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+.pip-window .conversation-panel header { border-radius: 0; }
