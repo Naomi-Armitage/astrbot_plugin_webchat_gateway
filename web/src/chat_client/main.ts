@@ -3815,7 +3815,14 @@ async function uploadDropFile(file: File): Promise<string> {
   const resp = await fetchWithTimeout(DROP_UPLOAD_URL, { method: "POST", headers: bearer(), credentials: "same-origin", body: form }, FETCH_TIMEOUT_CHAT_MS);
   if (resp.status === 401) { handle401(); throw new Error("未授权"); }
   const data = await resp.json().catch(() => ({})) as Record<string, unknown>;
-  if (!resp.ok || typeof data.file_id !== "string") throw new Error(typeof data.error === "string" ? data.error : "上传失败");
+  if (!resp.ok) {
+    const code = typeof data?.error === "string" ? data.error : `http_${resp.status}`;
+    const reason = resp.status >= 500
+      ? "服务器处理失败，请检查服务端日志"
+      : uploadErrorCopy(code, data ?? {});
+    throw new Error(`${reason}（HTTP ${resp.status}）`);
+  }
+  if (typeof data?.file_id !== "string") throw new Error("服务器未返回文件编号");
   return data.file_id;
 }
 
@@ -4477,9 +4484,12 @@ async function uploadDropAttachment(attachment: PendingAttachment): Promise<void
     attachment.file_id = fileId;
     attachment.state = "ready";
   } catch (e) {
-    if (version !== attachment.uploadVersion) return;
+    if (version !== attachment.uploadVersion || !dropComposerAttachments.includes(attachment)) return;
     attachment.state = "error";
-    attachment.error_message = (e as Error).message;
+    attachment.error_message = (e as Error).name === "AbortError"
+      ? "上传超时，请检查网络后重试"
+      : (e as Error).message || "网络错误";
+    composerNotice(`${attachment.filename || "文件"} 上传失败：${attachment.error_message}`, "drop");
   } finally { renderComposerAttachments(); updateSendButtonState(); }
 }
 // Latch so the "exceeded 4 chips" notice only fires once per add batch even
@@ -4691,11 +4701,13 @@ async function uploadAttachment(blob: Blob, sid: string, attachment: PendingAtta
 function uploadErrorCopy(code: string, payload: Record<string, unknown>): string {
   if (code === "payload_too_large") return "文件过大";
   if (code === "unsupported_mime") return "不支持的图片格式";
+  if (code === "unsupported_type") return "不支持的文件类型";
   if (code === "invalid_image") return "无效的图片文件";
   if (code === "storage_quota_exceeded") return "存储配额已满";
   if (code === "invalid_session_id") return "会话无效";
   if (code === "invalid_payload") return "上传内容无效";
   if (code === "forbidden_origin") return "来源未授权";
+  if (code.startsWith("http_")) return "上传失败";
   return typeof payload.detail === "string" ? `${code}: ${payload.detail}` : code;
 }
 
@@ -4707,6 +4719,7 @@ function addAttachmentFiles(rawFiles: FileList | File[], target: ComposerTarget 
   const unit = isDrop ? "个文件" : "张";
   const files = Array.from(rawFiles);
   if (!files.length) return;
+  if (isDrop) dropStatusText("");
   const remaining = limit - queue.length;
   if (remaining <= 0) {
     if (!attachmentsCapNoticeShown[target]) {
@@ -4816,6 +4829,7 @@ function retryAttachment(local_id: string, target: ComposerTarget = "chat"): voi
   if (!att || att.state !== "error" || !att.blob) return;
   att.state = "uploading";
   att.error_message = undefined;
+  if (att.destination === "drop") dropStatusText("");
   renderComposerAttachments();
   updateSendButtonState();
   if (att.destination === "drop") void uploadDropAttachment(att);
@@ -4839,7 +4853,7 @@ function renderComposerAttachmentList(target: ComposerTarget): void {
       // server's reason in the tooltip plus the tap-to-retry hint.
       chip.title = a.error_message ? `${a.error_message}（点击重试）` : "上传失败，点击重试";
       chip.setAttribute("role", "button");
-      chip.setAttribute("aria-label", "上传失败，点击重试");
+      chip.setAttribute("aria-label", chip.title);
       chip.tabIndex = 0;
       chip.addEventListener("click", () => retryAttachment(a.local_id, target));
       chip.addEventListener("keydown", (event) => {

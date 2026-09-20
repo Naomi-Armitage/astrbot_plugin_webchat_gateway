@@ -164,6 +164,10 @@ class SqliteStorage(AbstractStorage):
                 for stmt in V5_TO_V6_SQLITE:
                     await self._conn.execute(stmt)
                 stored = "6"
+            if stored == "6":
+                # v6 → v7 widens MySQL MIME columns; SQLite's TEXT fields
+                # already preserve media types of any length.
+                stored = "7"
             # Persist the marker only when the ladder actually
             # advanced (`stored != stored_pre`). A boot whose stored
             # value already matches CURRENT skips the dead UPDATE.

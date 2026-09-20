@@ -35,6 +35,7 @@ from .ddl import (
     V2_TO_V3_MYSQL,
     V4_TO_V5_MYSQL,
     V5_TO_V6_MYSQL,
+    V6_TO_V7_MYSQL,
 )
 
 
@@ -169,6 +170,11 @@ class MysqlStorage(AbstractStorage):
                         for stmt in V5_TO_V6_MYSQL:
                             await cur.execute(stmt)
                         stored = "6"
+                    if stored == "6":
+                        # Preserve full Office MIME types for upload and send.
+                        for stmt in V6_TO_V7_MYSQL:
+                            await cur.execute(stmt)
+                        stored = "7"
                     # Persist the marker only when the ladder
                     # actually advanced (`stored != stored_pre`). A
                     # boot whose stored value already matches CURRENT

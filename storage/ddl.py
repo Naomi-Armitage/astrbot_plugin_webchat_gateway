@@ -11,7 +11,7 @@ Schema parity goals
   failed auth.
 - `_schema_meta` is a forward hook for migrations: each backend seeds
   `(schema_version, "<version>")` on `initialize()` and reads it back to drive
-  any pending ALTERs. Not a migration framework — additive columns only.
+  any pending ALTERs. Migrations add tables/columns or widen existing fields.
 
 Both schemas use idempotent `IF NOT EXISTS`, so re-running on an existing database
 is safe. Cross-version upgrades happen inside each backend's `initialize()`.
@@ -19,7 +19,7 @@ is safe. Cross-version upgrades happen inside each backend's `initialize()`.
 
 from __future__ import annotations
 
-CURRENT_SCHEMA_VERSION = "6"
+CURRENT_SCHEMA_VERSION = "7"
 
 SCHEMA_SQLITE: tuple[str, ...] = (
     """
@@ -290,7 +290,7 @@ SCHEMA_MYSQL: tuple[str, ...] = (
         file_id      VARCHAR(32)  NOT NULL,
         token_name   VARCHAR(128) NOT NULL,
         session_id   VARCHAR(128) NOT NULL,
-        mime         VARCHAR(64)  NOT NULL,
+        mime         VARCHAR(255) NOT NULL,
         size_bytes   BIGINT NOT NULL,
         storage_key  VARCHAR(512) NOT NULL,
         committed    TINYINT(1)   NOT NULL DEFAULT 0,
@@ -312,7 +312,7 @@ SCHEMA_MYSQL: tuple[str, ...] = (
         text        TEXT         NOT NULL,
         file_id     VARCHAR(32)  NULL,
         filename    VARCHAR(255) NOT NULL DEFAULT '',
-        mime        VARCHAR(64)  NOT NULL DEFAULT '',
+        mime        VARCHAR(255) NOT NULL DEFAULT '',
         size_bytes  BIGINT NOT NULL DEFAULT 0,
         created_at  BIGINT NOT NULL,
         deleted_at  BIGINT NULL,
@@ -477,4 +477,15 @@ V5_TO_V6_MYSQL: tuple[str, ...] = (
         INDEX idx_drop_messages_file (file_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
+)
+
+
+# v6 → v7: Office media types (e.g. PPTX, 73 characters) exceed the old
+# 64-character image-only limit. Widen both upload and message metadata;
+# otherwise upload or send fails on strict MySQL and truncates on non-strict
+# MySQL. MODIFY is safe to replay after a partially completed migration.
+# SQLite already uses unbounded TEXT and only advances its version marker.
+V6_TO_V7_MYSQL: tuple[str, ...] = (
+    "ALTER TABLE webchat_files MODIFY COLUMN mime VARCHAR(255) NOT NULL",
+    "ALTER TABLE webchat_drop_messages MODIFY COLUMN mime VARCHAR(255) NOT NULL DEFAULT ''",
 )

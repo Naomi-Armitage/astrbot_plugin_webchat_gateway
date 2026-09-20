@@ -639,6 +639,7 @@ Drop（多设备自传，写端点）：
 | 启动日志无 `HTTP server started` | 端口被占用 / `host` 写错 | `lsof -i :6186` 或 `netstat -ano \| findstr 6186` 排查；改 `port` |
 | 启动日志 `mysql driver requires mysql_dsn` | 选了 mysql 但没填 DSN | 填 `storage.mysql_dsn` 或切回 `sqlite` |
 | 启动日志 `MySQL backend requires aiomysql` | 没装 aiomysql | `pip install aiomysql` 后重启 |
+| Drop 上传 PPTX / DOCX / XLSX 一直返回 500，日志含 `Data too long for column 'mime'` | 旧版 MySQL 的 MIME 字段只有 64 字符，容不下 Office 文件类型 | 更新插件并重启；数据库版本 7 会自动扩宽上传表和 Drop 消息表的 MIME 字段，再重试上传 |
 | 启动 WARNING `persona_id does not exist` | `persona_id` 配的人格已删除 | 在 Dashboard 重选已存在的人格，或留空使用默认 |
 | 聊天接口返回 `chat_provider_not_configured` | AstrBot 还没配置 LLM Provider | 在 AstrBot Dashboard 配置一个聊天 Provider |
 | 浏览器请求一律 `403 forbidden_origin` | `allowed_origins` 没含前端域名 | 加入对应 Origin 后重启插件；或确认前端真的在发 `Origin` 头 |

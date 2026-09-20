@@ -1,11 +1,11 @@
 """Drop feature: storage-layer truth against real sqlite.
 
 Pins the v5 → v6 migration (webchat_files.filename backfill + the
-webchat_drop_messages table) and the six new Drop storage methods.
+webchat_drop_messages table), the v7 marker upgrade, and Drop storage methods.
 Schema typos, missing indexes, and SQLite-specific behavior surface
 here — per the project's "integration tests over mocks for migrations"
-convention. MySQL implementation follows the same SQL shapes but is
-not tested (existing project pattern).
+convention. MySQL migration orchestration has separate unit coverage;
+these integration tests exercise the SQLite engine only.
 """
 
 from __future__ import annotations
@@ -29,8 +29,8 @@ async def storage(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-class TestDropSchemaV6:
-    async def test_fresh_install_is_v6_with_drop_table(self, storage):
+class TestDropSchema:
+    async def test_fresh_install_has_current_schema_with_drop_table(self, storage):
         from astrbot_plugin_webchat_gateway.storage.ddl import (
             CURRENT_SCHEMA_VERSION,
         )
@@ -40,7 +40,7 @@ class TestDropSchemaV6:
         ) as cursor:
             row = await cursor.fetchone()
         assert row is not None
-        assert row["value"] == CURRENT_SCHEMA_VERSION == "6"
+        assert row["value"] == CURRENT_SCHEMA_VERSION == "7"
 
         async with storage._db.execute(
             "SELECT name FROM sqlite_master WHERE type='table' "
@@ -48,18 +48,19 @@ class TestDropSchemaV6:
         ) as cursor:
             assert await cursor.fetchone() is not None
 
-    async def test_v5_db_upgrades_to_v6_and_backfills_filename(
+    async def test_v5_db_upgrades_and_backfills_filename(
         self, tmp_path: Path
     ):
         """A DB stamped v5 (webchat_files without filename, no drop
         table) must upgrade on initialize: filename column added with
-        '' backfill, drop table created, marker moved to 6."""
+        '' backfill, drop table created, marker advanced to current."""
         import aiosqlite
 
         from astrbot_plugin_webchat_gateway.storage.sqlite_backend import (
             SqliteStorage,
         )
         from astrbot_plugin_webchat_gateway.storage.ddl import (
+            CURRENT_SCHEMA_VERSION,
             SCHEMA_SQLITE,
         )
 
@@ -104,6 +105,10 @@ class TestDropSchemaV6:
         s = SqliteStorage(str(db_path))
         try:
             await s.initialize()
+            async with s._db.execute(
+                "SELECT value FROM _schema_meta WHERE key = 'schema_version'"
+            ) as cursor:
+                assert (await cursor.fetchone())["value"] == CURRENT_SCHEMA_VERSION
             row = await s.get_file("aaaaaaaaaaaaaaaa")
             assert row is not None
             # v5 upload without a filename backfills to '' — NOT garbage.
@@ -115,6 +120,44 @@ class TestDropSchemaV6:
             assert msgs == []
         finally:
             await s.close()
+
+    async def test_v6_upgrade_preserves_office_metadata_and_is_repeatable(self, tmp_path):
+        from astrbot_plugin_webchat_gateway.storage.ddl import CURRENT_SCHEMA_VERSION
+        from astrbot_plugin_webchat_gateway.storage.sqlite_backend import SqliteStorage
+
+        storage = SqliteStorage(str(tmp_path / "v6.db"))
+        mime = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        await storage.initialize()
+        try:
+            await storage.insert_file(
+                file_id="a" * 16, token_name="alice", session_id="drop", mime=mime,
+                size_bytes=123, storage_key="alice/presentation.bin", now=100,
+                filename="演示文稿.pptx",
+            )
+            await storage.append_drop_message(
+                token_name="alice", device_id="device-pptx", device_name="PC",
+                kind="file", text="", file_id="a" * 16, filename="演示文稿.pptx",
+                mime=mime, size_bytes=123, now=101,
+            )
+            await storage._db.execute("UPDATE _schema_meta SET value = '6' WHERE key = 'schema_version'")
+            await storage._db.commit()
+        finally:
+            await storage.close()
+        for _ in range(2):
+            await storage.initialize()
+            try:
+                async with storage._db.execute(
+                    "SELECT value FROM _schema_meta WHERE key = 'schema_version'"
+                ) as cursor:
+                    assert (await cursor.fetchone())["value"] == CURRENT_SCHEMA_VERSION
+                file = await storage.get_file("a" * 16)
+                assert file.mime == mime and file.filename == "演示文稿.pptx"
+                rows = await storage.list_drop_messages(
+                    token_name="alice", limit=10, before_id=None, include_deleted=False,
+                )
+                assert len(rows) == 1 and rows[0].mime == mime
+            finally:
+                await storage.close()
 
 
 @pytest.mark.asyncio
