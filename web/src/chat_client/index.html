@@ -88,12 +88,12 @@
                 </svg>
               </button>
               <div id="headerMenuPanel" class="header-menu-panel" role="group" aria-label="更多选项" hidden>
-                <button id="importConversations" type="button" class="header-menu-item" title="从 JSON 备份导入对话">
+                <button id="importConversations" type="button" class="header-menu-item" title="导入 JSON 对话备份或 Edge Drop 文本记录">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                     stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <path d="M4 16v4h16v-4M12 3v12m-4-4 4 4 4-4"/>
                   </svg>
-                  <span>导入对话</span>
+                  <span>导入对话 / Drop</span>
                 </button>
                 <button id="exportConversations" type="button" class="header-menu-item" title="导出全部对话为 JSON，附件不包含在内">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
@@ -119,7 +119,7 @@
                   <span>登出</span>
                 </button>
               </div>
-              <input id="conversationImportFile" type="file" accept=".json,application/json" hidden />
+              <input id="conversationImportFile" type="file" accept=".json,.txt,application/json,text/plain" hidden />
             </div>
           </div>
         </header>

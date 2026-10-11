@@ -380,6 +380,10 @@ class ConfigView:
         return f"{self.endpoint_prefix}/drop/send"
 
     @property
+    def drop_import_path(self) -> str:
+        return f"{self.endpoint_prefix}/drop/import"
+
+    @property
     def drop_upload_path(self) -> str:
         return f"{self.endpoint_prefix}/drop/upload"
 

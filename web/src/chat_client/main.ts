@@ -1,6 +1,7 @@
 import { createComposer, autosizeComposer, type ComposerTarget } from "./composer";
 import { ConversationPanel } from "./conversation-panel";
 import { isDropImage } from "./drop-image";
+import { looksLikeEdgeDropExport, parseEdgeDropExport } from "./edge-drop-import";
 import "./conversation-panel.css";
 import {
   LS_TOKEN,
@@ -61,6 +62,7 @@ const EVENTS_URL = `${API}/events`;
 const UPLOAD_URL = `${API}/upload`;
 const FILES_URL = `${API}/files`;
 const DROP_SEND_URL = API + "/drop/send";
+const DROP_IMPORT_URL = API + "/drop/import";
 const DROP_UPLOAD_URL = API + "/drop/upload";
 const DROP_MESSAGES_URL = API + "/drop/messages";
 const DROP_FILE_URL = (id: string): string => API + "/drop/files/" + encodeURIComponent(id);
@@ -289,7 +291,8 @@ type EventType =
   | "stream_ended"
   | "drop_message_added"
   | "drop_message_deleted"
-  | "drop_history_cleared";
+  | "drop_history_cleared"
+  | "drop_history_imported";
 interface ServerEvent {
   pts: number;
   ts: number;
@@ -2646,6 +2649,12 @@ function applyEvent(ev: ServerEvent): void {
       if (dropOpen) renderDropMessages();
       break;
     }
+    case "drop_history_imported": {
+      // A bulk import may exceed one page. Refetch from the head and reset
+      // the cursor so every imported row remains reachable by pagination.
+      resetDropAfterImport();
+      break;
+    }
   }
 }
 
@@ -3755,6 +3764,13 @@ function appendDropPreviewFailure(bubble: HTMLElement, item: DropMessage): void 
   });
 }
 
+function edgeDropImportTime(seconds: number): string {
+  const date = new Date(seconds * 1000);
+  const two = (value: number): string => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${two(date.getMonth() + 1)}-${two(date.getDate())} `
+    + `${two(date.getHours())}:${two(date.getMinutes())}:${two(date.getSeconds())}`;
+}
+
 function renderDropMessages(options: { forceBottom?: boolean } = {}): void {
   const previousScrollTop = dropMessagesEl.scrollTop;
   const wasNearBottom = dropMessagesEl.scrollHeight - previousScrollTop - dropMessagesEl.clientHeight < 80;
@@ -3787,7 +3803,14 @@ function renderDropMessages(options: { forceBottom?: boolean } = {}): void {
         appendDropPreviewFailure(bubble, item);
       },
     });
-    children.push(bubble.closest<HTMLElement>(".msg-row")!);
+    const row = bubble.closest<HTMLElement>(".msg-row")!;
+    if (item.device_id === "edge-drop-import") {
+      const caption = document.createElement("span");
+      caption.className = "drop-import-caption";
+      caption.textContent = `${item.device_name || "Edge Drop 导入"} · ${edgeDropImportTime(item.created_at)}`;
+      row.insertBefore(caption, row.querySelector(".msg-actions"));
+    }
+    children.push(row);
     if (item.kind === "file" && item.file_id && !image) {
       appendDropFileLink(bubble, item);
     }
@@ -3823,6 +3846,21 @@ function dropCursorFromResponse(data: DropListResponse, messages: DropMessage[])
   if (typeof raw === "number" && Number.isInteger(raw) && raw > 0) return raw;
   const last = messages[messages.length - 1];
   return typeof last?.id === "number" && Number.isInteger(last.id) ? last.id : null;
+}
+
+function resetDropAfterImport(): void {
+  dropLoadSeq += 1;
+  dropHasMore = false;
+  dropBefore = null;
+  dropLoadingOlder = false;
+  if (dropOpen) {
+    // Keep the visible history until the fresh head loads. A failed
+    // refresh should not turn previously loaded messages into an empty view.
+    renderDropMessages();
+    void loadDropMessages();
+  } else {
+    dropMessages = [];
+  }
 }
 
 async function loadDropMessages(options: { preserveOlder?: boolean } = {}): Promise<void> {
@@ -6373,13 +6411,22 @@ conversationImportFile.addEventListener("change", () => {
 async function importConversations(file: File): Promise<void> {
   if (transferBusy) return;
   if (file.size > MAX_TRANSFER_BYTES) {
-    showTransferStatus("备份文件不能超过 20 MiB。", true);
+    showTransferStatus("导入文件不能超过 20 MiB。", true);
     return;
   }
   let source: string;
-  let count: number;
   try {
     source = await file.text();
+  } catch {
+    showTransferStatus("无法读取导入文件。", true);
+    return;
+  }
+  if (looksLikeEdgeDropExport(source)) {
+    await importEdgeDrop(source);
+    return;
+  }
+  let count: number;
+  try {
     const backup = JSON.parse(source) as { format?: string; version?: number; conversations?: unknown[] };
     if (backup?.format !== TRANSFER_FORMAT || backup.version !== 1 || !Array.isArray(backup.conversations)) {
       throw new Error("文件不是有效的对话备份");
@@ -6429,6 +6476,63 @@ async function importConversations(file: File): Promise<void> {
     );
   } catch (error) {
     showTransferStatus(`导入失败：${(error as Error).message}。如请求中断，请先刷新确认是否已有部分对话导入。`, true);
+  } finally {
+    setTransferBusy(false);
+  }
+}
+
+async function importEdgeDrop(source: string): Promise<void> {
+  let messages: ReturnType<typeof parseEdgeDropExport>;
+  try {
+    messages = parseEdgeDropExport(source);
+  } catch (error) {
+    showTransferStatus(`Edge Drop 文件无效：${(error as Error).message}`, true);
+    return;
+  }
+  const body = JSON.stringify({ format: "edge-drop-text-v1", messages });
+  if (new Blob([body]).size > MAX_TRANSFER_BYTES) {
+    showTransferStatus("转换后的 Drop 导入内容超过 20 MiB，请拆分文件后再试。", true);
+    return;
+  }
+  if (!confirm(`将 ${messages.length} 条 Edge Drop 文字记录导入 Drop？原时间按本机时区解析；文件附件不会恢复，已有消息不会覆盖。`)) return;
+  setTransferBusy(true);
+  try {
+    const resp = await fetchWithTimeout(
+      DROP_IMPORT_URL,
+      {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json", ...bearer() },
+        body,
+      },
+      180_000,
+    );
+    if (resp.status === 401) { handle401(); return; }
+    const result = await resp.json().catch(() => ({})) as { imported?: number; failed?: number };
+    if (!resp.ok) {
+      const reason = resp.status === 403 ? "Drop 未启用"
+        : resp.status === 413 ? "文件超过服务器限制"
+        : resp.status === 400 ? "Drop 文件内容不符合要求"
+        : `服务器错误（${resp.status}）`;
+      if (resp.status >= 500 && result.imported === 0 && typeof result.failed === "number" && result.failed > 0) {
+        throw new Error(`${result.failed} 条 Drop 消息均未导入，请检查服务端日志`);
+      }
+      throw new Error(reason);
+    }
+    const imported = result.imported;
+    const failed = result.failed;
+    if (typeof imported !== "number" || typeof failed !== "number"
+      || !Number.isInteger(imported) || !Number.isInteger(failed)
+      || imported < 0 || failed < 0 || imported + failed !== messages.length) {
+      throw new Error("服务器返回的导入结果无效");
+    }
+    resetDropAfterImport();
+    if (!dropOpen) openDrop();
+    showTransferStatus(
+      `已导入 ${imported} 条 Drop 消息。${failed ? `${failed} 条失败；重试会重复导入已成功的消息。` : ""}`,
+      failed > 0,
+    );
+  } catch (error) {
+    showTransferStatus(`Drop 导入失败：${(error as Error).message}。重试前请刷新 Drop，避免重复消息。`, true);
   } finally {
     setTransferBusy(false);
   }

@@ -25,6 +25,7 @@ chat pipeline:
 Endpoints (all registered in handlers/server.py under cfg.drop_*):
 
   POST {prefix}/drop/send          JSON {text, attachments, device_id, device_name}
+  POST {prefix}/drop/import        Edge Drop timestamped text import
   POST {prefix}/drop/upload        multipart file upload (any type, NOT the
                                    image-only /upload — Drop accepts arbitrary
                                    files and enforces its own MIME policy)
@@ -70,8 +71,15 @@ from .common import (
 )
 from .conversations_overlay import (
     EVENT_DROP_HISTORY_CLEARED,
+    EVENT_DROP_HISTORY_IMPORTED,
     EVENT_DROP_MESSAGE_ADDED,
     EVENT_DROP_MESSAGE_DELETED,
+)
+from .edge_drop_import import (
+    EDGE_DROP_IMPORT_DEVICE_ID,
+    EDGE_DROP_IMPORT_DEVICE_NAME,
+    MAX_EDGE_DROP_IMPORT_BYTES,
+    validate_edge_drop_import,
 )
 
 # Fixed pseudo-session that owns Drop file rows in webchat_files. The
@@ -393,6 +401,75 @@ def make_drop_handlers(deps: DropDeps):
             logger.exception(
                 "[WebChatGateway] drop event push failed token=%s", token_name
             )
+
+    # ----- POST {prefix}/drop/import -----
+
+    async def import_drop(request: web.Request) -> web.Response:
+        gated = await gate_request(request, deps)
+        if isinstance(gated, web.Response):
+            return gated
+        if not deps.enabled:
+            return _disabled(request, gated.origin)
+        if request.content_length is not None and request.content_length > MAX_EDGE_DROP_IMPORT_BYTES:
+            return _err(request, gated.origin, ServiceError("payload_too_large", status=413))
+        try:
+            raw = await request.read()
+            if len(raw) > MAX_EDGE_DROP_IMPORT_BYTES:
+                raise ServiceError("payload_too_large", status=413)
+            messages = validate_edge_drop_import(json.loads(raw))
+        except web.HTTPRequestEntityTooLarge:
+            return _err(request, gated.origin, ServiceError("payload_too_large", status=413))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return _err(request, gated.origin, ServiceError("invalid_json", status=400))
+        except ServiceError as exc:
+            return _err(request, gated.origin, exc)
+
+        imported = 0
+        async with deps.upload_gate.acquire(gated.token.name):
+            for message in messages:
+                try:
+                    await deps.storage.append_drop_message(
+                        token_name=gated.token.name,
+                        device_id=EDGE_DROP_IMPORT_DEVICE_ID,
+                        device_name=EDGE_DROP_IMPORT_DEVICE_NAME,
+                        kind="text",
+                        text=message.text,
+                        file_id=None,
+                        filename="",
+                        mime="",
+                        size_bytes=0,
+                        now=message.created_at,
+                    )
+                except Exception:
+                    logger.exception(
+                        "[WebChatGateway] Edge Drop import failed token=%s row=%s",
+                        gated.token.name, imported + 1,
+                    )
+                    break
+                imported += 1
+            if imported:
+                now = int(time.time())
+                await _push_events(
+                    gated.token.name,
+                    [NewEvent(
+                        event_type=EVENT_DROP_HISTORY_IMPORTED,
+                        session_id=DROP_SESSION_ID,
+                        payload=json.dumps({"count": imported}),
+                    )],
+                    now,
+                )
+
+        failed = len(messages) - imported
+        await deps.audit.write(
+            "drop_import", name=gated.token.name, ip=gated.ip,
+            detail={"imported": imported, "failed": failed},
+        )
+        return json_response(
+            {"imported": imported, "failed": failed},
+            status=200 if imported else 500,
+            origin=gated.origin, allowed_origins=allowed,
+            same_origin_host=gated.same_host,
+        )
 
     # ----- POST {prefix}/drop/send -----
 
@@ -1287,6 +1364,7 @@ def make_drop_handlers(deps: DropDeps):
 
     return {
         "send": send_drop,
+        "import": import_drop,
         "upload": upload_drop,
         "list": list_drop,
         "delete": delete_drop,

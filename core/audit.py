@@ -60,6 +60,7 @@ Chat path (per request):
     Drop (multi-device self-to-self transfer, no LLM):
     drop_sent       — a Drop send (text note and/or file attach) landed;
                       detail: {text_len, files, device_id}
+    drop_import     — Edge Drop text history imported; detail: {imported, failed}.
     drop_upload_ok  — a Drop file upload stored; detail:
                       {file_id, size, mime, has_filename}
     drop_upload_rejected — Drop upload refused; detail:

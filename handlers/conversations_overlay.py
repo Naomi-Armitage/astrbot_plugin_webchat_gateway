@@ -38,6 +38,7 @@ EVENT_STREAM_ENDED = "stream_ended"
 EVENT_DROP_MESSAGE_ADDED = "drop_message_added"
 EVENT_DROP_MESSAGE_DELETED = "drop_message_deleted"
 EVENT_DROP_HISTORY_CLEARED = "drop_history_cleared"
+EVENT_DROP_HISTORY_IMPORTED = "drop_history_imported"
 
 # The reserved Drop pseudo-session. Regular chat endpoints reject this
 # session_id (reserved_session) so ordinary conversations can't collide
@@ -186,6 +187,7 @@ __all__ = [
     "EVENT_DROP_MESSAGE_ADDED",
     "EVENT_DROP_MESSAGE_DELETED",
     "EVENT_DROP_HISTORY_CLEARED",
+    "EVENT_DROP_HISTORY_IMPORTED",
     "DROP_SESSION_ID",
     "_extract_text",
     "_extract_attachment_file_ids",

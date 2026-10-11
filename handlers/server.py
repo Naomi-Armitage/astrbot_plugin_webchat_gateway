@@ -216,6 +216,8 @@ def build_app(deps: ServerDeps) -> web.Application:
     drop_preflight = make_drop_files_preflight(deps.drop)
     app.router.add_post(cfg.drop_send_path, drop["send"])
     app.router.add_options(cfg.drop_send_path, drop_preflight)
+    app.router.add_post(cfg.drop_import_path, drop["import"])
+    app.router.add_options(cfg.drop_import_path, drop_preflight)
     app.router.add_post(cfg.drop_upload_path, drop["upload"])
     app.router.add_options(cfg.drop_upload_path, drop_preflight)
     app.router.add_get(cfg.drop_messages_path, drop["list"])

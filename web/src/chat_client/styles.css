@@ -1746,6 +1746,12 @@ body.lightbox-open { overflow: hidden; }
 }
 .msg-row.bot-row { align-self: flex-start; align-items: flex-start; }
 .msg-row.user-row { align-self: flex-end; align-items: flex-end; }
+.drop-import-caption {
+  max-width: 100%;
+  color: var(--ink-soft);
+  font: 11px/1.4 var(--font-ui);
+  overflow-wrap: anywhere;
+}
 /* The bubble's own animation now lives on the row (above) so the
    inner element doesn't re-animate during a regenerate innerHTML
    swap. Bubbles wrapped in .msg-row no longer need it. */
