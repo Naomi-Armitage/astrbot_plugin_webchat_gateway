@@ -313,6 +313,7 @@ const sidebarEl = $("sidebar");
 const sidebarToggleBtn = $<HTMLButtonElement>("sidebarToggle");
 const sidebarBackdrop = $("sidebarBackdrop");
 const sessionListEl = $<HTMLUListElement>("sessionList");
+const sessionScrollbarEl = $("sessionScrollbar");
 const plusBtn = $<HTMLButtonElement>("plusBtn");
 const menuUpload = $<HTMLButtonElement>("menuUpload");
 const menuImage = $<HTMLButtonElement>("menuImage");
@@ -3224,6 +3225,24 @@ document.addEventListener("keydown", (event) => {
   event.stopImmediatePropagation();
 }, true);
 
+function updateSessionScrollbar(): void {
+  const height = sessionListEl.clientHeight;
+  const scrollRange = sessionListEl.scrollHeight - height;
+  const scrollable = height > 0 && scrollRange > 1;
+  sessionScrollbarEl.classList.toggle("is-scrollable", scrollable);
+  if (!scrollable) return;
+
+  const thumbHeight = Math.min(height, Math.max(28, height * height / sessionListEl.scrollHeight));
+  const scrollTop = Math.max(0, Math.min(scrollRange, sessionListEl.scrollTop));
+  const thumbTop = scrollTop / scrollRange * (height - thumbHeight);
+  sessionScrollbarEl.style.top = `${sessionListEl.offsetTop}px`;
+  sessionScrollbarEl.style.height = `${height}px`;
+  sessionScrollbarEl.style.setProperty("--thumb-height", `${thumbHeight}px`);
+  sessionScrollbarEl.style.setProperty("--thumb-top", `${thumbTop}px`);
+}
+sessionListEl.addEventListener("scroll", updateSessionScrollbar, { passive: true });
+new ResizeObserver(updateSessionScrollbar).observe(sessionListEl);
+
 function renderSessionList(): void {
   closeSessionSwipe();
   const activeEditor = sessionListEl.querySelector<HTMLInputElement>(".session-title-input");
@@ -3320,6 +3339,7 @@ function renderSessionList(): void {
 
     sessionListEl.appendChild(li);
   }
+  updateSessionScrollbar();
 }
 
 function switchSession(id: string): void {
@@ -4003,6 +4023,7 @@ let sidebarFocusTrap: FocusTrap | null = null;
 
 function openMobileSidebar(): void {
   sidebarEl.classList.add("open");
+  updateSessionScrollbar();
   sidebarBackdrop.hidden = false;
   sidebarToggleBtn.setAttribute("aria-expanded", "true");
   // Trap Tab inside the drawer so it can't escape into the (visually-
