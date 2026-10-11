@@ -6184,10 +6184,12 @@ $<HTMLButtonElement>("newSessionBtn").onclick = newSession;
 function updateRefreshButtonState(): void {
   for (const [button, target] of [[refreshHistoryBtn, mainRefreshTarget()], [dropRefreshBtn, "drop"]] as const) {
     const busy = conversationBusy(target);
-    button.textContent = refreshingHistory[target] ? "刷新中…" : "刷新";
     button.disabled = refreshingHistory[target] || busy;
     button.setAttribute("aria-busy", String(refreshingHistory[target]));
-    button.title = busy ? "正在处理，完成后再刷新" : "刷新当前对话";
+    const label = refreshingHistory[target] ? "刷新中…"
+      : busy ? "正在处理，完成后再刷新" : "刷新当前对话";
+    button.setAttribute("aria-label", label);
+    button.title = label;
   }
 }
 updateRefreshButtonState();

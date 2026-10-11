@@ -449,6 +449,11 @@ header h1 {
   display: inline-grid; place-items: center;
 }
 .actions .icon-only svg { width: 15px; height: 15px; }
+.actions .refresh-button[aria-busy="true"] svg { animation: refreshSpin .9s linear infinite; }
+@keyframes refreshSpin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .actions .refresh-button[aria-busy="true"] svg { animation: none; }
+}
 .actions [hidden] { display: none; }
 .header-menu { position: relative; }
 .header-menu-panel {
@@ -1446,6 +1451,7 @@ body.lightbox-open { overflow: hidden; }
   .wrap { width: 100%; }
   .main { padding: 0 14px calc(12px + env(safe-area-inset-bottom)); }
   .session-item { margin-inline: 8px; }
+  .session-title { max-width: 10em; }
   .session-actions { display: none; }
   .session-title-input { font-size: 16px; }
   header { gap: 8px; padding: 12px 14px 10px; }
@@ -1494,7 +1500,7 @@ body.lightbox-open { overflow: hidden; }
   .sidebar {
     position: fixed;
     left: 0; top: 0; bottom: 0;
-    width: 300px; max-width: 86vw;
+    width: 200px; max-width: 86vw;
     flex: 0 0 auto;
     /* Drawer needs an opaque panel so it reads against the dimmed backdrop;
        desktop column stays transparent (cards float on the page gradient). */
