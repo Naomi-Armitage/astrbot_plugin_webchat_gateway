@@ -123,8 +123,6 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
   flex: 0 0 240px; width: 240px;
   display: flex; flex-direction: column;
   min-height: 0;
-  /* Desktop: column sits on the page gradient with no fill of its own;
-     items are floating cards. Mobile drawer adds a solid panel below. */
 }
 .sidebar-head { padding: 14px 12px 8px; }
 .sidebar-new {
@@ -337,6 +335,11 @@ header {
   border-bottom: 1px solid color-mix(in oklab, var(--rule) 60%, transparent);
   container-type: inline-size;
   container-name: chathead;
+}
+@media (min-width: 720px) {
+  /* Extend the main header across the sidebar, then start its controls below it. */
+  #chatHeader { left: -240px; }
+  .sidebar-head { padding-top: 78px; }
 }
 .brand { display: flex; align-items: center; gap: 10px; text-decoration: none; }
 .brand-mark {
@@ -1450,7 +1453,20 @@ body.lightbox-open { overflow: hidden; }
 @media (max-width: 719px) {
   .wrap { width: 100%; }
   .main { padding: 0 14px calc(12px + env(safe-area-inset-bottom)); }
-  .session-item { margin-inline: 8px; }
+  /* Put the scrollbar on the screen's left edge; keep card contents left-to-right. */
+  .session-list { direction: rtl; }
+  .session-item { margin-inline: 8px; direction: ltr; }
+  .sidebar-new,
+  .session-item,
+  .drop-entry {
+    background: color-mix(in oklab, var(--card) 90%, transparent);
+  }
+  .sidebar-new:hover,
+  .session-item[aria-current="page"],
+  .session-item.rename-ready,
+  .drop-entry[aria-expanded="true"] {
+    background: color-mix(in oklab, color-mix(in oklab, var(--card) 90%, var(--accent) 10%) 90%, transparent);
+  }
   .session-title { max-width: 10em; }
   .session-actions { display: none; }
   .session-title-input { font-size: 16px; }
@@ -1502,14 +1518,9 @@ body.lightbox-open { overflow: hidden; }
     left: 0; top: 0; bottom: 0;
     width: 200px; max-width: 86vw;
     flex: 0 0 auto;
-    /* Drawer needs an opaque panel so it reads against the dimmed backdrop;
-       desktop column stays transparent (cards float on the page gradient). */
-    background: var(--paper);
-    border-right: 1px solid var(--rule);
     transform: translateX(-100%);
     z-index: 100;
     transition: transform .25s ease;
-    box-shadow: 0 0 24px var(--shadow-strong);
   }
   .sidebar.open { transform: translateX(0); }
   .sidebar-backdrop:not([hidden]) { display: block; }
