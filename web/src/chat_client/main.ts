@@ -328,7 +328,7 @@ $("dropPanel").append(dropComposer.root);
 const composerView = (target: ComposerTarget) => target === "drop" ? dropComposer : chatComposer;
 const dropHeader = $("chatHeader").cloneNode(true) as HTMLElement;
 dropHeader.id = "dropHeader";
-for (const selector of ["#sidebarToggle", ".brand", "#who", "#syncStatus", "#quotaBadge", "#themeToggle", "#logout", "#dropLayoutSwitch"]) {
+for (const selector of ["#sidebarToggle", ".brand", "#who", "#syncStatus", "#quotaBadge", "#headerMenu", "#dropLayoutSwitch"]) {
   dropHeader.querySelector(selector)?.remove();
 }
 for (const element of dropHeader.querySelectorAll<HTMLElement>("[id]")) element.id = `drop-${element.id}`;
@@ -6145,6 +6145,35 @@ function updateRefreshButtonState(): void {
   }
 }
 updateRefreshButtonState();
+const headerMenu = $("headerMenu");
+const headerMenuToggle = $<HTMLButtonElement>("headerMenuToggle");
+const headerMenuPanel = $("headerMenuPanel");
+function closeHeaderMenu(restoreFocus = false): void {
+  if (headerMenuPanel.hidden) return;
+  headerMenuPanel.hidden = true;
+  headerMenuToggle.setAttribute("aria-expanded", "false");
+  if (restoreFocus) headerMenuToggle.focus();
+}
+headerMenuToggle.addEventListener("click", () => {
+  const open = headerMenuPanel.hidden;
+  headerMenuPanel.hidden = !open;
+  headerMenuToggle.setAttribute("aria-expanded", String(open));
+});
+headerMenuPanel.addEventListener("click", (event) => {
+  if (event.target instanceof Element && event.target.closest("button")) closeHeaderMenu(true);
+});
+headerMenu.addEventListener("focusout", (event) => {
+  if (!headerMenu.contains(event.relatedTarget as Node | null)) closeHeaderMenu();
+});
+document.addEventListener("pointerdown", (event) => {
+  if (!headerMenu.contains(event.target as Node)) closeHeaderMenu();
+}, { passive: true });
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape" || headerMenuPanel.hidden) return;
+  event.preventDefault();
+  event.stopPropagation();
+  closeHeaderMenu(true);
+});
 $<HTMLButtonElement>("logout").onclick = () => {
   if (!confirm("登出会清除本机保存的 token 与对话历史。继续？")) return;
   sync.stopped = true;

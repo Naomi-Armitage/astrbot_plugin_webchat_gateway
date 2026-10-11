@@ -453,6 +453,37 @@ header h1 {
 }
 .actions .icon-only svg { width: 15px; height: 15px; }
 .actions [hidden] { display: none; }
+.header-menu { position: relative; }
+.header-menu-panel {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 1;
+  width: 184px;
+  padding: 5px;
+  background: var(--card);
+  border: 1px solid var(--rule);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px var(--shadow-strong);
+}
+.actions .header-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 40px;
+  padding: 8px 10px;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+  font-size: 13px;
+}
+.actions .header-menu-item svg { width: 18px; height: 18px; flex: 0 0 18px; }
+.actions .header-menu-item:hover { background: var(--accent-soft); color: var(--ink); }
+.actions .header-menu-item.danger:hover { background: color-mix(in oklab, var(--bad) 8%, transparent); color: var(--bad); }
+.actions .header-menu-item:focus-visible,
+.actions .header-menu-trigger:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 @media (max-width: 719px) {
   html:not([data-pip]) #dropLayoutSwitch { display: none; }
 }
