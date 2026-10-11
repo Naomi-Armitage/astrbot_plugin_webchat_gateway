@@ -36,6 +36,7 @@ from .ddl import (
     V4_TO_V5_MYSQL,
     V5_TO_V6_MYSQL,
     V6_TO_V7_MYSQL,
+    V7_TO_V8_MYSQL,
 )
 
 
@@ -175,6 +176,13 @@ class MysqlStorage(AbstractStorage):
                         for stmt in V6_TO_V7_MYSQL:
                             await cur.execute(stmt)
                         stored = "7"
+                    if stored == "7":
+                        try:
+                            await cur.execute(V7_TO_V8_MYSQL)
+                        except aiomysql.OperationalError as exc:
+                            if not exc.args or exc.args[0] != _ERR_DUP_KEY_NAME:
+                                raise
+                        stored = "8"
                     # Persist the marker only when the ladder
                     # actually advanced (`stored != stored_pre`). A
                     # boot whose stored value already matches CURRENT
@@ -1407,19 +1415,35 @@ class MysqlStorage(AbstractStorage):
         params: list = [token_name]
         if not include_deleted:
             clauses.append("deleted_at IS NULL")
-        if before_id is not None:
-            clauses.append("id < %s")
-            params.append(before_id)
-        params.append(limit)
-        sql = (
-            "SELECT id, token_name, device_id, device_name, kind, text, "
-            "file_id, filename, mime, size_bytes, created_at, deleted_at "
-            "FROM webchat_drop_messages "
-            f"WHERE {' AND '.join(clauses)} "
-            "ORDER BY id DESC LIMIT %s"
-        )
         async with self._read_tx() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
+                if before_id is not None:
+                    await cur.execute(
+                        "SELECT created_at FROM webchat_drop_messages "
+                        "WHERE token_name = %s AND id = %s",
+                        (token_name, before_id),
+                    )
+                    anchor = await cur.fetchone()
+                    if anchor is None:
+                        return []
+                    # MySQL can range-scan the composite index for the
+                    # expanded predicate; row-constructor comparison may
+                    # use only its token_name prefix on older servers.
+                    clauses.append(
+                        "(created_at < %s OR (created_at = %s AND id < %s))"
+                    )
+                    params.extend((
+                        int(anchor["created_at"]), int(anchor["created_at"]),
+                        before_id,
+                    ))
+                params.append(limit)
+                sql = (
+                    "SELECT id, token_name, device_id, device_name, kind, text, "
+                    "file_id, filename, mime, size_bytes, created_at, deleted_at "
+                    "FROM webchat_drop_messages "
+                    f"WHERE {' AND '.join(clauses)} "
+                    "ORDER BY created_at DESC, id DESC LIMIT %s"
+                )
                 await cur.execute(sql, tuple(params))
                 rows = await cur.fetchall()
         return [self._row_to_drop_message(r) for r in rows]

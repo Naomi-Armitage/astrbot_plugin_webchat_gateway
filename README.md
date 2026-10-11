@@ -304,9 +304,9 @@ MIME 通过 Pillow `verify()` 检测（不信任客户端 Content-Type），允�
 | POST | `{prefix}/conversations/{sid}/regenerate` | body `{message_index}`：重新生成指定 assistant 回复。**会把 `message_index` 之后的所有 turn 一并清掉**（对端设备同样收到逐条 `message_deleted` 事件），然后追加新 assistant。响应 `{ok, reply, remaining, daily_quota}`。 |
 | GET | `{prefix}/events?since=N&timeout=25` | 多设备同步长轮询。返回 `{events:[{event_type, payload, pts, ts, session_id}], last_pts, has_more, tooFar?}`。事件类型：`session_created` / `session_meta_updated` / `message_added` / `message_deleted` / `history_cleared` / `stream_started` / `stream_ended`。`tooFar=true` 表示 `since` 已被 `_pruned_marker` 越过，客户端应整体 cold-refetch。 |
 
-聊天页右上角「更多选项」提供「导入对话 / Drop」与「导出全部对话」。JSON 对话导入单文件不超过 20 MiB、500 个会话、合计 20,000 条消息，单条文字不超过 100,000 字符。空备份不创建会话；非法 JSON 返回 `400 invalid_json`，格式错误返回 `400 invalid_import` / `unsupported_backup_version`，超出文件大小返回 `413 payload_too_large`。所有会话写入失败返回 HTTP 500，部分成功返回 HTTP 200，并在页面提示成功与失败数量。
+聊天页右上角「更多选项」提供「导入会话」与「导出对话」。JSON 对话导入单文件不超过 20 MiB、500 个会话、合计 20,000 条消息，单条文字不超过 100,000 字符。空备份不创建会话；非法 JSON 返回 `400 invalid_json`，格式错误返回 `400 invalid_import` / `unsupported_backup_version`，超出文件大小返回 `413 payload_too_large`。所有会话写入失败返回 HTTP 500，部分成功返回 HTTP 200，并在页面提示成功与失败数量。
 
-同一导入入口也接受旧版 Edge Drop 导出的文本，例如 `[2025-07-07 06:19:24] 你好`；下一条时间戳前的续行属于同一条消息。时间按导入浏览器的本地时区解析，保存在 Drop 消息时间中。只导入文字，文件附件无法从文本备份恢复；已有 Drop 内容不会覆盖。导入记录按导入顺序获得新 ID，因此会作为新加入的一组显示在历史顶部，即使原时间较早。一次最多 1,000 条，单条不超过 16,000 字符。再次导入会产生重复消息。
+同一导入入口也接受旧版 Edge Drop 导出的文本，例如 `[2025-07-07 06:19:24] 你好`；下一条时间戳前的续行属于同一条消息。时间按导入浏览器的本地时区解析，保存在 Drop 消息时间中。只导入文字，文件附件无法从文本备份恢复；已有 Drop 内容不会覆盖。导入与已有消息按时间排序；同一秒的消息按 ID 排序。一次最多 1,000 条，单条不超过 16,000 字符。再次导入会产生重复消息。
 
 ### Drop 端点（多设备自传，无 LLM）
 
@@ -319,7 +319,7 @@ Drop 是聊天页左侧固定的虚拟会话（session_id 留字面量 `drop`）
 | POST | `{prefix}/drop/send` | body `{text?, attachments?, device_id, device_name}`：文字 + 文件附件（file_id 必须是本 token 已上传到 `/drop/upload` 的）。返回 `{messages:[{id, device_id, device_name, kind: "text"|"file", text, file_id?, filename?, mime?, size?, created_at}, ...]}`。`device_id` 服务端不存，仅按 `^[A-Za-z0-9_\-.:]{8,64}$` 校验；`device_name` 走 UA 推导 + 客户端 localStorage 覆盖。失败码：`invalid_payload` / `invalid_device_id` / `invalid_attachment` / `text_too_long` / `storage_quota_exceeded` / `drop_disabled`。 |
 | POST | `{prefix}/drop/import` | body `{format:"edge-drop-text-v1", messages:[{text, created_at}, ...]}`：批量导入 Edge Drop 文字，`created_at` 是浏览器解析出的 Unix 秒数。返回 `{imported, failed}`；导入后发送一次 `drop_history_imported` 事件让其他设备刷新。需 bearer 鉴权；上限 20 MiB、1,000 条，内容错误返回 `400 invalid_drop_import`，Drop 关闭返回 `403 drop_disabled`。 |
 | POST | `{prefix}/drop/upload` | multipart `file` + 可选 `filename` 字段。任意文件类型；图片走 PIL sniff 与现有 `uploads.allowed_mime` 一致，其他类型信任声明 MIME 但服务端强制拒绝 `image/svg+xml` / `text/html` / `application/xhtml+xml` 与 `.html` / `.svg` / `.xhtml` 等可执行扩展名（stored-XSS 与 XHTML 执行上下文防御）。返回 `{file_id, mime, size, filename}`。失败码：`unsupported_type` (415) / `storage_quota_exceeded` (429) / `payload_too_large` (413)。 |
-| GET  | `{prefix}/drop/messages?limit=50&before={id}` | newest-first 分页（`before_id` 游标）。返回 `{messages:[...], has_more, before}`；有下一页时 `before` 是本页最旧消息 id，否则为 `null`。`has_more` 用 peek+1 判定（边界页与全满页可区分）。 |
+| GET  | `{prefix}/drop/messages?limit=50&before={id}` | 按 `(created_at DESC, id DESC)` 分页（`before` 为上一页最后一条消息的 id）。返回 `{messages:[...], has_more, before}`；有下一页时 `before` 是本页最旧消息 id，否则为 `null`。`has_more` 用 peek+1 判定（边界页与全满页可区分）。 |
 | DELETE | `{prefix}/drop/messages/{message_id}` | 软删除一条。返回 `{ok, id}`；已删除的 id 统一返回 `404 not_found`（幂等）。peer 设备在事件长轮询里收到 `drop_message_deleted`，按 id 移除本地气泡。 |
 | POST | `{prefix}/drop/clear` | 硬清空整个 Drop 历史 + 释放所有附件。前端 confirm 后调；返回 `{ok, removed}`。peer 设备收到 `drop_history_cleared`。 |
 | DELETE | `{prefix}/drop/files/{file_id}` | 删除尚未发送的临时上传；若文件已经被 Drop 消息引用则返回 `409 file_in_use` 并保留文件。 |

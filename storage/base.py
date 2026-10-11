@@ -708,9 +708,9 @@ class AbstractStorage(ABC):
     ) -> int:
         """Insert one row into `webchat_drop_messages` and return its id.
 
-        `id` is server-assigned monotonic per token. `kind='file'` requires
-        `file_id != None`; `kind='text'` requires it to be None. The
-        caller is expected to have already validated the kind/file_id
+        `id` is server-assigned monotonic and breaks ties in timeline order.
+        `kind='file'` requires `file_id != None`; `kind='text'` requires it
+        to be None. The caller is expected to have validated the kind/file_id
         pairing and (for files) the file's token/session ownership.
         """
 
@@ -723,12 +723,12 @@ class AbstractStorage(ABC):
         before_id: int | None,
         include_deleted: bool,
     ) -> list[DropMessageRow]:
-        """Return up to `limit` rows ordered by id DESC (newest first).
+        """Return rows by (created_at DESC, id DESC), newest first.
 
-        `before_id` is a pagination cursor — pass the smallest id from
-        the previous page to fetch the next page. `None` starts at the
-        head. `include_deleted=False` hides soft-deleted rows (used by
-        the chat client); `True` exposes them (used by the prune sweep).
+        `before_id` identifies the last row of the previous page, including
+        its timestamp. `None` starts at the head. Soft-deleted cursor rows
+        remain valid. `include_deleted=False` hides soft-deleted rows (used
+        by the chat client); `True` exposes them (used by the prune sweep).
         """
 
     @abstractmethod

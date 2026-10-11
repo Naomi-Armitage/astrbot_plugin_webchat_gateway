@@ -82,7 +82,7 @@ OFFICE_MIMES = (
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("version", [None, "5", "6", CURRENT_SCHEMA_VERSION, "99"])
+@pytest.mark.parametrize("version", [None, "5", "6", "7", CURRENT_SCHEMA_VERSION, "99"])
 async def test_mysql_office_capacity_on_fresh_install_and_upgrade(mysql_storage, version):
     storage, cursor = mysql_storage(version)
     await storage.initialize()
@@ -103,6 +103,10 @@ async def test_mysql_office_capacity_on_fresh_install_and_upgrade(mysql_storage,
         assert "NOT NULL" in definition
         if table == "webchat_drop_messages":
             assert re.search(r"\bmime\s+VARCHAR\(\d+\)\s+NOT NULL DEFAULT ''", definition)
+    timeline_indexes = [
+        sql for sql in cursor.statements if "idx_drop_messages_token_time_id" in sql
+    ]
+    assert len(timeline_indexes) == (2 if version in ("5", "6", "7") else 1)
 
 
 @pytest.mark.asyncio

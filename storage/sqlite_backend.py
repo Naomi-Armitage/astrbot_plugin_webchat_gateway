@@ -35,6 +35,7 @@ from .ddl import (
     V2_TO_V3_SQLITE,
     V4_TO_V5_SQLITE,
     V5_TO_V6_SQLITE,
+    V7_TO_V8_SQLITE,
 )
 
 
@@ -168,6 +169,9 @@ class SqliteStorage(AbstractStorage):
                 # v6 → v7 widens MySQL MIME columns; SQLite's TEXT fields
                 # already preserve media types of any length.
                 stored = "7"
+            if stored == "7":
+                await self._conn.execute(V7_TO_V8_SQLITE)
+                stored = "8"
             # Persist the marker only when the ladder actually
             # advanced (`stored != stored_pre`). A boot whose stored
             # value already matches CURRENT skips the dead UPDATE.
@@ -1340,24 +1344,31 @@ class SqliteStorage(AbstractStorage):
         before_id: int | None,
         include_deleted: bool,
     ) -> list[DropMessageRow]:
-        # Single SELECT for both branches — `deleted_at IS NULL` filter is
-        # a no-op when include_deleted=True. Build the WHERE clause portably
-        # rather than branching two queries (keeps the index hit identical
-        # to the more common path).
+        # The id cursor identifies a (created_at, id) position, not an id
+        # range: imported rows receive new ids but retain their old dates.
+        # Include soft-deleted cursor rows so deleting the last visible row
+        # of a page does not break the next-page request.
         clauses = ["token_name = ?"]
         params: list = [token_name]
         if not include_deleted:
             clauses.append("deleted_at IS NULL")
         if before_id is not None:
-            clauses.append("id < ?")
-            params.append(before_id)
+            async with self._db.execute(
+                "SELECT created_at FROM webchat_drop_messages "
+                "WHERE token_name = ? AND id = ?", (token_name, before_id),
+            ) as cursor:
+                anchor = await cursor.fetchone()
+            if anchor is None:
+                return []
+            clauses.append("(created_at, id) < (?, ?)")
+            params.extend((int(anchor["created_at"]), before_id))
         params.append(limit)
         sql = (
             "SELECT id, token_name, device_id, device_name, kind, text, "
             "file_id, filename, mime, size_bytes, created_at, deleted_at "
             "FROM webchat_drop_messages "
             f"WHERE {' AND '.join(clauses)} "
-            "ORDER BY id DESC LIMIT ?"
+            "ORDER BY created_at DESC, id DESC LIMIT ?"
         )
         async with self._db.execute(sql, tuple(params)) as cursor:
             rows = await cursor.fetchall()

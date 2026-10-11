@@ -19,7 +19,7 @@ is safe. Cross-version upgrades happen inside each backend's `initialize()`.
 
 from __future__ import annotations
 
-CURRENT_SCHEMA_VERSION = "7"
+CURRENT_SCHEMA_VERSION = "8"
 
 SCHEMA_SQLITE: tuple[str, ...] = (
     """
@@ -119,9 +119,8 @@ SCHEMA_SQLITE: tuple[str, ...] = (
     # its own table because reusing webchat_session_meta / webchat_updates
     # would either pollute AstrBot's CM history (TECH_DEBT §1 calls this out
     # for the user/assistant pair semantic) or force every reader to branch
-    # on event_type. The `id` is a server-assigned monotonic counter per
-    # token (NOT a UUID) so peer devices can dedup by id and so history
-    # pagination is a simple `WHERE id < ?` range scan.
+    # on event_type. The `id` is a server-assigned monotonic counter (NOT a
+    # UUID) for peer deduplication and a tie-breaker for equal timestamps.
     """
     CREATE TABLE IF NOT EXISTS webchat_drop_messages (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -140,6 +139,8 @@ SCHEMA_SQLITE: tuple[str, ...] = (
     """,
     "CREATE INDEX IF NOT EXISTS idx_drop_messages_token_created "
     "ON webchat_drop_messages (token_name, id DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_drop_messages_token_time_id "
+    "ON webchat_drop_messages (token_name, created_at DESC, id DESC)",
     "CREATE INDEX IF NOT EXISTS idx_drop_messages_token_deleted "
     "ON webchat_drop_messages (token_name, deleted_at)",
     # FK with ON DELETE SET NULL: when a webchat_files row is hard-deleted
@@ -317,6 +318,7 @@ SCHEMA_MYSQL: tuple[str, ...] = (
         created_at  BIGINT NOT NULL,
         deleted_at  BIGINT NULL,
         INDEX idx_drop_messages_token_id (token_name, id),
+        INDEX idx_drop_messages_token_time_id (token_name, created_at, id),
         INDEX idx_drop_messages_token_deleted (token_name, deleted_at),
         INDEX idx_drop_messages_file (file_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
@@ -488,4 +490,16 @@ V5_TO_V6_MYSQL: tuple[str, ...] = (
 V6_TO_V7_MYSQL: tuple[str, ...] = (
     "ALTER TABLE webchat_files MODIFY COLUMN mime VARCHAR(255) NOT NULL",
     "ALTER TABLE webchat_drop_messages MODIFY COLUMN mime VARCHAR(255) NOT NULL DEFAULT ''",
+)
+
+
+# v7 → v8: timeline pagination uses (created_at, id), including imported
+# messages whose original timestamp predates their newly assigned id.
+V7_TO_V8_SQLITE = (
+    "CREATE INDEX IF NOT EXISTS idx_drop_messages_token_time_id "
+    "ON webchat_drop_messages (token_name, created_at DESC, id DESC)"
+)
+V7_TO_V8_MYSQL = (
+    "CREATE INDEX idx_drop_messages_token_time_id "
+    "ON webchat_drop_messages (token_name, created_at, id)"
 )

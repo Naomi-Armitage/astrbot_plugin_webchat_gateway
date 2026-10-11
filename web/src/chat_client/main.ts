@@ -1,6 +1,7 @@
 import { createComposer, autosizeComposer, type ComposerTarget } from "./composer";
 import { ConversationPanel } from "./conversation-panel";
 import { isDropImage } from "./drop-image";
+import { compareDropNewestFirst, isOlderDropMessage, type DropOrderKey } from "./drop-order";
 import { looksLikeEdgeDropExport, parseEdgeDropExport } from "./edge-drop-import";
 import "./conversation-panel.css";
 import {
@@ -2601,7 +2602,7 @@ function applyEvent(ev: ServerEvent): void {
       break;
     }
     case "drop_message_added": {
-      // Peer device added a Drop message — prepend to local list and re-render.
+      // Peer device added a Drop message — merge into timeline order.
       const msg = payload as Partial<DropMessage>;
       if (typeof msg.id !== "number" || !Number.isInteger(msg.id)) break;
       if (typeof msg.text !== "string" || (msg.kind !== "text" && msg.kind !== "file")) break;
@@ -2617,12 +2618,11 @@ function applyEvent(ev: ServerEvent): void {
         mime: typeof msg.mime === "string" ? msg.mime : undefined,
         size: typeof msg.size === "number" ? msg.size : undefined,
       };
-      // Prepend (newest first)
       dropLoadSeq += 1;
       const existing = dropMessages.findIndex((item) => item.id === full.id);
       if (existing >= 0) dropMessages.splice(existing, 1);
       dropMessages.unshift(full);
-      dropMessages.sort((a, b) => b.id - a.id);
+      dropMessages.sort(compareDropNewestFirst);
       if (dropOpen) renderDropMessages();
       break;
     }
@@ -3591,7 +3591,7 @@ let dropOpen = false;
 let dropFallbackTimer: ReturnType<typeof setTimeout> | null = null;
 let dropMessages: DropMessage[] = [];
 let dropHasMore = false;
-let dropBefore: number | null = null;
+let dropBefore: DropOrderKey | null = null;
 let dropLoadingOlder = false;
 const DROP_PAGE_SIZE = 50;
 const DROP_FALLBACK_REFRESH_MS = 15_000;
@@ -3840,12 +3840,14 @@ interface DropListResponse {
   before?: number | null;
 }
 
-function dropCursorFromResponse(data: DropListResponse, messages: DropMessage[]): number | null {
+function dropCursorFromResponse(data: DropListResponse, messages: DropMessage[]): DropOrderKey | null {
   if (data.has_more !== true || !messages.length) return null;
   const raw = data.before;
-  if (typeof raw === "number" && Number.isInteger(raw) && raw > 0) return raw;
   const last = messages[messages.length - 1];
-  return typeof last?.id === "number" && Number.isInteger(last.id) ? last.id : null;
+  if (typeof raw === "number" && Number.isInteger(raw) && raw > 0) {
+    return messages.find((item) => item.id === raw) ?? null;
+  }
+  return last && Number.isInteger(last.id) ? last : null;
 }
 
 function resetDropAfterImport(): void {
@@ -3886,16 +3888,16 @@ async function loadDropMessages(options: { preserveOlder?: boolean } = {}): Prom
         // the local cache just because an older page had been loaded.
         dropMessages = dropMessages.filter((item) => incomingIds.has(item.id));
       } else if (headCursor !== null) {
-        // The response covers every live row at/after its cursor. Keep only
-        // those rows plus pages strictly older than that cursor.
+        // The response covers every live row at/after its timeline cursor.
+        // Keep only those rows plus pages strictly older than that cursor.
         dropMessages = dropMessages.filter(
-          (item) => item.id < headCursor || incomingIds.has(item.id),
+          (item) => isOlderDropMessage(item, headCursor) || incomingIds.has(item.id),
         );
       }
       const merged = new Map<number, DropMessage>();
       for (const item of dropMessages) merged.set(item.id, item);
       for (const item of incoming) merged.set(item.id, item);
-      dropMessages = [...merged.values()].sort((a, b) => b.id - a.id);
+      dropMessages = [...merged.values()].sort(compareDropNewestFirst);
       if (data.has_more !== true) {
         dropHasMore = false;
         dropBefore = null;
@@ -3907,7 +3909,7 @@ async function loadDropMessages(options: { preserveOlder?: boolean } = {}): Prom
       // response's cursor only describes the first page, not the oldest page
       // currently present in the local list.
     } else {
-      dropMessages = incoming.sort((a, b) => b.id - a.id);
+      dropMessages = incoming.sort(compareDropNewestFirst);
       dropBefore = dropCursorFromResponse(data, incoming);
       dropHasMore = dropBefore !== null;
     }
@@ -3925,7 +3927,7 @@ async function loadOlderDropMessages(): Promise<void> {
   if (dropOpen) renderDropMessages();
   const requestSeq = ++dropLoadSeq;
   try {
-    const url = `${DROP_MESSAGES_URL}?limit=${DROP_PAGE_SIZE}&before=${encodeURIComponent(String(cursor))}`;
+    const url = `${DROP_MESSAGES_URL}?limit=${DROP_PAGE_SIZE}&before=${encodeURIComponent(String(cursor.id))}`;
     const resp = await fetchWithTimeout(url, { headers: bearer(), credentials: "same-origin" }, FETCH_TIMEOUT_FAST_MS);
     if (resp.status === 401) { handle401(); return; }
     if (!resp.ok) throw new Error("HTTP " + resp.status);
@@ -3938,19 +3940,19 @@ async function loadOlderDropMessages(): Promise<void> {
       // This response covers the complete remaining range below `cursor`.
       // Remove rows deleted while the older-page request was in flight.
       dropMessages = dropMessages.filter(
-        (item) => item.id >= cursor || incomingIds.has(item.id),
+        (item) => !isOlderDropMessage(item, cursor) || incomingIds.has(item.id),
       );
     } else if (nextCursor !== null) {
       // The returned page covers [nextCursor, cursor). Preserve the already
       // loaded head and rows strictly older than the new cursor.
       dropMessages = dropMessages.filter(
-        (item) => item.id >= cursor || item.id < nextCursor || incomingIds.has(item.id),
+        (item) => !isOlderDropMessage(item, cursor) || isOlderDropMessage(item, nextCursor) || incomingIds.has(item.id),
       );
     }
     const merged = new Map<number, DropMessage>();
     for (const item of dropMessages) merged.set(item.id, item);
     for (const item of incoming) merged.set(item.id, item);
-    dropMessages = [...merged.values()].sort((a, b) => b.id - a.id);
+    dropMessages = [...merged.values()].sort(compareDropNewestFirst);
     dropHasMore = data.has_more === true && incoming.length > 0;
     dropBefore = dropHasMore ? dropCursorFromResponse(data, incoming) : null;
     // A malformed/empty response must not leave an endless disabled cursor.
@@ -4044,7 +4046,7 @@ async function sendDrop(): Promise<void> {
     if (historyVersion === dropHistoryVersion) {
       const merged = new Map(dropMessages.map((item) => [item.id, item]));
       for (const item of data.messages ?? []) merged.set(item.id, item);
-      dropMessages = [...merged.values()].sort((a, b) => b.id - a.id);
+      dropMessages = [...merged.values()].sort(compareDropNewestFirst);
       if (dropOpen) renderDropMessages({ forceBottom: true });
     } else {
       await loadDropMessages({ preserveOlder: true });

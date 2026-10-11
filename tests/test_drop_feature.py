@@ -40,7 +40,7 @@ class TestDropSchema:
         ) as cursor:
             row = await cursor.fetchone()
         assert row is not None
-        assert row["value"] == CURRENT_SCHEMA_VERSION == "7"
+        assert row["value"] == CURRENT_SCHEMA_VERSION == "8"
 
         async with storage._db.execute(
             "SELECT name FROM sqlite_master WHERE type='table' "
@@ -159,6 +159,36 @@ class TestDropSchema:
             finally:
                 await storage.close()
 
+    async def test_v7_upgrade_adds_timeline_index(self, tmp_path):
+        from astrbot_plugin_webchat_gateway.storage.sqlite_backend import SqliteStorage
+
+        storage = SqliteStorage(str(tmp_path / "v7.db"))
+        await storage.initialize()
+        try:
+            await storage._db.execute(
+                "DROP INDEX idx_drop_messages_token_time_id"
+            )
+            await storage._db.execute(
+                "UPDATE _schema_meta SET value = '7' WHERE key = 'schema_version'"
+            )
+            await storage._db.commit()
+        finally:
+            await storage.close()
+        for _ in range(2):
+            await storage.initialize()
+            try:
+                async with storage._db.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' "
+                    "AND name = 'idx_drop_messages_token_time_id'"
+                ) as cursor:
+                    assert await cursor.fetchone() is not None
+                async with storage._db.execute(
+                    "SELECT value FROM _schema_meta WHERE key = 'schema_version'"
+                ) as cursor:
+                    assert (await cursor.fetchone())["value"] == "8"
+            finally:
+                await storage.close()
+
 
 @pytest.mark.asyncio
 class TestDropMessages:
@@ -196,6 +226,56 @@ class TestDropMessages:
             include_deleted=False,
         )
         assert [r.id for r in page2] == [ids[1], ids[0]]
+
+    async def test_imported_and_local_rows_share_timeline_across_pages(self, storage):
+        async def append(text, when):
+            return await storage.append_drop_message(
+                token_name="alice", device_id="dev-1", device_name="",
+                kind="text", text=text, file_id=None, filename="",
+                mime="", size_bytes=0, now=when,
+            )
+
+        oldest = await append("local old", 100)
+        newest = await append("local new", 300)
+        imported = await append("imported", 200)
+        tied = await append("imported same second", 200)
+        latest = await append("local latest", 400)
+        expected = [latest, newest, tied, imported, oldest]
+        assert imported > newest  # An id cursor would put this before newest.
+
+        found = []
+        before = None
+        while True:
+            page = await storage.list_drop_messages(
+                token_name="alice", limit=2, before_id=before,
+                include_deleted=False,
+            )
+            if not page:
+                break
+            found.extend(row.id for row in page)
+            before = page[-1].id
+        assert found == expected
+
+        # The cursor remains usable after its row is soft-deleted.
+        await storage.soft_delete_drop_message(
+            token_name="alice", message_id=tied, now=500,
+        )
+        remainder = await storage.list_drop_messages(
+            token_name="alice", limit=10, before_id=tied,
+            include_deleted=False,
+        )
+        assert [row.id for row in remainder] == [imported, oldest]
+
+        # A cursor from another token must never expose Alice's head page.
+        bob = await storage.append_drop_message(
+            token_name="bob", device_id="dev-1", device_name="",
+            kind="text", text="bob", file_id=None, filename="",
+            mime="", size_bytes=0, now=150,
+        )
+        assert await storage.list_drop_messages(
+            token_name="alice", limit=10, before_id=bob,
+            include_deleted=False,
+        ) == []
 
     async def test_include_deleted_toggles_visibility(self, storage):
         mid = await storage.append_drop_message(

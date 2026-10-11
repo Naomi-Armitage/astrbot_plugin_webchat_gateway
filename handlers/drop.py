@@ -29,7 +29,7 @@ Endpoints (all registered in handlers/server.py under cfg.drop_*):
   POST {prefix}/drop/upload        multipart file upload (any type, NOT the
                                    image-only /upload — Drop accepts arbitrary
                                    files and enforces its own MIME policy)
-  GET  {prefix}/drop/messages?before=&limit=   newest-first pagination
+  GET  {prefix}/drop/messages?before=&limit=   timeline pagination
   DELETE {prefix}/drop/messages/{message_id}   soft-delete one message
   POST {prefix}/drop/clear         hard-clear own history + release files
   DELETE {prefix}/drop/files/{file_id}           discard an unsent upload
@@ -413,7 +413,17 @@ def make_drop_handlers(deps: DropDeps):
         if request.content_length is not None and request.content_length > MAX_EDGE_DROP_IMPORT_BYTES:
             return _err(request, gated.origin, ServiceError("payload_too_large", status=413))
         try:
-            raw = await request.read()
+            # The app-wide body cap can be much larger than this endpoint's
+            # cap when Drop uploads allow multi-GB files. Bound the read
+            # itself so chunked imports cannot allocate the whole upload.
+            raw = bytearray()
+            while len(raw) <= MAX_EDGE_DROP_IMPORT_BYTES:
+                chunk = await request.content.read(
+                    MAX_EDGE_DROP_IMPORT_BYTES + 1 - len(raw)
+                )
+                if not chunk:
+                    break
+                raw.extend(chunk)
             if len(raw) > MAX_EDGE_DROP_IMPORT_BYTES:
                 raise ServiceError("payload_too_large", status=413)
             messages = validate_edge_drop_import(json.loads(raw))

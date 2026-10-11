@@ -28,12 +28,13 @@ class _MemoryDropStorage:
         return [len(self.events)]
 
 
-def _routes(monkeypatch, *, enabled=True, gate_response=None):
+def _routes(monkeypatch, *, enabled=True, gate_response=None, storage=None):
     from astrbot_plugin_webchat_gateway.core.ratelimit import PerTokenUploadGate
     from astrbot_plugin_webchat_gateway.handlers import drop
     from astrbot_plugin_webchat_gateway.handlers.common import GatePass
 
-    storage = _MemoryDropStorage()
+    if storage is None:
+        storage = _MemoryDropStorage()
     audit = SimpleNamespace(write=AsyncMock())
     bus = SimpleNamespace(notify=AsyncMock())
     gate = gate_response or GatePass(
@@ -52,9 +53,11 @@ def _routes(monkeypatch, *, enabled=True, gate_response=None):
 
 def _request(messages, *, format="edge-drop-text-v1", content_length=None):
     headers = {"Content-Length": str(content_length)} if content_length is not None else {}
-    request = make_mocked_request("POST", "/api/webchat/drop/import", headers=headers)
-    request._read_bytes = json.dumps({"format": format, "messages": messages}).encode()
-    return request
+    body = json.dumps({"format": format, "messages": messages}).encode()
+    return make_mocked_request(
+        "POST", "/api/webchat/drop/import", headers=headers,
+        payload=SimpleNamespace(read=AsyncMock(side_effect=[body, b""])),
+    )
 
 
 @pytest.mark.asyncio
@@ -92,6 +95,40 @@ async def test_import_preserves_text_time_and_token_scope(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_import_and_list_interleave_with_persisted_local_messages(monkeypatch, tmp_path):
+    from astrbot_plugin_webchat_gateway.storage.sqlite_backend import SqliteStorage
+
+    storage = SqliteStorage(str(tmp_path / "drop_import.db"))
+    await storage.initialize()
+    try:
+        routes, _, _, _ = _routes(monkeypatch, storage=storage)
+        for text, when in [("local old", 1751869000), ("local new", 1751869300)]:
+            await storage.append_drop_message(
+                token_name="alice", device_id="device-local", device_name="PC",
+                kind="text", text=text, file_id=None, filename="",
+                mime="", size_bytes=0, now=when,
+            )
+        response = await routes["import"](_request([
+            {"text": "imported", "created_at": 1751869164},
+        ]))
+        assert response.status == 200
+        first = await routes["list"](make_mocked_request(
+            "GET", "/api/webchat/drop/messages?limit=2",
+        ))
+        body = json.loads(first.body)
+        assert [row["text"] for row in body["messages"]] == ["local new", "imported"]
+        assert body["has_more"] is True
+        second = await routes["list"](make_mocked_request(
+            "GET", f"/api/webchat/drop/messages?limit=2&before={body['before']}",
+        ))
+        body = json.loads(second.body)
+        assert [row["text"] for row in body["messages"]] == ["local old"]
+        assert body["has_more"] is False
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("messages,fmt", [
     ([], "edge-drop-text-v1"),
     ([{"text": "", "created_at": 1751869164}], "edge-drop-text-v1"),
@@ -116,6 +153,33 @@ async def test_import_rejects_oversized_body(monkeypatch):
     response = await routes["import"](_request([], content_length=MAX_EDGE_DROP_IMPORT_BYTES + 1))
     assert response.status == 413
     assert storage.rows == []
+
+
+@pytest.mark.asyncio
+async def test_import_bounds_chunked_body_without_content_length(monkeypatch):
+    from astrbot_plugin_webchat_gateway.handlers.edge_drop_import import MAX_EDGE_DROP_IMPORT_BYTES
+
+    routes, storage, _, _ = _routes(monkeypatch)
+    request = _request([])
+    request.content.read.side_effect = [b"x" * (MAX_EDGE_DROP_IMPORT_BYTES + 1)]
+    response = await routes["import"](request)
+    assert response.status == 413
+    request.content.read.assert_awaited_once_with(MAX_EDGE_DROP_IMPORT_BYTES + 1)
+    assert storage.rows == []
+
+
+@pytest.mark.asyncio
+async def test_import_reads_all_chunks_before_parsing(monkeypatch):
+    routes, storage, _, _ = _routes(monkeypatch)
+    request = _request([{"text": "split", "created_at": 1751869164}])
+    body = json.dumps({
+        "format": "edge-drop-text-v1",
+        "messages": [{"text": "split", "created_at": 1751869164}],
+    }).encode()
+    request.content.read.side_effect = [body[:12], body[12:], b""]
+    response = await routes["import"](request)
+    assert response.status == 200
+    assert [row["text"] for row in storage.rows] == ["split"]
 
 
 @pytest.mark.asyncio
