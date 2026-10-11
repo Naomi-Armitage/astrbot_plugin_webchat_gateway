@@ -223,6 +223,7 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
   border-color: color-mix(in oklab, var(--accent) 45%, var(--rule));
   box-shadow: 0 1px 3px var(--shadow);
 }
+.session-item.rename-ready { border-color: var(--accent); background: var(--accent-soft); }
 .session-pick {
   flex: 1; min-width: 0;
   display: flex; flex-direction: column; align-items: stretch;
@@ -288,10 +289,6 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
     opacity: 1;
     pointer-events: auto;
   }
-}
-
-.session-edit {
-  display: none;
 }
 
 .session-title-input {
@@ -1448,6 +1445,9 @@ body.lightbox-open { overflow: hidden; }
 @media (max-width: 719px) {
   .wrap { width: 100%; }
   .main { padding: 0 14px calc(12px + env(safe-area-inset-bottom)); }
+  .session-item { margin-inline: 8px; }
+  .session-actions { display: none; }
+  .session-title-input { font-size: 16px; }
   header { gap: 8px; padding: 12px 14px 10px; }
   .who { display: none; }
   .actions { gap: 4px; }
@@ -1494,7 +1494,7 @@ body.lightbox-open { overflow: hidden; }
   .sidebar {
     position: fixed;
     left: 0; top: 0; bottom: 0;
-    width: 280px; max-width: 80vw;
+    width: 300px; max-width: 86vw;
     flex: 0 0 auto;
     /* Drawer needs an opaque panel so it reads against the dimmed backdrop;
        desktop column stays transparent (cards float on the page gradient). */

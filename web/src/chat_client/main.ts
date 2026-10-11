@@ -1415,6 +1415,7 @@ function relativeTime(ts: number): string {
 }
 
 let editingSessionId: string | null = null;
+let editingSessionDraft: string | null = null;
 
 // ---------- Sync state ----------
 
@@ -3076,6 +3077,7 @@ function onVisibilityChange(): void {
 // ---------- Sidebar render ----------
 
 const SESSION_SWIPE_WIDTH = 64;
+const SESSION_RENAME_HOLD_MS = 400;
 type SessionSwipeAction = "pin" | "delete";
 let swipedSession: HTMLElement | null = null;
 
@@ -3114,16 +3116,32 @@ function createSessionSwipeButton(action: SessionSwipeAction, label: string, ico
   return button;
 }
 
-function installSessionSwipe(row: HTMLElement): void {
+function installSessionSwipe(row: HTMLElement, sessionId: string): void {
   let gesture: { id: number; x: number; y: number; start: number; offset: number; horizontal: boolean } | null = null;
   let suppressClick = false;
+  let renameHoldTimer: ReturnType<typeof setTimeout> | null = null;
+  let renameReady = false;
+  const cancelRenameHold = (): void => {
+    if (renameHoldTimer !== null) clearTimeout(renameHoldTimer);
+    renameHoldTimer = null;
+    row.classList.remove("rename-ready");
+  };
   row.addEventListener("pointerdown", (event) => {
     suppressClick = false;
     if (event.pointerType !== "touch" && event.pointerType !== "pen") return;
     if (!event.isPrimary || !(event.target as Element).closest(".session-pick")) return;
+    renameReady = false;
     const start = row.dataset.swipeOpen === "pin" ? SESSION_SWIPE_WIDTH
       : row.dataset.swipeOpen === "delete" ? -SESSION_SWIPE_WIDTH : 0;
     gesture = { id: event.pointerId, x: event.clientX, y: event.clientY, start, offset: start, horizontal: false };
+    if (window.matchMedia("(max-width: 719px)").matches && !row.hasAttribute("data-swipe-open")) {
+      renameHoldTimer = setTimeout(() => {
+        renameHoldTimer = null;
+        if (!gesture || !row.isConnected) return;
+        renameReady = true;
+        row.classList.add("rename-ready");
+      }, SESSION_RENAME_HOLD_MS);
+    }
   });
   row.addEventListener("pointermove", (event) => {
     if (!gesture || event.pointerId !== gesture.id) return;
@@ -3131,6 +3149,8 @@ function installSessionSwipe(row: HTMLElement): void {
     const dy = event.clientY - gesture.y;
     if (!gesture.horizontal) {
       if (Math.max(Math.abs(dx), Math.abs(dy)) < 10) return;
+      cancelRenameHold();
+      renameReady = false;
       // Lock to the first clear direction so scrolling the list never opens actions.
       if (Math.abs(dy) >= Math.abs(dx)) { gesture = null; return; }
       gesture.horizontal = true;
@@ -3149,6 +3169,15 @@ function installSessionSwipe(row: HTMLElement): void {
     if (!gesture || event.pointerId !== gesture.id) return;
     const current = gesture;
     gesture = null;
+    cancelRenameHold();
+    if (renameReady) {
+      renameReady = false;
+      suppressClick = true;
+      // Let the touch's compatibility click reach the capture guard below
+      // before replacing the row with the title editor.
+      setTimeout(() => { if (row.isConnected) beginRename(sessionId); }, 0);
+      return;
+    }
     if (!current.horizontal) return;
     const offset = event.type === "pointerup" ? current.offset : current.start;
     const action = offset >= SESSION_SWIPE_WIDTH / 2 ? "pin"
@@ -3162,6 +3191,11 @@ function installSessionSwipe(row: HTMLElement): void {
     // Transferring the touch's implicit capture from the pick button to the
     // row also emits this event on the button; only losing the row's capture cancels.
     if (event.target === row) finish(event);
+  });
+  row.addEventListener("contextmenu", (event) => {
+    if (window.matchMedia("(max-width: 719px)").matches && (event.target as Element).closest(".session-pick")) {
+      event.preventDefault();
+    }
   });
   row.addEventListener("click", (event) => {
     // Ignore the compatibility click after a swipe; a fresh pointerdown resets
@@ -3192,6 +3226,8 @@ document.addEventListener("keydown", (event) => {
 
 function renderSessionList(): void {
   closeSessionSwipe();
+  const activeEditor = sessionListEl.querySelector<HTMLInputElement>(".session-title-input");
+  if (activeEditor && editingSessionId) editingSessionDraft = activeEditor.value;
   sessionListEl.replaceChildren();
   const sorted = Object.values(store.sessions).sort((a, b) => {
     const ap = a.pinned ? 1 : 0;
@@ -3211,16 +3247,17 @@ function renderSessionList(): void {
     if (isEditing) {
       const input = document.createElement("input");
       input.className = "session-title-input"; input.type = "text";
-      input.maxLength = RENAME_MAX; input.value = sess.title || "";
+      input.maxLength = RENAME_MAX; input.value = editingSessionDraft ?? sess.title ?? "";
       input.setAttribute("aria-label", "重命名会话");
       let settled = false;
       const commit = (): void => { if (settled) return; settled = true; void commitRename(sess.id, input.value); };
       const cancel = (): void => { if (settled) return; settled = true; cancelRename(); };
+      input.addEventListener("input", () => { editingSessionDraft = input.value; });
       input.addEventListener("keydown", (e) => {
         if (e.key === "Enter") { e.preventDefault(); commit(); }
         else if (e.key === "Escape") { e.preventDefault(); cancel(); }
       });
-      input.addEventListener("blur", commit);
+      input.addEventListener("blur", () => { if (input.isConnected) commit(); });
       li.append(input); sessionListEl.appendChild(li);
       queueMicrotask(() => { input.focus(); input.select(); });
       continue;
@@ -3242,6 +3279,11 @@ function renderSessionList(): void {
     meta.append(time);
     pick.append(title, meta);
     pick.addEventListener("click", () => switchSession(sess.id));
+    pick.addEventListener("keydown", (event) => {
+      if (event.key !== "F2") return;
+      event.preventDefault();
+      beginRename(sess.id);
+    });
 
     // 双击标题进入编辑模式
     title.addEventListener("dblclick", (e) => {
@@ -3274,7 +3316,7 @@ function renderSessionList(): void {
     swipePin.setAttribute("aria-pressed", String(!!sess.pinned));
     const swipeDelete = createSessionSwipeButton("delete", "删除", TRASH_SVG, () => { void deleteSession(sess.id); });
     li.append(content, swipePin, swipeDelete);
-    installSessionSwipe(li);
+    installSessionSwipe(li, sess.id);
 
     sessionListEl.appendChild(li);
   }
@@ -3379,6 +3421,7 @@ async function commitRename(sid: string, raw: string): Promise<void> {
   sess.title = newTitle;
   sess.titleManual = true;
   editingSessionId = null;
+  editingSessionDraft = null;
   saveStore();
   renderSessionList();
   try {
@@ -3388,17 +3431,20 @@ async function commitRename(sid: string, raw: string): Promise<void> {
     sess.title = prev.title;
     sess.titleManual = prev.titleManual;
     editingSessionId = sid;
+    editingSessionDraft = raw;
     saveStore();
     renderSessionList();
     addMessageBubble("error", `重命名失败: ${(e as Error).message}`);
   }
 }
 
-function cancelRename(): void { editingSessionId = null; renderSessionList(); }
+function cancelRename(): void { editingSessionId = null; editingSessionDraft = null; renderSessionList(); }
 
 function beginRename(sid: string): void {
   if (!store.sessions[sid]) return;
-  editingSessionId = sid; renderSessionList();
+  editingSessionId = sid;
+  editingSessionDraft = store.sessions[sid]!.title;
+  renderSessionList();
 }
 
 async function deleteSession(id: string): Promise<void> {
