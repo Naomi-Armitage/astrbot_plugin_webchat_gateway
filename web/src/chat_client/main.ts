@@ -53,6 +53,10 @@ const ME_URL = `${API}/me`;
 const SITE_URL = `${API}/site`;
 const TITLE_URL = `${API}/title`;
 const CONV_URL = `${API}/conversations`;
+const CONV_EXPORT_URL = `${CONV_URL}/export`;
+const CONV_IMPORT_URL = `${CONV_URL}/import`;
+const TRANSFER_FORMAT = "webchat-gateway-conversations";
+const MAX_TRANSFER_BYTES = 20 * 1024 * 1024;
 const EVENTS_URL = `${API}/events`;
 const UPLOAD_URL = `${API}/upload`;
 const FILES_URL = `${API}/files`;
@@ -2332,6 +2336,8 @@ function applyEvent(ev: ServerEvent): void {
         store.sessions[sid] = {
           id: sid,
           title: title || "新会话",
+          titleManual: typeof payload["title_manual"] === "boolean" ? payload["title_manual"] as boolean : false,
+          pinned: typeof payload["pinned"] === "boolean" ? payload["pinned"] as boolean : false,
           lastActiveAt: ev.ts * 1000,
           history: [],
         };
@@ -6272,6 +6278,10 @@ updateRefreshButtonState();
 const headerMenu = $("headerMenu");
 const headerMenuToggle = $<HTMLButtonElement>("headerMenuToggle");
 const headerMenuPanel = $("headerMenuPanel");
+const importConversationsBtn = $<HTMLButtonElement>("importConversations");
+const exportConversationsBtn = $<HTMLButtonElement>("exportConversations");
+const conversationImportFile = $<HTMLInputElement>("conversationImportFile");
+const transferStatusEl = $("transferStatus");
 function closeHeaderMenu(restoreFocus = false): void {
   if (headerMenuPanel.hidden) return;
   headerMenuPanel.hidden = true;
@@ -6298,6 +6308,132 @@ document.addEventListener("keydown", (event) => {
   event.stopPropagation();
   closeHeaderMenu(true);
 });
+
+let transferBusy = false;
+let transferStatusTimer: ReturnType<typeof setTimeout> | null = null;
+function showTransferStatus(message: string, error = false): void {
+  if (transferStatusTimer !== null) clearTimeout(transferStatusTimer);
+  transferStatusEl.textContent = message;
+  transferStatusEl.dataset.error = String(error);
+  transferStatusEl.hidden = false;
+  transferStatusTimer = setTimeout(() => { transferStatusEl.hidden = true; }, 7000);
+}
+function setTransferBusy(busy: boolean): void {
+  transferBusy = busy;
+  importConversationsBtn.disabled = busy;
+  exportConversationsBtn.disabled = busy;
+}
+
+exportConversationsBtn.addEventListener("click", () => { void exportConversations(); });
+async function exportConversations(): Promise<void> {
+  if (transferBusy) return;
+  setTransferBusy(true);
+  try {
+    const resp = await fetchWithTimeout(
+      CONV_EXPORT_URL,
+      { credentials: "same-origin", headers: bearer() },
+      180_000,
+    );
+    if (resp.status === 401) { handle401(); return; }
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const backup = await resp.json() as {
+      format?: string; version?: number; attachments_omitted?: number; conversations?: unknown[];
+    };
+    if (backup.format !== TRANSFER_FORMAT || backup.version !== 1 || !Array.isArray(backup.conversations)) {
+      throw new Error("备份格式无效");
+    }
+    const blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `webchat-conversations-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    const omitted = backup.attachments_omitted || 0;
+    showTransferStatus(
+      `已导出 ${backup.conversations.length} 个对话。${omitted ? `${omitted} 个附件以文字标记代替，文件未包含。` : ""}`,
+    );
+  } catch (error) {
+    showTransferStatus(`导出失败：${(error as Error).message}`, true);
+  } finally {
+    setTransferBusy(false);
+  }
+}
+
+importConversationsBtn.addEventListener("click", () => {
+  if (!transferBusy) conversationImportFile.click();
+});
+conversationImportFile.addEventListener("change", () => {
+  const file = conversationImportFile.files?.[0];
+  conversationImportFile.value = "";
+  if (file) void importConversations(file);
+});
+async function importConversations(file: File): Promise<void> {
+  if (transferBusy) return;
+  if (file.size > MAX_TRANSFER_BYTES) {
+    showTransferStatus("备份文件不能超过 20 MiB。", true);
+    return;
+  }
+  let source: string;
+  let count: number;
+  try {
+    source = await file.text();
+    const backup = JSON.parse(source) as { format?: string; version?: number; conversations?: unknown[] };
+    if (backup?.format !== TRANSFER_FORMAT || backup.version !== 1 || !Array.isArray(backup.conversations)) {
+      throw new Error("文件不是有效的对话备份");
+    }
+    count = backup.conversations.length;
+  } catch {
+    showTransferStatus("无法读取对话备份：请选用本应用导出的 JSON 文件。", true);
+    return;
+  }
+  if (count === 0) {
+    showTransferStatus("备份中没有对话可导入。");
+    return;
+  }
+  if (!confirm(`将 ${count} 个对话导入为新会话，现有对话不会覆盖。备份不包含附件文件，继续？`)) return;
+  setTransferBusy(true);
+  try {
+    const resp = await fetchWithTimeout(
+      CONV_IMPORT_URL,
+      {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json", ...bearer() },
+        body: source,
+      },
+      180_000,
+    );
+    if (resp.status === 401) { handle401(); return; }
+    const result = await resp.json().catch(() => ({})) as {
+      error?: string; imported?: number; failed?: number; session_ids?: string[];
+    };
+    if (!resp.ok) {
+      const reason = resp.status === 413 ? "文件超过服务器限制"
+        : resp.status === 400 ? "文件格式或内容不符合要求" : `服务器错误（${resp.status}）`;
+      if (result.failed && result.imported === 0) {
+        throw new Error(`${result.failed} 个对话均未导入，请检查服务端日志`);
+      }
+      throw new Error(reason);
+    }
+    let refreshed = true;
+    try { await coldRefetch(); } catch { refreshed = false; }
+    const firstId = result.session_ids?.[0];
+    if (refreshed && firstId && store.sessions[firstId]) switchSession(firstId);
+    const imported = result.imported ?? 0;
+    const failed = result.failed ?? 0;
+    showTransferStatus(
+      `已导入 ${imported} 个对话。${failed ? `${failed} 个失败；再次导入会重复创建已成功的对话。` : ""}${refreshed ? "" : "请刷新页面查看。"}`,
+      failed > 0 || !refreshed,
+    );
+  } catch (error) {
+    showTransferStatus(`导入失败：${(error as Error).message}。如请求中断，请先刷新确认是否已有部分对话导入。`, true);
+  } finally {
+    setTransferBusy(false);
+  }
+}
+
 $<HTMLButtonElement>("logout").onclick = () => {
   if (!confirm("登出会清除本机保存的 token 与对话历史。继续？")) return;
   sync.stopped = true;

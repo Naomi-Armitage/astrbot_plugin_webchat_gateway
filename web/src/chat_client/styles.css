@@ -514,12 +514,26 @@ header h1 {
   font-size: 13px;
 }
 .actions .header-menu-item svg { width: 18px; height: 18px; flex: 0 0 18px; }
+.header-menu-separator { border-top: 1px solid var(--rule); margin: 5px 4px; }
 .actions .header-menu-item:hover { background: var(--accent-soft); color: var(--ink); }
+.actions .header-menu-item:disabled { opacity: .5; cursor: wait; }
 .actions .header-menu-item.danger:hover { background: color-mix(in oklab, var(--bad) 8%, transparent); color: var(--bad); }
 .actions .header-menu-item:focus-visible,
 .actions .header-menu-trigger:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.transfer-status {
+  position: fixed; top: 72px; right: 20px; z-index: 110;
+  max-width: min(360px, calc(100vw - 24px));
+  padding: 10px 14px;
+  background: var(--card); color: var(--ink);
+  border: 1px solid var(--rule); border-radius: 10px;
+  box-shadow: 0 8px 24px var(--shadow-strong);
+  font-size: 13px;
+}
+.transfer-status[hidden] { display: none; }
+.transfer-status[data-error="true"] { border-color: var(--bad); }
 @media (max-width: 719px) {
   html:not([data-pip]) #dropLayoutSwitch { display: none; }
+  .transfer-status { top: 62px; right: 12px; }
 }
 
 .who {

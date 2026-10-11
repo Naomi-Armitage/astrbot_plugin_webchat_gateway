@@ -16,9 +16,10 @@ from __future__ import annotations
 
 import json
 import time
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -72,6 +73,12 @@ from .conversations_overlay import (
     _extract_text,
     _normalize_history,
     _renderable_entry,
+)
+from .conversations_transfer import (
+    ATTACHMENT_PLACEHOLDER,
+    TRANSFER_FORMAT,
+    TRANSFER_VERSION,
+    ImportedConversation,
 )
 
 
@@ -631,6 +638,125 @@ class ConversationService:
         )
         last_pts = await self._storage.get_max_pts(token_name=token_name)
         return ConversationListResult(conversations=items, last_pts=last_pts)
+
+    async def export_conversations(self, *, token_name: str) -> dict[str, Any]:
+        """Export every saved session as portable text; file bytes stay private."""
+        listed = await self.list_conversations(token_name=token_name)
+        conversations: list[dict[str, Any]] = []
+        attachments_omitted = 0
+        for item in listed.conversations:
+            detail = await self.get_conversation(
+                token_name=token_name, session_id=item.session_id
+            )
+            messages: list[dict[str, str]] = []
+            for message in detail.messages:
+                role = message.get("role")
+                content = message.get("content")
+                if role not in ("user", "assistant") or not isinstance(content, str):
+                    continue
+                attachments = message.get("attachments")
+                if isinstance(attachments, list) and attachments:
+                    attachments_omitted += len(attachments)
+                    content += ("\n\n" if content else "") + ATTACHMENT_PLACEHOLDER
+                messages.append({"role": role, "content": content})
+            conversations.append(
+                {
+                    "title": detail.title,
+                    "title_manual": detail.title_manual,
+                    "pinned": detail.pinned,
+                    "messages": messages,
+                }
+            )
+        return {
+            "format": TRANSFER_FORMAT,
+            "version": TRANSFER_VERSION,
+            "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "attachments_omitted": attachments_omitted,
+            "conversations": conversations,
+        }
+
+    async def import_conversations(
+        self,
+        *,
+        token_name: str,
+        conversations: list[ImportedConversation],
+        ip: str | None = None,
+    ) -> dict[str, Any]:
+        """Create copies under fresh session IDs, leaving existing chats intact."""
+        imported_ids: list[str] = []
+        events: list[NewEvent] = []
+        failed = 0
+        for conversation in conversations:
+            session_id = str(uuid.uuid4())
+            umo = _umo(token_name, session_id)
+            now = self._now()
+            history = [
+                {"role": role, "content": [{"type": "text", "text": content}]}
+                for role, content in conversation.messages
+            ]
+            try:
+                cid = await self._cm.new_conversation(
+                    umo,
+                    platform_id="webchat_gateway",
+                    title=session_id,
+                    persona_id=None,
+                )
+                await self._cm.update_conversation(
+                    unified_msg_origin=umo, conversation_id=cid, history=history
+                )
+                await self._storage.upsert_session_meta(
+                    token_name=token_name,
+                    session_id=session_id,
+                    title=conversation.title,
+                    title_manual=conversation.title_manual,
+                    pinned_at=now if conversation.pinned else None,
+                    message_count=len(history),
+                    preview=(
+                        conversation.messages[-1][1][:_PREVIEW_CHARS]
+                        if conversation.messages else ""
+                    ),
+                    now=now,
+                )
+            except Exception:
+                failed += 1
+                logger.exception(
+                    "[WebChatGateway] import_conversations failed token=%s session=%s",
+                    token_name,
+                    session_id,
+                )
+                continue
+            imported_ids.append(session_id)
+            events.append(
+                NewEvent(
+                    event_type=EVENT_SESSION_CREATED,
+                    session_id=session_id,
+                    payload=json.dumps(
+                        {
+                            "title": conversation.title,
+                            "title_manual": conversation.title_manual,
+                            "pinned": conversation.pinned,
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+            )
+        if events:
+            try:
+                await self._storage.append_updates(
+                    token_name=token_name, events=events, now=self._now()
+                )
+                await self._event_bus.notify(token_name)
+            except Exception:
+                # Histories and metadata are committed. The importing client
+                # refreshes its list; peers recover on their next full refetch.
+                logger.exception("[WebChatGateway] import sync event failed")
+        await self._audit.write(
+            "conv_import",
+            name=token_name,
+            ip=ip,
+            detail={"imported": len(imported_ids), "failed": failed},
+        )
+        return {"imported": len(imported_ids), "failed": failed, "session_ids": imported_ids}
 
     async def get_conversation(
         self, *, token_name: str, session_id: str

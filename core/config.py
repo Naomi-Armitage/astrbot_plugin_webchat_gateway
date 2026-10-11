@@ -337,6 +337,14 @@ class ConfigView:
         return f"{self.endpoint_prefix}/conversations"
 
     @property
+    def conversations_export_path(self) -> str:
+        return f"{self.conversations_path}/export"
+
+    @property
+    def conversations_import_path(self) -> str:
+        return f"{self.conversations_path}/import"
+
+    @property
     def conversations_item_path(self) -> str:
         return f"{self.endpoint_prefix}/conversations/{{session_id}}"
 

@@ -35,6 +35,7 @@
         </div>
       </aside>
       <div class="sidebar-backdrop" id="sidebarBackdrop" hidden></div>
+      <div id="transferStatus" class="transfer-status" role="status" aria-live="polite" hidden></div>
 
       <div class="main">
         <header id="chatHeader">
@@ -87,6 +88,21 @@
                 </svg>
               </button>
               <div id="headerMenuPanel" class="header-menu-panel" role="group" aria-label="更多选项" hidden>
+                <button id="importConversations" type="button" class="header-menu-item" title="从 JSON 备份导入对话">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                    stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M4 16v4h16v-4M12 3v12m-4-4 4 4 4-4"/>
+                  </svg>
+                  <span>导入对话</span>
+                </button>
+                <button id="exportConversations" type="button" class="header-menu-item" title="导出全部对话为 JSON，附件不包含在内">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                    stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M4 16v4h16v-4M12 15V3m-4 4 4-4 4 4"/>
+                  </svg>
+                  <span>导出全部对话</span>
+                </button>
+                <div class="header-menu-separator" role="separator"></div>
                 <button id="themeToggle" type="button" class="header-menu-item"
                   aria-label="切换主题" aria-pressed="false">
                   <svg id="themeIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -103,6 +119,7 @@
                   <span>登出</span>
                 </button>
               </div>
+              <input id="conversationImportFile" type="file" accept=".json,application/json" hidden />
             </div>
           </div>
         </header>

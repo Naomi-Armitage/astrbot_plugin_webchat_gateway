@@ -295,12 +295,16 @@ MIME 通过 Pillow `verify()` 检测（不信任客户端 Content-Type），允�
 | GET | `{prefix}/me` | 身份探测 + `wcg_file` cookie 下发。返回 `{name, remaining, daily_quota}`。前端聊天页 boot 时调一次，浏览器拿到 HttpOnly cookie 后续 `<img>` 才能 GET 私有附件。 |
 | POST | `{prefix}/title` | `{session_id, conversation:[{role,text}, ...]}` → `{title}`。可选服务端：LLM 总结前几轮生成 25 字以内会话标题，自动写回 session_meta。`auto_title_enabled=false` 时返回 503 disabled。 |
 | GET | `{prefix}/conversations` | 列出本 token 名下所有会话：`{conversations:[{session_id, title, updated_at, message_count, preview, pinned, title_manual}], last_pts}`。`last_pts` 是当前事件流游标，用于后续长轮询。 |
+| GET | `{prefix}/conversations/export` | 导出本 token 名下未删除的已保存会话为 JSON 备份，含标题、置顶状态与文字消息。附件用文字占位，返回 `attachments_omitted` 数量；不包含附件文件、Drop 或 token。 |
+| POST | `{prefix}/conversations/import` | body 为上述 JSON 备份。校验通过后创建新会话，保留标题与置顶状态，不覆盖现有会话。返回 `{imported, failed, session_ids}`；部分失败时已成功的会话仍保留，再次导入会创建副本。 |
 | GET | `{prefix}/conversations/{sid}` | 单会话详情：`{session_id, title, ..., messages:[{role, content, ts, attachments?, incomplete?}]}`。复用 CM 历史 + `webchat_updates` 事件回放补齐附件与未完整标记。 |
 | PATCH | `{prefix}/conversations/{sid}` | 改 `{title?, title_manual?, pinned?, deleted?}`（软删）。返回更新后的 `_meta_payload`。 |
 | POST | `{prefix}/conversations/{sid}/clear` | 清空本会话历史 + 释放所有附件。返回 `_meta_payload`。与 `/chat/stream` 互斥，冲突 `429 concurrent_request`。 |
 | DELETE | `{prefix}/conversations/{sid}/messages/{idx}` | 删单条消息（`idx` 是渲染索引，0-based）。**永久删除，无 undo。** 释放该条附件中未被其他消息引用的文件。返回 `{ok:true, ...meta}`。 |
 | POST | `{prefix}/conversations/{sid}/regenerate` | body `{message_index}`：重新生成指定 assistant 回复。**会把 `message_index` 之后的所有 turn 一并清掉**（对端设备同样收到逐条 `message_deleted` 事件），然后追加新 assistant。响应 `{ok, reply, remaining, daily_quota}`。 |
 | GET | `{prefix}/events?since=N&timeout=25` | 多设备同步长轮询。返回 `{events:[{event_type, payload, pts, ts, session_id}], last_pts, has_more, tooFar?}`。事件类型：`session_created` / `session_meta_updated` / `message_added` / `message_deleted` / `history_cleared` / `stream_started` / `stream_ended`。`tooFar=true` 表示 `since` 已被 `_pruned_marker` 越过，客户端应整体 cold-refetch。 |
+
+聊天页右上角「更多选项」提供「导入对话」与「导出全部对话」。导入仅接受本应用的 JSON 备份，单文件不超过 20 MiB、500 个会话、合计 20,000 条消息，单条文字不超过 100,000 字符。空备份不创建会话；非法 JSON 返回 `400 invalid_json`，格式错误返回 `400 invalid_import` / `unsupported_backup_version`，超出文件大小返回 `413 payload_too_large`。所有会话写入失败返回 HTTP 500，部分成功返回 HTTP 200，并在页面提示成功与失败数量。
 
 ### Drop 端点（多设备自传，无 LLM）
 

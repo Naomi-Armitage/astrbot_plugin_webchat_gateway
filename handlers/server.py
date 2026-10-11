@@ -36,6 +36,7 @@ from .conversations import (
     ConversationService,
     make_conversation_handlers,
 )
+from .conversations_transfer import MAX_TRANSFER_BYTES
 from .drop import (
     DropDeps,
     make_drop_files_preflight,
@@ -130,7 +131,9 @@ def build_app(deps: ServerDeps) -> web.Application:
         upload_cap_bytes = max(
             upload_cap_bytes, cfg.drop.max_file_size_mb * 1024 * 1024 + 256 * 1024
         )
-    body_cap = max(64 * 1024, cfg.max_message_length * 4, upload_cap_bytes)
+    # A JSON conversation backup can be imported even when file uploads are
+    # disabled. The import handler applies this same cap to its own body.
+    body_cap = max(MAX_TRANSFER_BYTES, cfg.max_message_length * 4, upload_cap_bytes)
     app = web.Application(client_max_size=body_cap)
 
     # Stream buffer eviction sweeper — runs for the lifetime of the app.
@@ -231,6 +234,10 @@ def build_app(deps: ServerDeps) -> web.Application:
     conv = make_conversation_handlers(deps.conv, deps.conv_service)
     app.router.add_get(cfg.conversations_path, conv["list"])
     app.router.add_options(cfg.conversations_path, conv["preflight"])
+    app.router.add_get(cfg.conversations_export_path, conv["export"])
+    app.router.add_options(cfg.conversations_export_path, conv["preflight"])
+    app.router.add_post(cfg.conversations_import_path, conv["import"])
+    app.router.add_options(cfg.conversations_import_path, conv["preflight"])
     app.router.add_get(cfg.conversations_item_path, conv["get"])
     app.router.add_patch(cfg.conversations_item_path, conv["patch"])
     app.router.add_options(cfg.conversations_item_path, conv["preflight"])

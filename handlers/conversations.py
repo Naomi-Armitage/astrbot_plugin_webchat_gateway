@@ -72,6 +72,7 @@ from .conversations_service import (  # noqa: F401
 # parameter to it so the validation and the eventual enforcement
 # agree on the bound.
 from .conversations_service import _MAX_EVENT_TIMEOUT
+from .conversations_transfer import MAX_TRANSFER_BYTES, validate_import_document
 
 
 # Handler-side constants. `_DEFAULT_EVENT_TIMEOUT` is the long-poll
@@ -241,6 +242,57 @@ def make_conversation_handlers(
                     _list_item_payload(it) for it in result.conversations
                 ],
             },
+            origin=gated.origin,
+            allowed_origins=gated.allowed,
+            same_origin_host=gated.same_host,
+        )
+
+    async def export_conversations(request: web.Request) -> web.Response:
+        gated = await gate_request(request, deps)
+        if isinstance(gated, web.Response):
+            return gated
+        try:
+            payload = await service.export_conversations(token_name=gated.token.name)
+        except ServiceError as exc:
+            return _err(request, gated.origin, exc)
+        except Exception:
+            logger.exception("[WebChatGateway] export_conversations failed")
+            return _err(request, gated.origin, ServiceError("internal_error", status=500))
+        return json_response(
+            payload,
+            origin=gated.origin,
+            allowed_origins=gated.allowed,
+            same_origin_host=gated.same_host,
+        )
+
+    async def import_conversations(request: web.Request) -> web.Response:
+        gated = await gate_request(request, deps)
+        if isinstance(gated, web.Response):
+            return gated
+        if request.content_length is not None and request.content_length > MAX_TRANSFER_BYTES:
+            return _err(request, gated.origin, ServiceError("payload_too_large", status=413))
+        try:
+            raw = await request.read()
+            if len(raw) > MAX_TRANSFER_BYTES:
+                raise ServiceError("payload_too_large", status=413)
+            conversations = validate_import_document(json.loads(raw))
+            result = await service.import_conversations(
+                token_name=gated.token.name,
+                conversations=conversations,
+                ip=gated.ip,
+            )
+        except web.HTTPRequestEntityTooLarge:
+            return _err(request, gated.origin, ServiceError("payload_too_large", status=413))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return _err(request, gated.origin, ServiceError("invalid_json", status=400))
+        except ServiceError as exc:
+            return _err(request, gated.origin, exc)
+        except Exception:
+            logger.exception("[WebChatGateway] import_conversations failed")
+            return _err(request, gated.origin, ServiceError("internal_error", status=500))
+        return json_response(
+            result,
+            status=200 if result["imported"] or not conversations else 500,
             origin=gated.origin,
             allowed_origins=gated.allowed,
             same_origin_host=gated.same_host,
@@ -720,6 +772,8 @@ def make_conversation_handlers(
 
     return {
         "list": list_conversations,
+        "export": export_conversations,
+        "import": import_conversations,
         "get": get_conversation,
         "patch": patch_conversation,
         "clear": clear_conversation,

@@ -45,6 +45,7 @@ Chat path (per request):
     llm_timeout     — provider call exceeded llm_timeout_seconds; detail: {msg_len}
     chat_error      — provider call failed; detail: {error: <truncated>}
     chat_ok         — request completed; detail: {msg_len, reply_len, remaining}
+    conv_import     — text-only backup imported; detail: {imported, failed}.
     image_generated — /image command produced an attachment; detail:
                       {prompt_len, model, size, file_id}.
     image_failed    — /image command raised; detail:
