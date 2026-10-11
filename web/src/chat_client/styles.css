@@ -87,6 +87,7 @@
 :root {
   --font-display: "Comic Sans MS", "Comic Neue", "Chalkboard SE", "Marker Felt", system-ui, sans-serif;
   --font-ui:      system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", Roboto, "Helvetica Neue", sans-serif;
+  --sidebar-width: 256px;
 }
 
 /* ----- base ----- */
@@ -120,16 +121,22 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
 
 /* ----- sidebar ----- */
 .sidebar {
-  flex: 0 0 240px; width: 240px;
+  flex: 0 0 var(--sidebar-width); width: var(--sidebar-width);
   display: flex; flex-direction: column;
   min-height: 0;
+  position: relative;
 }
-.sidebar-head { padding: 14px 12px 8px; }
+.sidebar-actions {
+  display: flex; align-items: stretch; gap: 8px;
+  flex: 0 0 auto;
+  padding: 10px 12px 14px;
+  border-top: 1px solid var(--rule);
+}
 .sidebar-new {
-  width: 100%;
+  flex: 1; min-width: 0; min-height: 46px;
   display: inline-flex; align-items: center; justify-content: center;
-  gap: 7px; padding: 9px 12px;
-  font: inherit; font-size: 13px; font-weight: 600;
+  gap: 8px; padding: 0 12px;
+  font: inherit; font-size: 14px; font-weight: 600;
   color: var(--accent); background: var(--card);
   border: 1px dashed color-mix(in oklab, var(--accent) 40%, var(--rule));
   border-radius: 10px; cursor: pointer;
@@ -140,28 +147,49 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
   background: var(--accent-soft); border-color: var(--accent); color: var(--accent-strong);
   box-shadow: 0 2px 4px var(--shadow-strong);
 }
-.sidebar-new svg { width: 14px; height: 14px; }
+.sidebar-new svg { width: 16px; height: 16px; }
+.sidebar-new:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 
-/* Drop shares the session item states below; only its compact layout differs. */
+/* The Drop action uses the same card states as a session, with an icon-only square. */
 .drop-entry {
-  width: 100%;
-  display: inline-flex; align-items: center; justify-content: center;
-  gap: 7px;
-  margin-top: 6px;
-  padding: 7px 10px;
-  font: inherit; font-size: 12.5px; font-weight: 600;
+  flex: 0 0 46px; width: 46px; height: 46px;
+  display: grid; place-items: center;
+  padding: 0;
+  font: inherit;
   border-radius: 10px;
   cursor: pointer;
 }
-.drop-entry svg { width: 13px; height: 13px; }
+.drop-entry[hidden] { display: none; }
+.drop-entry svg { width: 20px; height: 20px; }
 
-.session-list { list-style: none; margin: 0; padding: 4px 0 6px; flex: 1; overflow-y: auto; min-height: 0; }
-.session-list::-webkit-scrollbar { width: 6px; }
-.session-list::-webkit-scrollbar-thumb {
-  background: color-mix(in oklab, var(--ink-soft) 30%, transparent);
-  border-radius: 999px;
+.session-list {
+  list-style: none; margin: 0; padding: 4px 0 6px 12px;
+  flex: 1; overflow-y: auto; min-height: 0;
+  scrollbar-width: none;
 }
-.session-scrollbar { display: none; }
+.session-list::-webkit-scrollbar { display: none; }
+.session-scrollbar {
+  display: none;
+  position: absolute;
+  left: 0;
+  width: 18px;
+  cursor: pointer;
+  touch-action: none;
+  user-select: none;
+}
+.session-scrollbar.is-scrollable { display: block; }
+.session-scrollbar::before {
+  content: "";
+  position: absolute;
+  left: 6px;
+  top: var(--thumb-top, 0px);
+  width: 6px;
+  height: var(--thumb-height, 0px);
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--ink-soft) 30%, transparent);
+  pointer-events: none;
+}
+.session-scrollbar:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 
 .session-item {
   display: flex; align-items: stretch; gap: 0;
@@ -339,8 +367,8 @@ header {
 }
 @media (min-width: 720px) {
   /* Extend the main header across the sidebar, then start its controls below it. */
-  #chatHeader { left: -240px; }
-  .sidebar-head { padding-top: 78px; }
+  #chatHeader { left: calc(-1 * var(--sidebar-width)); }
+  .sidebar { padding-top: 72px; }
 }
 .brand { display: flex; align-items: center; gap: 10px; text-decoration: none; }
 .brand-mark {
@@ -1453,30 +1481,7 @@ body.lightbox-open { overflow: hidden; }
 /* ----- mobile ----- */
 @media (max-width: 719px) {
   .main { padding: 0 14px calc(12px + env(safe-area-inset-bottom)); }
-  .session-list {
-    /* Native mobile scrollbars can ignore RTL; clip them and show our thumb on the left. */
-    width: calc(100% + 12px);
-    padding-right: 12px;
-    scrollbar-width: none;
-  }
-  .session-list::-webkit-scrollbar { display: none; }
   .session-item { margin-inline: 8px; }
-  .session-scrollbar {
-    position: absolute;
-    left: 2px;
-    width: 4px;
-    pointer-events: none;
-  }
-  .sidebar.open .session-scrollbar.is-scrollable { display: block; }
-  .session-scrollbar::before {
-    content: "";
-    position: absolute;
-    top: var(--thumb-top, 0px);
-    width: 100%;
-    height: var(--thumb-height, 0px);
-    border-radius: 999px;
-    background: color-mix(in oklab, var(--ink-soft) 55%, transparent);
-  }
   .sidebar.open ~ .main .message-list { scrollbar-width: none; }
   .sidebar.open ~ .main .message-list::-webkit-scrollbar { display: none; }
   .sidebar-new,
@@ -1543,13 +1548,15 @@ body.lightbox-open { overflow: hidden; }
   .sidebar {
     position: fixed;
     left: 0; top: 0; bottom: 0;
-    width: 200px; max-width: 86vw;
+    width: 236px; max-width: 86vw;
     flex: 0 0 auto;
+    padding-top: calc(12px + env(safe-area-inset-top));
     overflow: hidden;
     transform: translateX(-100%);
     z-index: 100;
     transition: transform .25s ease;
   }
+  .sidebar-actions { padding-bottom: calc(14px + env(safe-area-inset-bottom)); }
   .sidebar.open { transform: translateX(0); }
   .sidebar-backdrop:not([hidden]) { display: block; }
 

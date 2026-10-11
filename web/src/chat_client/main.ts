@@ -3225,23 +3225,77 @@ document.addEventListener("keydown", (event) => {
   event.stopImmediatePropagation();
 }, true);
 
-function updateSessionScrollbar(): void {
+function sessionScrollbarMetrics(): { height: number; scrollRange: number; thumbHeight: number; thumbTop: number; thumbTravel: number } | null {
   const height = sessionListEl.clientHeight;
   const scrollRange = sessionListEl.scrollHeight - height;
-  const scrollable = height > 0 && scrollRange > 1;
-  sessionScrollbarEl.classList.toggle("is-scrollable", scrollable);
-  if (!scrollable) return;
+  if (height <= 0 || scrollRange <= 1) return null;
 
   const thumbHeight = Math.min(height, Math.max(28, height * height / sessionListEl.scrollHeight));
   const scrollTop = Math.max(0, Math.min(scrollRange, sessionListEl.scrollTop));
-  const thumbTop = scrollTop / scrollRange * (height - thumbHeight);
+  const thumbTravel = height - thumbHeight;
+  return { height, scrollRange, thumbHeight, thumbTop: scrollTop / scrollRange * thumbTravel, thumbTravel };
+}
+
+function updateSessionScrollbar(): void {
+  const metrics = sessionScrollbarMetrics();
+  sessionScrollbarEl.classList.toggle("is-scrollable", !!metrics);
+  sessionScrollbarEl.tabIndex = metrics && (window.innerWidth >= 720 || sidebarEl.classList.contains("open")) ? 0 : -1;
+  if (!metrics) return;
+
+  const { height, scrollRange, thumbHeight, thumbTop } = metrics;
   sessionScrollbarEl.style.top = `${sessionListEl.offsetTop}px`;
   sessionScrollbarEl.style.height = `${height}px`;
   sessionScrollbarEl.style.setProperty("--thumb-height", `${thumbHeight}px`);
   sessionScrollbarEl.style.setProperty("--thumb-top", `${thumbTop}px`);
+  sessionScrollbarEl.setAttribute("aria-valuemax", String(Math.ceil(scrollRange)));
+  sessionScrollbarEl.setAttribute("aria-valuenow", String(Math.round(sessionListEl.scrollTop)));
+  sessionScrollbarEl.setAttribute("aria-valuetext", `${Math.round(sessionListEl.scrollTop / scrollRange * 100)}%`);
 }
 sessionListEl.addEventListener("scroll", updateSessionScrollbar, { passive: true });
 new ResizeObserver(updateSessionScrollbar).observe(sessionListEl);
+window.addEventListener("resize", updateSessionScrollbar);
+
+let sessionScrollbarDrag: { pointerId: number; startY: number; startScrollTop: number } | null = null;
+sessionScrollbarEl.addEventListener("pointerdown", (event) => {
+  if (!event.isPrimary || event.button !== 0) return;
+  const metrics = sessionScrollbarMetrics();
+  if (!metrics) return;
+  event.preventDefault();
+  const y = event.clientY - sessionScrollbarEl.getBoundingClientRect().top;
+  if (y < metrics.thumbTop || y > metrics.thumbTop + metrics.thumbHeight) {
+    // A track tap moves one page; it never jumps an unexpectedly long distance.
+    sessionListEl.scrollTop += (y < metrics.thumbTop ? -1 : 1) * metrics.height * .9;
+    return;
+  }
+  sessionScrollbarDrag = { pointerId: event.pointerId, startY: event.clientY, startScrollTop: sessionListEl.scrollTop };
+  sessionScrollbarEl.setPointerCapture(event.pointerId);
+});
+sessionScrollbarEl.addEventListener("pointermove", (event) => {
+  if (!sessionScrollbarDrag || event.pointerId !== sessionScrollbarDrag.pointerId) return;
+  const metrics = sessionScrollbarMetrics();
+  if (!metrics || metrics.thumbTravel <= 0) return;
+  sessionListEl.scrollTop = sessionScrollbarDrag.startScrollTop
+    + (event.clientY - sessionScrollbarDrag.startY) * metrics.scrollRange / metrics.thumbTravel;
+});
+function stopSessionScrollbarDrag(event: PointerEvent): void {
+  if (!sessionScrollbarDrag || event.pointerId !== sessionScrollbarDrag.pointerId) return;
+  sessionScrollbarDrag = null;
+  if (sessionScrollbarEl.hasPointerCapture(event.pointerId)) sessionScrollbarEl.releasePointerCapture(event.pointerId);
+}
+sessionScrollbarEl.addEventListener("pointerup", stopSessionScrollbarDrag);
+sessionScrollbarEl.addEventListener("pointercancel", stopSessionScrollbarDrag);
+sessionScrollbarEl.addEventListener("lostpointercapture", stopSessionScrollbarDrag);
+sessionScrollbarEl.addEventListener("keydown", (event) => {
+  const page = sessionListEl.clientHeight * .9;
+  const offsets: Record<string, number> = {
+    ArrowUp: -40, ArrowDown: 40, PageUp: -page, PageDown: page,
+  };
+  if (event.key === "Home") sessionListEl.scrollTop = 0;
+  else if (event.key === "End") sessionListEl.scrollTop = sessionListEl.scrollHeight;
+  else if (Object.hasOwn(offsets, event.key)) sessionListEl.scrollTop += offsets[event.key]!;
+  else return;
+  event.preventDefault();
+});
 
 function renderSessionList(): void {
   closeSessionSwipe();
@@ -4044,6 +4098,7 @@ function openMobileSidebar(): void {
 function closeMobileSidebar(): void {
   closeSessionSwipe();
   sidebarEl.classList.remove("open");
+  updateSessionScrollbar();
   sidebarBackdrop.hidden = true;
   sidebarToggleBtn.setAttribute("aria-expanded", "false");
   sidebarFocusTrap?.release();
