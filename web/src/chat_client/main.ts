@@ -3288,11 +3288,25 @@ function sessionScrollbarMetrics(): { height: number; scrollRange: number; thumb
   return { height, scrollRange, thumbHeight, thumbTop: scrollTop / scrollRange * thumbTravel, thumbTravel };
 }
 
+let sessionScrollbarHideTimer: number | undefined;
+function revealSessionScrollbar(): void {
+  if (!sessionScrollbarEl.classList.contains("is-scrollable")) return;
+  sessionScrollbarEl.classList.add("is-visible");
+  window.clearTimeout(sessionScrollbarHideTimer);
+  sessionScrollbarHideTimer = window.setTimeout(() => {
+    if (!sessionScrollbarDrag) sessionScrollbarEl.classList.remove("is-visible");
+  }, 800);
+}
+
 function updateSessionScrollbar(): void {
   const metrics = sessionScrollbarMetrics();
   sessionScrollbarEl.classList.toggle("is-scrollable", !!metrics);
   sessionScrollbarEl.tabIndex = metrics && (window.innerWidth >= 720 || sidebarEl.classList.contains("open")) ? 0 : -1;
-  if (!metrics) return;
+  if (!metrics) {
+    window.clearTimeout(sessionScrollbarHideTimer);
+    sessionScrollbarEl.classList.remove("is-visible");
+    return;
+  }
 
   const { height, scrollRange, thumbHeight, thumbTop } = metrics;
   sessionScrollbarEl.style.top = `${sessionListEl.offsetTop}px`;
@@ -3303,16 +3317,21 @@ function updateSessionScrollbar(): void {
   sessionScrollbarEl.setAttribute("aria-valuenow", String(Math.round(sessionListEl.scrollTop)));
   sessionScrollbarEl.setAttribute("aria-valuetext", `${Math.round(sessionListEl.scrollTop / scrollRange * 100)}%`);
 }
-sessionListEl.addEventListener("scroll", updateSessionScrollbar, { passive: true });
+sessionListEl.addEventListener("scroll", () => {
+  updateSessionScrollbar();
+  revealSessionScrollbar();
+}, { passive: true });
 new ResizeObserver(updateSessionScrollbar).observe(sessionListEl);
 window.addEventListener("resize", updateSessionScrollbar);
 
 let sessionScrollbarDrag: { pointerId: number; startY: number; startScrollTop: number } | null = null;
+sessionScrollbarEl.addEventListener("pointerenter", revealSessionScrollbar);
 sessionScrollbarEl.addEventListener("pointerdown", (event) => {
   if (!event.isPrimary || event.button !== 0) return;
   const metrics = sessionScrollbarMetrics();
   if (!metrics) return;
   event.preventDefault();
+  revealSessionScrollbar();
   const y = event.clientY - sessionScrollbarEl.getBoundingClientRect().top;
   if (y < metrics.thumbTop || y > metrics.thumbTop + metrics.thumbHeight) {
     // A track tap moves one page; it never jumps an unexpectedly long distance.
@@ -3324,6 +3343,7 @@ sessionScrollbarEl.addEventListener("pointerdown", (event) => {
 });
 sessionScrollbarEl.addEventListener("pointermove", (event) => {
   if (!sessionScrollbarDrag || event.pointerId !== sessionScrollbarDrag.pointerId) return;
+  revealSessionScrollbar();
   const metrics = sessionScrollbarMetrics();
   if (!metrics || metrics.thumbTravel <= 0) return;
   sessionListEl.scrollTop = sessionScrollbarDrag.startScrollTop
@@ -3333,6 +3353,7 @@ function stopSessionScrollbarDrag(event: PointerEvent): void {
   if (!sessionScrollbarDrag || event.pointerId !== sessionScrollbarDrag.pointerId) return;
   sessionScrollbarDrag = null;
   if (sessionScrollbarEl.hasPointerCapture(event.pointerId)) sessionScrollbarEl.releasePointerCapture(event.pointerId);
+  revealSessionScrollbar();
 }
 sessionScrollbarEl.addEventListener("pointerup", stopSessionScrollbarDrag);
 sessionScrollbarEl.addEventListener("pointercancel", stopSessionScrollbarDrag);
@@ -3346,6 +3367,7 @@ sessionScrollbarEl.addEventListener("keydown", (event) => {
   else if (event.key === "End") sessionListEl.scrollTop = sessionListEl.scrollHeight;
   else if (Object.hasOwn(offsets, event.key)) sessionListEl.scrollTop += offsets[event.key]!;
   else return;
+  revealSessionScrollbar();
   event.preventDefault();
 });
 
