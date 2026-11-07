@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { mergePendingLocalSessions } from "../src/chat_client/session-list.ts";
+import {
+  mergePendingLocalSessions,
+  clearPendingMessagesForDeletedSession,
+} from "../src/chat_client/session-list.ts";
 
 test("keeps a new local session while its optimistic message awaits the server", () => {
   const local = { id: "new-session", history: [{ role: "user", text: "/image cat" }] };
@@ -42,4 +45,15 @@ test("keeps the server version when a pending session is already listed", () => 
   );
 
   assert.equal(merged.same, server);
+});
+
+test("a server tombstone clears pending messages for that session", () => {
+  const pending = [
+    { sessionId: "deleted", recordedAtSec: 10, role: "user" },
+    { sessionId: "deleted", recordedAtSec: 12, role: "assistant" },
+    { sessionId: "other", recordedAtSec: 8, role: "user" },
+  ];
+  const result = clearPendingMessagesForDeletedSession(pending, "deleted");
+
+  assert.deepEqual(result, [pending[2]]);
 });

@@ -13,3 +13,10 @@ export function mergePendingLocalSessions<T>(
   }
   return merged;
 }
+
+export function clearPendingMessagesForDeletedSession<T extends { sessionId: string }>(
+  pending: readonly T[],
+  sessionId: string,
+): T[] {
+  return pending.filter((message) => message.sessionId !== sessionId);
+}

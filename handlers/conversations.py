@@ -238,6 +238,10 @@ def make_conversation_handlers(
         return json_response(
             {
                 "last_pts": result.last_pts,
+                "deleted_sessions": [
+                    {"session_id": session_id, "deleted_at": deleted_at}
+                    for session_id, deleted_at in getattr(result, "deleted_sessions", [])
+                ],
                 "conversations": [
                     _list_item_payload(it) for it in result.conversations
                 ],

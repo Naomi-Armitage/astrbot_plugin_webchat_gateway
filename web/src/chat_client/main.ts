@@ -3,7 +3,7 @@ import { ConversationPanel } from "./conversation-panel";
 import { isDropImage } from "./drop-image";
 import { compareDropNewestFirst, isOlderDropMessage, type DropOrderKey } from "./drop-order";
 import { looksLikeEdgeDropExport, parseEdgeDropExport } from "./edge-drop-import";
-import { mergePendingLocalSessions } from "./session-list";
+import { clearPendingMessagesForDeletedSession, mergePendingLocalSessions } from "./session-list";
 import "./conversation-panel.css";
 import {
   LS_TOKEN,
@@ -267,6 +267,7 @@ interface ServerSessionListItem {
 interface ServerConversationsResponse {
   last_pts: number;
   conversations: ServerSessionListItem[];
+  deleted_sessions?: Array<{ session_id: string; deleted_at: number }>;
 }
 interface ServerMessage {
   role: ServerRole;
@@ -1578,6 +1579,14 @@ function prunePendingLocals(): void {
   if (mutated) savePendingLocals();
 }
 
+function removePendingLocalsForDeletedSession(sessionId: string): void {
+  const remaining = clearPendingMessagesForDeletedSession(pendingLocals, sessionId);
+  if (remaining.length !== pendingLocals.length) {
+    pendingLocals.splice(0, pendingLocals.length, ...remaining);
+    savePendingLocals();
+  }
+}
+
 function trimContent(s: string): string {
   return s.trim().slice(0, DEDUP_CONTENT_LEN);
 }
@@ -2359,6 +2368,7 @@ function applyEvent(ev: ServerEvent): void {
         // below, since the common case is the row is already locally gone.
         // dropSessionDelete is a no-op for ids not in the outbox.
         dropSessionDelete(sid);
+        removePendingLocalsForDeletedSession(sid);
         if (!store.sessions[sid]) break;
         const wasActive = sid === store.activeId;
         delete store.sessions[sid];
@@ -2700,14 +2710,32 @@ async function fetchConversation(sessionId: string): Promise<ServerConversationD
   return await resp.json() as ServerConversationDetail;
 }
 
-// Replace local sidebar with the server's list. Sessions present locally but
-// missing from the server are dropped UNLESS a pending optimistic message
-// still vouches for them (the first turn may not have reached server metadata
-// yet, especially while a non-streaming image request is running), or the
-// server list is empty (fresh deploy, no events yet).
+// Rebuild the sidebar from server state, retaining local sessions only while
+// an optimistic message is still waiting for sync. A truly fresh server has
+// no event cursor yet, so preserve the prior local cache for that migration.
 function ingestConversationList(resp: ServerConversationsResponse): void {
   const incoming = resp.conversations;
-  if (!incoming.length && Object.keys(store.sessions).length > 0) {
+  const incomingIds = new Set(incoming.map((row) => row.session_id));
+  prunePendingLocals();
+  for (const tombstone of resp.deleted_sessions ?? []) {
+    if (!tombstone || typeof tombstone.session_id !== "string" || !tombstone.session_id) continue;
+    // A live list row wins if the snapshot raced with a message that already
+    // undeleted this session. Otherwise the server tombstone is authoritative:
+    // discard all local optimistic state for that deleted session.
+    if (incomingIds.has(tombstone.session_id)) continue;
+    removePendingLocalsForDeletedSession(tombstone.session_id);
+    delete store.sessions[tombstone.session_id];
+  }
+  if (
+    !incoming.length &&
+    Object.keys(store.sessions).length > 0 &&
+    (resp.deleted_sessions === undefined || resp.last_pts === 0)
+  ) {
+    if (!store.sessions[store.activeId]) {
+      const sorted = Object.values(store.sessions).sort((a, b) => b.lastActiveAt - a.lastActiveAt);
+      if (sorted.length) store.activeId = sorted[0]!.id;
+      else { const fresh = blankSession(); store.sessions[fresh.id] = fresh; store.activeId = fresh.id; }
+    }
     sync.lastPts = resp.last_pts;
     saveLastPts(resp.last_pts);
     return;
@@ -2731,7 +2759,6 @@ function ingestConversationList(resp: ServerConversationsResponse): void {
       history: existing?.history ?? [],
     };
   }
-  prunePendingLocals();
   const pendingSessionIds = new Set(pendingLocals.map((pending) => pending.sessionId));
   const deletedSessionIds = new Set(pendingSessionDeletes.map((pending) => pending.sessionId));
   store.sessions = mergePendingLocalSessions(

@@ -219,6 +219,49 @@ async def test_empty_backup_and_partial_failure():
     assert audit.writes[-1]["detail"] == {"imported": 1, "failed": 1}
 
 
+@pytest.mark.asyncio
+async def test_conversation_list_returns_deleted_session_tombstones():
+    from astrbot_plugin_webchat_gateway.handlers.conversations_service import (
+        ConversationService,
+    )
+
+    storage = _MemoryStorage()
+    storage.meta[("alice", "live")] = SessionMetaRow(
+        token_name="alice",
+        session_id="live",
+        title="Live",
+        title_manual=False,
+        pinned_at=None,
+        deleted_at=None,
+        updated_at=20,
+        message_count=2,
+        preview="answer",
+    )
+    storage.meta[("alice", "deleted")] = SessionMetaRow(
+        token_name="alice",
+        session_id="deleted",
+        title="Deleted",
+        title_manual=False,
+        pinned_at=None,
+        deleted_at=15,
+        updated_at=15,
+        message_count=2,
+        preview="answer",
+    )
+    service = ConversationService(
+        storage=storage,
+        audit=_Audit(),
+        event_bus=_Bus(),
+        cm=_MemoryCM(),
+        file_store=object(),
+    )
+
+    result = await service.list_conversations(token_name="alice")
+
+    assert [row.session_id for row in result.conversations] == ["live"]
+    assert result.deleted_sessions == [("deleted", 15)]
+
+
 @pytest.mark.parametrize(
     "change",
     [

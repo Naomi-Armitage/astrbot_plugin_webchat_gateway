@@ -18,7 +18,7 @@ import json
 import time
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -117,6 +117,7 @@ class ConversationListItem:
 class ConversationListResult:
     conversations: list[ConversationListItem]
     last_pts: int
+    deleted_sessions: list[tuple[str, int]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -638,9 +639,15 @@ class ConversationService:
         # in sync by record_chat_pair / clear_history / lazy backfill in
         # get_conversation), so the sidebar refresh runs as a single SELECT
         # — no per-row CM lookup like the v3 implementation did.
-        rows = await self._storage.list_session_meta(
-            token_name=token_name, include_deleted=False
+        all_rows = await self._storage.list_session_meta(
+            token_name=token_name, include_deleted=True
         )
+        rows = [row for row in all_rows if row.deleted_at is None]
+        deleted_sessions = [
+            (row.session_id, row.deleted_at)
+            for row in all_rows
+            if row.deleted_at is not None
+        ]
         items: list[ConversationListItem] = []
         for meta in rows:
             items.append(
@@ -659,7 +666,11 @@ class ConversationService:
             reverse=True,
         )
         last_pts = await self._storage.get_max_pts(token_name=token_name)
-        return ConversationListResult(conversations=items, last_pts=last_pts)
+        return ConversationListResult(
+            conversations=items,
+            last_pts=last_pts,
+            deleted_sessions=deleted_sessions,
+        )
 
     async def export_conversations(self, *, token_name: str) -> dict[str, Any]:
         """Export every saved session as portable text; file bytes stay private."""
