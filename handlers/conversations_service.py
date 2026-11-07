@@ -456,17 +456,19 @@ class ConversationService:
 
     async def _build_history_overlay(
         self, *, token_name: str, session_id: str
-    ) -> tuple[set[int], dict[int, list[dict]]]:
+    ) -> tuple[set[int], dict[int, list[dict]], list[dict[str, Any]]]:
         """Walk `webchat_updates` + CM history once and return overlays.
 
         Returns:
-            (incomplete_indices, attachments_map)
+            (incomplete_indices, attachments_map, event_history)
 
         - `incomplete_indices`: 0-based CM history indices of assistant
           messages whose chat-sync `message_added` event flagged
           `incomplete: true`.
         - `attachments_map`: CM history index → list of `{file_id, mime}`
-          dicts pulled off the matching user `message_added` event payload.
+          dicts pulled off the matching `message_added` event payload.
+        - `event_history`: the replayed current event-log view, used only to
+          recover a CM tail when the retained log is complete.
 
         Both overlays are derived from the same event scan + history
         walk so the caller only pays for one storage round trip per
@@ -503,24 +505,38 @@ class ConversationService:
             logger.exception(
                 "[WebChatGateway] _build_history_overlay scan failed"
             )
-            return set(), {}
+            return set(), {}, []
 
         if not session_events:
-            return set(), {}
+            return set(), {}, []
 
-        # Find the last `history_cleared` event for this session and drop
-        # everything at or before it — those `message_added` rows refer
-        # to a wiped CM history.
-        last_clear_idx = -1
-        for i, row in enumerate(session_events):
-            if row.event_type == EVENT_HISTORY_CLEARED:
-                last_clear_idx = i
-        if last_clear_idx >= 0:
-            session_events = session_events[last_clear_idx + 1 :]
-
-        # Build the in-order list of (role, content, incomplete, attachments).
-        msg_events: list[tuple[str, str, bool, list[dict]]] = []
+        # Reconstruct the current event-log view. This is also a bounded
+        # recovery source for a missing CM tail: record_chat_pair deliberately
+        # keeps the UI sync write independent from AstrBot CM, so a transient
+        # CM write failure can leave a complete message_added pair here.
+        # Deletes and clears must be replayed before considering that history.
+        event_history: list[dict[str, Any]] = []
         for row in session_events:
+            if row.event_type == EVENT_HISTORY_CLEARED:
+                event_history.clear()
+                continue
+            if row.event_type == EVENT_MESSAGE_DELETED:
+                try:
+                    payload = json.loads(row.payload) if row.payload else {}
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                index = payload.get("index")
+                role = payload.get("role")
+                if (
+                    isinstance(index, int)
+                    and not isinstance(index, bool)
+                    and 0 <= index < len(event_history)
+                    and event_history[index].get("role") == role
+                ):
+                    event_history.pop(index)
+                continue
             if row.event_type != EVENT_MESSAGE_ADDED:
                 continue
             try:
@@ -537,7 +553,11 @@ class ConversationService:
                 content = ""
             if role not in ("user", "assistant"):
                 continue
-            incomplete = bool(payload.get("incomplete"))
+            entry: dict[str, Any] = {
+                "role": role,
+                "content": content,
+                "incomplete": bool(payload.get("incomplete")),
+            }
             raw_attachments = payload.get("attachments")
             attachments: list[dict] = []
             if isinstance(raw_attachments, list):
@@ -548,19 +568,21 @@ class ConversationService:
                     mime = att.get("mime")
                     if not isinstance(fid, str) or not fid:
                         continue
-                    entry: dict[str, Any] = {"file_id": fid}
+                    attachment_entry: dict[str, Any] = {"file_id": fid}
                     if isinstance(mime, str) and mime:
-                        entry["mime"] = mime
-                    attachments.append(entry)
-            msg_events.append((role, content, incomplete, attachments))
+                        attachment_entry["mime"] = mime
+                    attachments.append(attachment_entry)
+            if attachments:
+                entry["attachments"] = attachments
+            event_history.append(entry)
 
-        if not msg_events:
-            return set(), {}
+        if not event_history:
+            return set(), {}, []
 
-        # Walk CM history alongside the event list. For each CM entry,
-        # advance the event pointer until we find a matching (role,
-        # content); record incomplete flag for assistant messages and
-        # attachments for user messages.
+        # Align the current event-log snapshot with CM history. Event
+        # attachments and incomplete markers decorate the matching CM rows;
+        # unmatched trailing event rows are returned for the guarded recovery
+        # below.
         cm_messages, _cid = await self._cm_history(
             token_name=token_name, session_id=session_id
         )
@@ -570,16 +592,16 @@ class ConversationService:
         for cm_idx, msg in enumerate(cm_messages):
             target_role = msg["role"]
             target_content = msg["content"]
-            # Advance ev_ptr to the first event matching this CM entry.
-            while ev_ptr < len(msg_events):
-                ev_role, ev_content, ev_incomplete, ev_attachments = msg_events[
-                    ev_ptr
-                ]
+            while ev_ptr < len(event_history):
+                event_msg = event_history[ev_ptr]
                 ev_ptr += 1
-                if ev_role == target_role and ev_content == target_content:
-                    if ev_incomplete and target_role == "assistant":
+                if (
+                    event_msg["role"] == target_role
+                    and event_msg["content"] == target_content
+                ):
+                    if event_msg["incomplete"] and target_role == "assistant":
                         incomplete_indices.add(cm_idx)
-                    if ev_attachments:
+                    if event_msg.get("attachments"):
                         # Both roles can carry attachments now: user
                         # has them for image uploads, assistant has
                         # them when a /image command produced an
@@ -587,13 +609,13 @@ class ConversationService:
                         # here ("user" only) silently dropped
                         # generated images from the post-refresh
                         # render.
-                        attachments_map[cm_idx] = ev_attachments
+                        attachments_map[cm_idx] = event_msg["attachments"]
                     break
             else:
                 # Event list exhausted; remaining CM entries have no
                 # surviving event record (pruned) → leave them unflagged.
                 break
-        return incomplete_indices, attachments_map
+        return incomplete_indices, attachments_map, event_history
 
     async def _build_incomplete_map(
         self, *, token_name: str, session_id: str
@@ -601,10 +623,10 @@ class ConversationService:
         """Backwards-compatible thin wrapper around `_build_history_overlay`.
 
         Kept for any caller that only cares about the incomplete flag —
-        the new code path uses the dual-overlay helper directly so the
-        attachments backfill comes free.
+        detail reads the full result so attachment backfill and retained-tail
+        recovery share the same event scan.
         """
-        incomplete, _ = await self._build_history_overlay(
+        incomplete, _, _ = await self._build_history_overlay(
             token_name=token_name, session_id=session_id
         )
         return incomplete
@@ -804,11 +826,42 @@ class ConversationService:
         # CM doesn't natively model). Event-derived attachments override
         # CM-derived ones, but in practice they agree — both originated
         # from the same `record_chat_pair` write.
-        incomplete_indices, attachments_map_from_events = (
+        incomplete_indices, attachments_map_from_events, event_history = (
             await self._build_history_overlay(
                 token_name=token_name, session_id=session_id
             )
         )
+        # `record_chat_pair` writes CM and chat-sync events independently so
+        # a transient AstrBot storage error does not fail an already-produced
+        # reply. Normally CM is authoritative. If its history is a strict
+        # prefix of a complete event snapshot, recover only the missing tail.
+        # `message_count == len(event_history)` proves the retained event log
+        # covers the whole session; after event pruning or an incomplete log,
+        # the counts differ and this path leaves CM untouched.
+        event_count = len(event_history)
+        if (
+            event_count > len(messages)
+            and getattr(meta, "message_count", -1) == event_count
+            and all(
+                messages[i].get("role") == event_history[i].get("role")
+                and messages[i].get("content") == event_history[i].get("content")
+                for i in range(len(messages))
+            )
+        ):
+            for index in range(len(messages), event_count):
+                event_msg = event_history[index]
+                recovered = {
+                    "role": event_msg["role"],
+                    "content": event_msg["content"],
+                }
+                if event_msg.get("incomplete") and event_msg["role"] == "assistant":
+                    recovered["incomplete"] = True
+                    incomplete_indices.add(index)
+                attachments = event_msg.get("attachments")
+                if attachments:
+                    recovered["attachments"] = list(attachments)
+                    attachments_map_from_events[index] = list(attachments)
+                messages.append(recovered)
         # Batch-fetch mimes for every file_id we'll surface (CM + events
         # merged). One query for the whole history.
         all_file_ids: set[str] = set()

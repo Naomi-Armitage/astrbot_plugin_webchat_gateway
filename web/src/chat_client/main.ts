@@ -3,6 +3,7 @@ import { ConversationPanel } from "./conversation-panel";
 import { isDropImage } from "./drop-image";
 import { compareDropNewestFirst, isOlderDropMessage, type DropOrderKey } from "./drop-order";
 import { looksLikeEdgeDropExport, parseEdgeDropExport } from "./edge-drop-import";
+import { mergePendingLocalSessions } from "./session-list";
 import "./conversation-panel.css";
 import {
   LS_TOKEN,
@@ -2700,9 +2701,10 @@ async function fetchConversation(sessionId: string): Promise<ServerConversationD
 }
 
 // Replace local sidebar with the server's list. Sessions present locally but
-// missing from the server are dropped UNLESS the server's list is empty (fresh
-// deploy, no events yet) — in that case we keep the local cache so the user
-// doesn't lose their pre-sync history.
+// missing from the server are dropped UNLESS a pending optimistic message
+// still vouches for them (the first turn may not have reached server metadata
+// yet, especially while a non-streaming image request is running), or the
+// server list is empty (fresh deploy, no events yet).
 function ingestConversationList(resp: ServerConversationsResponse): void {
   const incoming = resp.conversations;
   if (!incoming.length && Object.keys(store.sessions).length > 0) {
@@ -2729,7 +2731,15 @@ function ingestConversationList(resp: ServerConversationsResponse): void {
       history: existing?.history ?? [],
     };
   }
-  store.sessions = next;
+  prunePendingLocals();
+  const pendingSessionIds = new Set(pendingLocals.map((pending) => pending.sessionId));
+  const deletedSessionIds = new Set(pendingSessionDeletes.map((pending) => pending.sessionId));
+  store.sessions = mergePendingLocalSessions(
+    next,
+    store.sessions,
+    pendingSessionIds,
+    deletedSessionIds,
+  );
   if (!store.sessions[store.activeId]) {
     const sorted = Object.values(store.sessions).sort((a, b) => b.lastActiveAt - a.lastActiveAt);
     if (sorted.length) store.activeId = sorted[0]!.id;

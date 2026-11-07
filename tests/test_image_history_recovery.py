@@ -209,11 +209,12 @@ class _StubCM:
 
 
 class _StubMeta:
-    def __init__(self) -> None:
+    def __init__(self, message_count: int = 0) -> None:
         self.title = "test"
         self.title_manual = False
         self.pinned_at = None
         self.updated_at = 1_700_000_000
+        self.message_count = message_count
 
 
 class _StubUpdateRow:
@@ -295,6 +296,27 @@ def _assistant_evt_with_attachment(
     )
 
 
+def _message_evt(
+    pts: int,
+    session_id: str,
+    *,
+    role: str,
+    content: str,
+    attachments: list[dict] | None = None,
+) -> _StubUpdateRow:
+    import json
+
+    payload: dict[str, Any] = {"role": role, "content": content}
+    if attachments:
+        payload["attachments"] = attachments
+    return _StubUpdateRow(
+        pts=pts,
+        session_id=session_id,
+        event_type="message_added",
+        payload=json.dumps(payload),
+    )
+
+
 @pytest.mark.asyncio
 class TestGetConversationSurfacesAssistantAttachments:
     async def test_image_reply_attachment_arrives_in_wire_payload(self):
@@ -357,3 +379,89 @@ class TestGetConversationSurfacesAssistantAttachments:
         attachments = assistant_msg.get("attachments")
         assert attachments, "assistant attachment missing from wire payload"
         assert attachments[0]["file_id"] == "gen-cat-1"
+
+    async def test_recovers_committed_event_tail_when_cm_write_failed(self):
+        """CM and the sync event log are independent writes. If CM failed
+        after a successful image response, a cold refresh must still show
+        the pair while the complete event snapshot is retained."""
+        from astrbot_plugin_webchat_gateway.handlers.conversations import (
+            ConversationService,
+        )
+
+        sid = "sess-image-first-turn"
+        update_rows = [
+            _message_evt(
+                1, sid, role="user", content="/image a cat"
+            ),
+            _message_evt(
+                2,
+                sid,
+                role="assistant",
+                content="",
+                attachments=[{"file_id": "gen-cat-2", "mime": "image/png"}],
+            ),
+        ]
+        service = ConversationService(
+            storage=_StubStorage(
+                meta=_StubMeta(message_count=2),
+                update_rows=update_rows,
+                files={"gen-cat-2": _StubFileRow("gen-cat-2", "image/png")},
+            ),  # type: ignore[arg-type]
+            audit=AsyncMock(),
+            event_bus=AsyncMock(),
+            cm=_StubCM([]),
+            file_store=None,  # type: ignore[arg-type]
+            concurrency=None,
+            llm_bridge=None,  # type: ignore[arg-type]
+        )
+
+        detail = await service.get_conversation(token_name="t1", session_id=sid)
+
+        assert [(m["role"], m["content"]) for m in detail.messages] == [
+            ("user", "/image a cat"),
+            ("assistant", ""),
+        ]
+        assert detail.messages[1]["attachments"] == [
+            {"file_id": "gen-cat-2", "mime": "image/png"}
+        ]
+
+    async def test_does_not_recover_only_a_partial_retained_event_log(self):
+        """Event rows are retention-limited, so they may fill a missing CM
+        tail only when the cached session count confirms the event log is a
+        complete snapshot. A partial log must never replace long-term CM
+        history with an incomplete subset."""
+        from astrbot_plugin_webchat_gateway.handlers.conversations import (
+            ConversationService,
+        )
+
+        sid = "sess-partial-events"
+        cm_history = [
+            {"role": "user", "content": [{"type": "text", "text": "old"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "answer"}]},
+        ]
+        service = ConversationService(
+            storage=_StubStorage(
+                # The meta count proves the event list is only a retained tail.
+                meta=_StubMeta(message_count=20),
+                update_rows=[
+                    _message_evt(
+                        1,
+                        sid,
+                        role="assistant",
+                        content="new image",
+                        attachments=[{"file_id": "gen-tail", "mime": "image/png"}],
+                    )
+                ],
+                files={"gen-tail": _StubFileRow("gen-tail", "image/png")},
+            ),  # type: ignore[arg-type]
+            audit=AsyncMock(),
+            event_bus=AsyncMock(),
+            cm=_StubCM(cm_history),
+            file_store=None,  # type: ignore[arg-type]
+            concurrency=None,
+            llm_bridge=None,  # type: ignore[arg-type]
+        )
+
+        detail = await service.get_conversation(token_name="t1", session_id=sid)
+
+        assert [m["content"] for m in detail.messages] == ["old", "answer"]
