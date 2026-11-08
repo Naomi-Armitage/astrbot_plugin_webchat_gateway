@@ -1395,9 +1395,12 @@ footer textarea:focus {
    `overflow: hidden` keeps the image's corners clipped to the bubble's
    `border-radius` instead of poking past the rounded outline. */
 .msg.has-image {
+  width: min(320px, 100%);
+  border: 0;
   padding: 0;
   overflow: hidden;
 }
+.msg.has-image:has(.msg-attachments.cnt-3) { width: min(360px, 100%); }
 .msg.has-image .msg-attachments {
   /* Grid fills the bubble; no inner gap to the bubble border.
      `border-radius: 0` here lets the bubble's own radius do the
