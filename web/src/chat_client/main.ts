@@ -182,8 +182,8 @@ function fetchWithTimeout(
 
 type Role = "user" | "bot" | "error" | "notice";
 type ServerRole = "user" | "assistant";
-// Server-issued reference to an uploaded file. `mime` is required after upload
-// commit; width/height are reserved for future per-image grid hints.
+// Server-issued reference to an uploaded file. Optional dimensions reserve the
+// image frame before its preview loads; the preview's intrinsic ratio wins.
 interface AttachmentRef {
   file_id: string;
   mime: string;
@@ -932,10 +932,16 @@ function addMessageBubble(
         && a.width! > 0 && a.height! > 0) {
         img.style.aspectRatio = `${a.width} / ${a.height}`;
       }
-      img.addEventListener("load", () => img.classList.add("is-loaded"), { once: true });
+      const markImageLoaded = (): void => {
+        if (count === 1 && img.naturalWidth > 0 && img.naturalHeight > 0) {
+          img.style.aspectRatio = `${img.naturalWidth} / ${img.naturalHeight}`;
+        }
+        img.classList.add("is-loaded");
+      };
+      img.addEventListener("load", markImageLoaded, { once: true });
       attachImgErrorRetry(img, options.onImageError);
       img.src = srcFor(a) + "?preview=1";
-      if (img.complete && img.naturalWidth > 0) img.classList.add("is-loaded");
+      if (img.complete && img.naturalWidth > 0) markImageLoaded();
       const captureIdx = i;
       img.addEventListener("click", () => openLightbox(list, captureIdx, srcFor, img.ownerDocument));
       img.tabIndex = 0;

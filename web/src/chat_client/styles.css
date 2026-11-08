@@ -1418,7 +1418,7 @@ footer textarea:focus {
    Telegram and modern iMessage. */
 .msg.has-image-only {
   background: transparent;
-  border-color: transparent;
+  border: 0;
   box-shadow: none;
   padding: 0;
   /* Border-radius on the bubble itself becomes irrelevant once the
@@ -1610,6 +1610,10 @@ body.lightbox-open { overflow: hidden; }
 }
 [data-theme^="classic-dark"] .msg.user {
   border-color: color-mix(in oklab, var(--accent) 45%, transparent);
+}
+[data-theme^="classic"] .msg.user.has-image-only {
+  background: transparent;
+  border: 0;
 }
 
 /* ----- failed user message (cancel / network / server failure) -----
