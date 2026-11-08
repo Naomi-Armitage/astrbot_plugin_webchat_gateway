@@ -1352,8 +1352,9 @@ footer textarea:focus {
   gap: 4px;
   border-radius: 10px;
   overflow: hidden;
-  background: var(--paper-deep);
+  background: transparent;
 }
+.msg .msg-attachments:has(.msg-image:not(.is-loaded)) { background: var(--paper-deep); }
 .msg .msg-attachments.cnt-1 { grid-template-columns: 1fr; max-width: 320px; }
 .msg .msg-attachments.cnt-2 { grid-template-columns: 1fr 1fr; max-width: 320px; }
 .msg .msg-attachments.cnt-3 { grid-template-columns: 1fr 1fr 1fr; max-width: 360px; }
@@ -1365,7 +1366,7 @@ footer textarea:focus {
   cursor: zoom-in;
   aspect-ratio: 1;
   display: block;
-  background: var(--paper-deep);
+  background: transparent;
   opacity: 0;
   transition: opacity .14s ease;
 }
