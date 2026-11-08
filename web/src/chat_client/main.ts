@@ -332,10 +332,12 @@ const imgRatioBar = $<HTMLDivElement>("imgRatioBar");
 const footerEl = document.querySelector("footer") as HTMLElement;
 const refreshHistoryBtn = $<HTMLButtonElement>("refreshHistory");
 const dropEntry = $<HTMLButtonElement>("dropEntry");
+const dropPanelEl = $("dropPanel");
 const dropMessagesEl = $<HTMLDivElement>("dropMessages");
+const dropScrollToBottomBtn = $<HTMLButtonElement>("dropScrollToBottom");
 const chatComposer = createComposer(footerEl, "chat");
 const dropComposer = createComposer(footerEl, "drop");
-$("dropPanel").append(dropComposer.root);
+dropPanelEl.append(dropComposer.root);
 const composerView = (target: ComposerTarget) => target === "drop" ? dropComposer : chatComposer;
 const dropHeader = $("chatHeader").cloneNode(true) as HTMLElement;
 dropHeader.id = "dropHeader";
@@ -3667,7 +3669,7 @@ let dropNoticeBad = false;
 let dropComposerAttachments: PendingAttachment[] = [];
 
 const dropPanelController = new ConversationPanel({
-  panel: $("dropPanel"), workspace: workspaceEl, main: mainEl,
+  panel: dropPanelEl, workspace: workspaceEl, main: mainEl,
   chatMessages: msgs, chatComposer: footerEl, composer: dropComposer.root, header: dropHeader, resizeHandle: $("dropResize"),
   layoutSwitch: $("dropLayoutSwitch"), closeButton: dropCloseBtn,
 }, {
@@ -3830,6 +3832,62 @@ function edgeDropImportTime(seconds: number): string {
     + `${two(date.getHours())}:${two(date.getMinutes())}:${two(date.getSeconds())}`;
 }
 
+let dropPinnedToBottom = true;
+const dropRowGeometry = new Map<HTMLElement, { top: number; height: number }>();
+function updateDropScrollButton(): void {
+  const distanceFromBottom = dropMessagesEl.scrollHeight - dropMessagesEl.scrollTop - dropMessagesEl.clientHeight;
+  dropPinnedToBottom = distanceFromBottom < 80;
+  dropScrollToBottomBtn.hidden = !dropOpen || dropPinnedToBottom;
+}
+
+function rememberDropRowGeometry(): void {
+  const containerTop = dropMessagesEl.getBoundingClientRect().top;
+  const rows = new Set(dropMessagesEl.querySelectorAll<HTMLElement>("[data-drop-id]"));
+  for (const row of dropRowGeometry.keys()) {
+    if (!rows.has(row)) {
+      dropMessagesResizeObserver.unobserve(row);
+      dropRowGeometry.delete(row);
+    }
+  }
+  for (const row of rows) {
+    if (!dropRowGeometry.has(row)) dropMessagesResizeObserver.observe(row);
+    const rect = row.getBoundingClientRect();
+    dropRowGeometry.set(row, { top: rect.top - containerTop, height: rect.height });
+  }
+}
+
+const dropMessagesResizeObserver = new ResizeObserver(() => {
+  const rows = [...dropMessagesEl.querySelectorAll<HTMLElement>("[data-drop-id]")];
+  const anchor = rows.find((row) => {
+    const previous = dropRowGeometry.get(row);
+    return previous && previous.top + previous.height > 0;
+  });
+  if (dropPinnedToBottom) {
+    dropMessagesEl.scrollTop = dropMessagesEl.scrollHeight;
+  } else if (anchor) {
+    const previous = dropRowGeometry.get(anchor)!;
+    const currentTop = anchor.getBoundingClientRect().top - dropMessagesEl.getBoundingClientRect().top;
+    dropMessagesEl.scrollTop += currentTop - previous.top;
+  }
+  updateDropScrollButton();
+  rememberDropRowGeometry();
+});
+dropMessagesResizeObserver.observe(dropMessagesEl);
+
+const dropComposerResizeObserver = new ResizeObserver(() => {
+  dropPanelEl.style.setProperty("--drop-scroll-bottom", `${dropComposer.root.getBoundingClientRect().height + 12}px`);
+});
+dropComposerResizeObserver.observe(dropComposer.root);
+
+dropMessagesEl.addEventListener("scroll", () => {
+  updateDropScrollButton();
+  rememberDropRowGeometry();
+}, { passive: true });
+dropScrollToBottomBtn.addEventListener("click", () => {
+  dropMessagesEl.scrollTop = dropMessagesEl.scrollHeight;
+  updateDropScrollButton();
+});
+
 function renderDropMessages(options: { forceBottom?: boolean } = {}): void {
   const previousScrollTop = dropMessagesEl.scrollTop;
   const wasNearBottom = dropMessagesEl.scrollHeight - previousScrollTop - dropMessagesEl.clientHeight < 80;
@@ -3886,12 +3944,17 @@ function renderDropMessages(options: { forceBottom?: boolean } = {}): void {
   });
   renderDropNotice();
   if (options.forceBottom || wasNearBottom) {
+    dropPinnedToBottom = true;
     dropMessagesEl.scrollTop = dropMessagesEl.scrollHeight;
   } else if (anchor?.isConnected && anchorTop !== undefined) {
+    dropPinnedToBottom = false;
     dropMessagesEl.scrollTop += anchor.getBoundingClientRect().top - anchorTop;
   } else {
+    dropPinnedToBottom = false;
     dropMessagesEl.scrollTop = previousScrollTop;
   }
+  updateDropScrollButton();
+  rememberDropRowGeometry();
 }
 interface DropListResponse {
   messages?: DropMessage[];
@@ -4145,6 +4208,7 @@ function closeDrop(restoreFocus = true): void {
   dropOpen = false;
   clearDropFallbackTimer();
   dropMessagesEl.hidden = true;
+  dropScrollToBottomBtn.hidden = true;
   dropPanelController.close();
   dropEntry.setAttribute("aria-expanded", "false");
   renderSessionList();
@@ -4156,6 +4220,7 @@ function openDrop(restoring = false): void {
   dropOpen = true;
   rememberDropOpen(true);
   dropMessagesEl.hidden = false;
+  dropScrollToBottomBtn.hidden = true;
   dropPanelController.open(!restoring);
   dropEntry.setAttribute("aria-expanded", "true");
   cancelLongPress();

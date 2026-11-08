@@ -52,6 +52,28 @@
 .conversation-panel[data-layout="float"] { position: fixed; z-index: 40; }
 .conversation-panel[data-layout="float"] footer textarea { max-height: min(120px, 20dvh); }
 .conversation-panel[data-layout="float"] .composer-attachments { max-height: 96px; overflow-y: auto; }
+.drop-scroll-bottom {
+  position: absolute;
+  z-index: 5;
+  right: 20px;
+  bottom: var(--drop-scroll-bottom, 76px);
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border: 1px solid var(--rule);
+  border-radius: 50%;
+  background: var(--card);
+  color: var(--ink);
+  box-shadow: 0 3px 12px var(--shadow-strong);
+  cursor: pointer;
+  transition: background .15s ease, transform .15s ease;
+}
+.drop-scroll-bottom[hidden] { display: none; }
+.drop-scroll-bottom:hover { background: var(--accent-soft); transform: translateY(1px); }
+.drop-scroll-bottom svg { width: 19px; height: 19px; pointer-events: none; }
+.drop-scroll-bottom:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 header[data-panel-movable] { cursor: grab; touch-action: none; }
 header[data-panel-movable]:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .conversation-panel.is-adjusting { user-select: none; }
