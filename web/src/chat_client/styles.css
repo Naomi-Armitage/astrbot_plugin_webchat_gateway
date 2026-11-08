@@ -1615,6 +1615,10 @@ body.lightbox-open { overflow: hidden; }
   background: transparent;
   border: 0;
 }
+[data-theme] .msg.bot:not(.has-image),
+[data-theme] .msg.user:not(.has-image) {
+  border-color: transparent;
+}
 
 /* ----- failed user message (cancel / network / server failure) -----
    Telegram-style red disc with "!" sits to the LEFT of the bubble
