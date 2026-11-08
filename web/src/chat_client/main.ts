@@ -928,6 +928,10 @@ function addMessageBubble(
       img.loading = "lazy";
       img.decoding = "async";
       img.alt = "";
+      if (count === 1 && Number.isFinite(a.width) && Number.isFinite(a.height)
+        && a.width! > 0 && a.height! > 0) {
+        img.style.aspectRatio = `${a.width} / ${a.height}`;
+      }
       img.addEventListener("load", () => img.classList.add("is-loaded"), { once: true });
       attachImgErrorRetry(img, options.onImageError);
       img.src = srcFor(a) + "?preview=1";
