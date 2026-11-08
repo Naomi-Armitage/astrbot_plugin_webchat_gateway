@@ -928,8 +928,10 @@ function addMessageBubble(
       img.loading = "lazy";
       img.decoding = "async";
       img.alt = "";
-      img.src = srcFor(a) + "?preview=1";
+      img.addEventListener("load", () => img.classList.add("is-loaded"), { once: true });
       attachImgErrorRetry(img, options.onImageError);
+      img.src = srcFor(a) + "?preview=1";
+      if (img.complete && img.naturalWidth > 0) img.classList.add("is-loaded");
       const captureIdx = i;
       img.addEventListener("click", () => openLightbox(list, captureIdx, srcFor, img.ownerDocument));
       img.tabIndex = 0;
