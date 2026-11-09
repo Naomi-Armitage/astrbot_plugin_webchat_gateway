@@ -1357,7 +1357,9 @@ footer textarea:focus {
 .msg .msg-attachments:has(.msg-image:not(.is-loaded)) { background: var(--paper-deep); }
 .msg .msg-attachments.cnt-1,
 .msg .msg-attachments.cnt-2 { width: min(320px, 100%); grid-template-columns: 1fr 1fr; }
-.msg .msg-attachments.cnt-1 { grid-template-columns: 1fr; }
+/* minmax(0, …): a bare 1fr track's automatic minimum lets a very narrow
+   image grow past the bubble (1:20 strip → 20px image in a 16px bubble). */
+.msg .msg-attachments.cnt-1 { grid-template-columns: minmax(0, 1fr); }
 .msg .msg-attachments.cnt-3 { width: min(360px, 100%); }
 .msg .msg-attachments.cnt-4 { width: min(320px, 100%); }
 .msg .msg-attachments.cnt-3 { grid-template-columns: 1fr 1fr 1fr; }
@@ -1379,7 +1381,7 @@ footer textarea:focus {
      prevents the parent grid from collapsing to a tiny placeholder. */
   aspect-ratio: 4 / 3;
   height: auto;
-  max-height: 320px;
+  max-height: var(--msg-image-edge, 320px);
   object-fit: contain;
 }
 .msg .msg-text {
@@ -1395,13 +1397,26 @@ footer textarea:focus {
    `overflow: hidden` keeps the image's corners clipped to the bubble's
    `border-radius` instead of poking past the rounded outline. */
 .msg.has-image {
-  width: var(--msg-image-width, min(320px, 100%));
+  /* Single source of truth for inline image sizing. JS sets
+     --msg-image-ar (width / height) for single images; the bubble is the
+     image's displayed width when its longest edge is capped at
+     --msg-image-edge. --msg-image-min keeps captioned bubbles readable for
+     narrow portraits (9:16 → 180px, long strips → a few px); the image
+     itself letterboxes via object-fit: contain.
+     Keep `width` free of percentages: .msg-row shrinks to its content, so a
+     percentage here would make the bubble's intrinsic width collapse to the
+     image's min-content. The row-relative cap lives on max-width instead,
+     which resolves after the row's width is known. */
+  --msg-image-edge: 320px;
+  --msg-image-min: 0px;
+  width: max(var(--msg-image-edge) * min(var(--msg-image-ar, 1), 1), var(--msg-image-min));
   max-width: 100%;
   border: 0;
   padding: 0;
   overflow: hidden;
 }
 .msg.has-image:has(.msg-attachments.cnt-3) { width: min(360px, 100%); }
+.msg.has-image:not(.has-image-only) { --msg-image-min: 200px; }
 .msg.has-image .msg-attachments {
   /* Grid fills the bubble; no inner gap to the bubble border.
      `border-radius: 0` here lets the bubble's own radius do the
