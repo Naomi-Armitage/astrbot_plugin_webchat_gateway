@@ -84,6 +84,7 @@ const regenerateUrl = (sid: string): string =>
 // gets a UI that respects the new cap without a frontend rebuild.
 // `let` (not `const`) so loadChatSite() can swap them in.
 let MAX_ATTACHMENTS_PER_MESSAGE = 4;
+const MAX_INLINE_IMAGE_EDGE = 320;
 let MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024;
 let ALLOWED_MIME: readonly string[] = ["image/jpeg", "image/png", "image/webp", "image/gif"];
 let UPLOADS_ENABLED = true;
@@ -919,6 +920,13 @@ function addMessageBubble(
   if (hasImages) {
     const list = attachments as AttachmentRef[];
     const count = Math.min(list.length, MAX_ATTACHMENTS_PER_MESSAGE);
+    // The caption and bubble should track the image's actual displayed width,
+    // especially when a portrait image hits the 320px height cap.
+    const setImageBubbleWidth = (width: number, height: number): void => {
+      if (count !== 1 || !Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return;
+      const scale = MAX_INLINE_IMAGE_EDGE / Math.max(width, height);
+      div.style.setProperty("--msg-image-width", `${width * scale}px`);
+    };
     const grid = document.createElement("div");
     grid.className = "msg-attachments cnt-" + count;
     for (let i = 0; i < count; i++) {
@@ -931,10 +939,12 @@ function addMessageBubble(
       if (count === 1 && Number.isFinite(a.width) && Number.isFinite(a.height)
         && a.width! > 0 && a.height! > 0) {
         img.style.aspectRatio = `${a.width} / ${a.height}`;
+        setImageBubbleWidth(a.width!, a.height!);
       }
       const markImageLoaded = (): void => {
         if (count === 1 && img.naturalWidth > 0 && img.naturalHeight > 0) {
           img.style.aspectRatio = `${img.naturalWidth} / ${img.naturalHeight}`;
+          setImageBubbleWidth(img.naturalWidth, img.naturalHeight);
         }
         img.classList.add("is-loaded");
       };
