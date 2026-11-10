@@ -147,3 +147,26 @@ async def test_upload_quota_query_failure_returns_503(tmp_path: Path):
         await client.close()
         await server.close()
         await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_upload_response_reports_image_dimensions(tmp_path: Path):
+    from PIL import Image
+
+    client, server, storage, _token_name, headers = await _make_client(tmp_path)
+    try:
+        buf = io.BytesIO()
+        Image.new("RGB", (9, 16), color=(20, 80, 160)).save(buf, format="PNG")
+        response = await client.post(
+            "/api/webchat/upload",
+            headers=headers,
+            data=_upload_form(buf.getvalue()),
+        )
+        assert response.status == 200
+        payload = await response.json()
+        assert payload["width"] == 9
+        assert payload["height"] == 16
+    finally:
+        await client.close()
+        await server.close()
+        await storage.close()

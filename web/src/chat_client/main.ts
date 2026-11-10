@@ -197,6 +197,10 @@ interface PendingAttachment {
   file_id?: string;
   mime: string;
   size: number;
+  // Intrinsic image size reported by /upload; forwarded on the optimistic
+  // echo so the bubble doesn't reflow when the preview loads.
+  width?: number;
+  height?: number;
   preview_url: string;
   state: "uploading" | "ready" | "error";
   error_message?: string;
@@ -371,6 +375,33 @@ function isAttachmentRef(it: unknown): it is AttachmentRef {
   if (o.width !== undefined && typeof o.width !== "number") return false;
   if (o.height !== undefined && typeof o.height !== "number") return false;
   return true;
+}
+// Parses a server-sent attachments array ({file_id, mime, width?, height?}).
+// Dimensions are kept only when they are positive finite numbers so the
+// bubble can reserve the image frame before the preview loads.
+function parseServerAttachments(raw: unknown, fallbackMime?: string): AttachmentRef[] {
+  if (!Array.isArray(raw)) return [];
+  const out: AttachmentRef[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") continue;
+    const o = entry as Record<string, unknown>;
+    if (typeof o.file_id !== "string" || !o.file_id) continue;
+    const mime = typeof o.mime === "string" ? o.mime : fallbackMime;
+    if (mime === undefined) continue;
+    const ref: AttachmentRef = { file_id: o.file_id, mime };
+    copyImageSize(o, ref);
+    out.push(ref);
+  }
+  return out;
+}
+function copyImageSize(src: Record<string, unknown>, dst: { width?: number; height?: number }): void {
+  const w = src.width;
+  const h = src.height;
+  if (typeof w === "number" && typeof h === "number"
+    && Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) {
+    dst.width = w;
+    dst.height = h;
+  }
 }
 function isHistoryItem(it: unknown): it is HistoryItem {
   if (!it || typeof it !== "object") return false;
@@ -2169,15 +2200,7 @@ async function regenerateMessage(bubble: HTMLDivElement): Promise<void> {
         scrollToEnd();
       }
     } else if (t === "done") {
-      const rawAtt = (obj as { attachments?: unknown }).attachments;
-      const atts: AttachmentRef[] = Array.isArray(rawAtt)
-        ? rawAtt
-            .filter((a): a is { file_id: string; mime: string } =>
-              !!a && typeof a === "object"
-              && typeof (a as { file_id?: unknown }).file_id === "string"
-              && typeof (a as { mime?: unknown }).mime === "string")
-            .map((a) => ({ file_id: a.file_id, mime: a.mime }))
-        : [];
+      const atts = parseServerAttachments((obj as { attachments?: unknown }).attachments);
       out.done = {
         reply: typeof obj.reply === "string" ? obj.reply : accumulated,
         remaining: typeof obj.remaining === "number" ? obj.remaining : 0,
@@ -2444,25 +2467,8 @@ function applyEvent(ev: ServerEvent): void {
         updateRefreshButtonState();
       }
       let attachments: AttachmentRef[] | undefined;
-      const rawAttachments = payload["attachments"];
-      if (Array.isArray(rawAttachments) && rawAttachments.length) {
-        const parsed: AttachmentRef[] = [];
-        for (const entry of rawAttachments) {
-          if (entry && typeof entry === "object") {
-            const o = entry as Record<string, unknown>;
-            if (typeof o.file_id === "string" && o.file_id) {
-              const ref: AttachmentRef = {
-                file_id: o.file_id,
-                mime: typeof o.mime === "string" ? o.mime : "image/jpeg",
-              };
-              if (typeof o.width === "number") ref.width = o.width;
-              if (typeof o.height === "number") ref.height = o.height;
-              parsed.push(ref);
-            }
-          }
-        }
-        if (parsed.length) attachments = parsed;
-      }
+      const parsedAttachments = parseServerAttachments(payload["attachments"], "image/jpeg");
+      if (parsedAttachments.length) attachments = parsedAttachments;
       // Dedup: if we already rendered this locally on this device, drop the event.
       if (consumeIfDuplicate(sid, role, content, ev.ts, attachments)) {
         // Still bump lastActiveAt so the sidebar order matches the server.
@@ -5018,6 +5024,9 @@ async function uploadAttachment(blob: Blob, sid: string, attachment: PendingAtta
     attachment.file_id = fid;
     attachment.mime = mime;
     attachment.size = size;
+    delete attachment.width;
+    delete attachment.height;
+    copyImageSize(payload, attachment);
     attachment.state = "ready";
     renderComposerAttachments();
     updateSendButtonState();
@@ -5442,7 +5451,14 @@ async function send(): Promise<void> {
   const message = inputEl.value.trim();
   let readyAttachments: AttachmentRef[] = composerAttachments
     .filter((a) => a.state === "ready" && a.file_id)
-    .map((a) => ({ file_id: a.file_id!, mime: a.mime }));
+    .map((a) => {
+      const ref: AttachmentRef = { file_id: a.file_id!, mime: a.mime };
+      if (a.width !== undefined && a.height !== undefined) {
+        ref.width = a.width;
+        ref.height = a.height;
+      }
+      return ref;
+    });
   if (!message && !readyAttachments.length) return;
   // Align an /image command's attachments with what the server actually
   // records on the user turn — otherwise the optimistic echo's attachment
@@ -6229,16 +6245,9 @@ async function runNonStreamingSend(sid: string, message: string, attachments: At
       // so the image renders inline (same renderer as user-side image
       // attachments). text/streaming responses never set this field,
       // so the legacy path stays unaffected.
-      const rawAttachments = (payload as { attachments?: unknown }).attachments;
-      const replyAttachments: AttachmentRef[] = Array.isArray(rawAttachments)
-        ? rawAttachments
-            .filter((a): a is { file_id: string; mime: string } =>
-              !!a && typeof a === "object"
-              && typeof (a as { file_id?: unknown }).file_id === "string"
-              && typeof (a as { mime?: unknown }).mime === "string"
-            )
-            .map((a) => ({ file_id: a.file_id, mime: a.mime }))
-        : [];
+      const replyAttachments = parseServerAttachments(
+        (payload as { attachments?: unknown }).attachments,
+      );
       // Image turns return an empty `reply` (the image IS the reply). Use
       // a REAL empty string so it renders as an image-only bubble AND the
       // dedup keys (optimistic + the message_added event) match the

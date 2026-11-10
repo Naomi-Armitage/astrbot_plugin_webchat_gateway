@@ -915,6 +915,24 @@ class TestPersistGeneratedImage:
             prompt="a forest",
         )
 
+    async def test_reports_intrinsic_dimensions(self):
+        from astrbot_plugin_webchat_gateway.core.image_bridge import (
+            ImageResult,
+            persist_generated_image,
+        )
+
+        attachment = await persist_generated_image(
+            storage=_StubStorage(),
+            file_store=_StubFileStore(),
+            token_name="alice",
+            result=ImageResult(
+                content=_png_bytes(9, 16), mime="image/png", prompt="tall"
+            ),
+            now=1_700_000_000,
+        )
+        assert attachment["width"] == 9
+        assert attachment["height"] == 16
+
     async def test_happy_path_inserts_and_commits(self):
         from astrbot_plugin_webchat_gateway.core.image_bridge import (
             persist_generated_image,
@@ -929,6 +947,7 @@ class TestPersistGeneratedImage:
             result=self._make_result(),
             now=1_700_000_000,
         )
+        # Stub bytes have no readable header → dimensions are omitted.
         assert set(attachment.keys()) == {"file_id", "mime"}
         assert attachment["mime"] == "image/png"
         assert len(store.saves) == 1

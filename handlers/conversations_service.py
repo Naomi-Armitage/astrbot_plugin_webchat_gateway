@@ -102,6 +102,26 @@ def _umo(token_name: str, session_id: str) -> str:
     return f"webchat_gateway:{token_name}:{session_id}"
 
 
+def _copy_image_size(src: dict, dst: dict) -> None:
+    """Carry an attachment's intrinsic ``width``/``height`` (set by the
+    upload / image-gen responses) through to the wire payload so clients
+    can reserve the image frame on a cold refetch too. Only positive ints
+    are copied; anything else is dropped.
+    """
+    width = src.get("width")
+    height = src.get("height")
+    if (
+        isinstance(width, int)
+        and isinstance(height, int)
+        and not isinstance(width, bool)
+        and not isinstance(height, bool)
+        and width > 0
+        and height > 0
+    ):
+        dst["width"] = width
+        dst["height"] = height
+
+
 @dataclass(frozen=True)
 class ConversationListItem:
     session_id: str
@@ -572,6 +592,7 @@ class ConversationService:
                     attachment_entry: dict[str, Any] = {"file_id": fid}
                     if isinstance(mime, str) and mime:
                         attachment_entry["mime"] = mime
+                    _copy_image_size(att, attachment_entry)
                     attachments.append(attachment_entry)
             if attachments:
                 entry["attachments"] = attachments
@@ -939,6 +960,8 @@ class ConversationService:
                         if not isinstance(fid, str):
                             continue
                         item = {"file_id": fid}
+                        if isinstance(att, dict):
+                            _copy_image_size(att, item)
                         if fid in mime_by_file_id:
                             item["mime"] = mime_by_file_id[fid]
                         elif isinstance(att, dict) and isinstance(

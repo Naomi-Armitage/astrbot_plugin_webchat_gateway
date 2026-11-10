@@ -173,6 +173,15 @@ def detect_image_size(content: bytes) -> tuple[int, int] | None:
     return (width, height)
 
 
+async def detect_image_size_async(content: bytes) -> tuple[int, int] | None:
+    """Off-thread wrapper around `detect_image_size`.
+
+    Used by upload / image-gen responses so the client can reserve the
+    image frame before the preview loads.
+    """
+    return await asyncio.to_thread(detect_image_size, content)
+
+
 def ext_for_mime(mime: str) -> str | None:
     """Return the on-disk extension for a validated MIME, or None.
 
@@ -191,5 +200,6 @@ __all__ = [
     "detect_image_mime",
     "detect_image_mime_async",
     "detect_image_size",
+    "detect_image_size_async",
     "ext_for_mime",
 ]

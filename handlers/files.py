@@ -48,6 +48,7 @@ from ..core.image_preview import ImagePreviewCache, InvalidImagePreview, PREVIEW
 from ..core.image_util import (
     ALLOWED_MIME_TO_EXT,
     detect_image_mime_async,
+    detect_image_size_async,
     ext_for_mime,
 )
 from ..core.ip_guard import IpGuard
@@ -410,13 +411,19 @@ def make_upload_handler(deps: UploadDeps):
         # the frontend resolves it against the page origin. Building it
         # off the request prefix lets a customised `endpoint_prefix`
         # flow through without a separate config plumbing.
+        payload: dict = {
+            "file_id": file_id,
+            "mime": mime,
+            "size": len(file_content),
+            "url": deps.files_serve_prefix + file_id,
+        }
+        # Intrinsic size lets the client reserve the image frame before
+        # the preview loads. Optional: omitted if the header can't be read.
+        dims = await detect_image_size_async(file_content)
+        if dims is not None:
+            payload["width"], payload["height"] = dims
         return json_response(
-            {
-                "file_id": file_id,
-                "mime": mime,
-                "size": len(file_content),
-                "url": deps.files_serve_prefix + file_id,
-            },
+            payload,
             origin=origin,
             allowed_origins=allowed,
             same_origin_host=same_host,

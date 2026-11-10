@@ -38,7 +38,7 @@ import aiohttp
 
 from astrbot.api import logger
 
-from .image_util import detect_image_size
+from .image_util import detect_image_size, detect_image_size_async
 
 
 _PREFIX_PATTERN = re.compile(r"^\s*/(?:image|img|draw)\b\s*", re.IGNORECASE)
@@ -584,9 +584,11 @@ async def persist_generated_image(
     uploads use is overkill here — we control both writes in the same
     request, so we can land the row in its final state directly.
 
-    Returns the attachment payload (``{file_id, mime}``) the chat
+    Returns the attachment payload (``{file_id, mime}``, plus
+    ``width``/``height`` when the image header is readable) the chat
     layer embeds into the ``message_added`` event's ``attachments``
-    list and the SSE ``image_ready`` frame.
+    list and the SSE ``image_ready`` frame. The dimensions let clients
+    reserve the image frame before the preview loads.
     """
     file_id = secrets.token_urlsafe(12)
     ext = _MIME_TO_EXT.get(result.mime, ".png")
@@ -620,4 +622,8 @@ async def persist_generated_image(
                 "[WebChatGateway] image gen storage-rollback delete failed"
             )
         raise
-    return {"file_id": file_id, "mime": result.mime}
+    attachment: dict = {"file_id": file_id, "mime": result.mime}
+    dims = await detect_image_size_async(result.content)
+    if dims is not None:
+        attachment["width"], attachment["height"] = dims
+    return attachment
